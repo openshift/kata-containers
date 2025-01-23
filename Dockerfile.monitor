@@ -1,0 +1,18 @@
+FROM registry.access.redhat.com/ubi9/go-toolset:1.22.7 AS builder
+
+USER root
+COPY ./VERSION /workdir/VERSION
+COPY ./.git /workdir/.git
+COPY ./src/runtime /workdir/src/runtime
+WORKDIR /workdir/src/runtime
+RUN CGO_ENABLED=1 GOFLAGS=-tags=strictfipsruntime make monitor
+
+# Add only required capabilities for the monitor
+RUN chmod u-s kata-monitor
+RUN setcap "cap_dac_override+eip" kata-monitor
+
+FROM registry.access.redhat.com/ubi9
+COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
+
+CMD ["-h"]
+ENTRYPOINT ["/usr/bin/kata-monitor"]
