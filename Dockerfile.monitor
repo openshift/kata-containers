@@ -7,12 +7,12 @@ COPY ./src/runtime /workdir/src/runtime
 WORKDIR /workdir/src/runtime
 RUN CGO_ENABLED=1 GOFLAGS=-tags=strictfipsruntime make monitor
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
-COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
-
 # Add only required capabilities for the monitor
-RUN chmod u-s /usr/bin/kata-monitor
-RUN setcap "cap_dac_override+eip" /usr/bin/kata-monitor
+RUN chmod u-s kata-monitor
+RUN setcap "cap_dac_override+eip" kata-monitor
+
+FROM registry.access.redhat.com/ubi9
+COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
 
 CMD ["-h"]
 ENTRYPOINT ["/usr/bin/kata-monitor"]
