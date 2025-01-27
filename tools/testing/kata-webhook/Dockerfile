@@ -1,7 +1,7 @@
 # Copyright (c) 2019 Intel Corporation
 #
 # SPDX-License-Identifier: Apache-2.0
-FROM golang:1.21.5-alpine3.19 AS builder
+FROM golang:1.23.4-alpine3.19 AS builder
 
 WORKDIR /go/src/kata-pod-annotate
 
