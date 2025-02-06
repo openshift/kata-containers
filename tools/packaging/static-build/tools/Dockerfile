@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM ubuntu:20.04
+FROM ubuntu:24.04
 ARG GO_TOOLCHAIN
 ARG RUST_TOOLCHAIN
 

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM ubuntu:20.04
+FROM ubuntu:24.04
 ARG RUST_TOOLCHAIN
 
 COPY install_libseccomp.sh /usr/bin/install_libseccomp.sh
