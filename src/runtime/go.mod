@@ -28,7 +28,7 @@ require (
 	github.com/go-openapi/validate v0.22.1
 	github.com/godbus/dbus/v5 v5.1.1-0.20230522191255-76236955d466
 	github.com/hashicorp/go-multierror v1.1.1
-	github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9
+	github.com/intel-go/cpuid 6c0fd109086b
 	github.com/mdlayher/vsock v1.2.1
 	github.com/opencontainers/runc v1.1.12
 	github.com/opencontainers/runtime-spec v1.1.1-0.20230922153023-c0e90434df2a
