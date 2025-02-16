@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG BASE_IMAGE_NAME=alpine
-ARG BASE_IMAGE_TAG=3.18
+ARG BASE_IMAGE_TAG=3.21
 FROM $BASE_IMAGE_NAME:$BASE_IMAGE_TAG
 ARG KATA_ARTIFACTS=./kata-static.tar.xz
 ARG DESTINATION=/opt/kata-artifacts
