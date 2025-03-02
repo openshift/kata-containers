@@ -106,8 +106,8 @@ github.com/containernetworking/cni v1.1.2 h1:wtRGZVv7olUHMOqouPpn3cXJWpJgM6+EUl3
 github.com/containernetworking/cni v1.1.2/go.mod h1:sDpYKmGVENF3s6uvMvGgldDWeG8dMxakj/u+i9ht9vw=
 github.com/containernetworking/plugins v1.3.0 h1:QVNXMT6XloyMUoO2wUOqWTC1hWFV62Q6mVDp5H1HnjM=
 github.com/containernetworking/plugins v1.3.0/go.mod h1:Pc2wcedTQQCVuROOOaLBPPxrEXqqXBFt3cZ+/yVg6l0=
-github.com/containers/podman/v4 v4.9.4 h1:jWQKG8G8Fq8Gecpce1rrztwggBXEc/gRdaOtT+2uBvg=
-github.com/containers/podman/v4 v4.9.4/go.mod h1:cV1LSpxITFd3TDcmdt6qIx/NzcDsM/F6oQp6IX7CKaU=
+github.com/containers/podman/v4 v4.9.5 h1:ra09gsEaxCxmFG5AEr01D0zQ7k5VGlyaUOQhVUom54E=
+github.com/containers/podman/v4 v4.9.5/go.mod h1:5k89uA87GXmxWsHrNOVXR4x+J1J+BwW6HKiy058UbUg=
 github.com/coreos/go-systemd/v22 v22.5.1-0.20231103132048-7d375ecc2b09 h1:OoRAFlvDGCUqDLampLQjk0yeeSGdF9zzst/3G9IkBbc=
 github.com/coreos/go-systemd/v22 v22.5.1-0.20231103132048-7d375ecc2b09/go.mod h1:m2r/smMKsKwgMSAoFKHaa68ImdCSNuKE1MxvQ64xuCQ=
 github.com/cpuguy83/go-md2man/v2 v2.0.2 h1:p1EgwI/C7NhT0JmVkwCD2ZBK8j4aeHQX2pMHHBfMQ6w=

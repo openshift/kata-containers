@@ -16,7 +16,7 @@ require (
 	github.com/containerd/ttrpc v1.2.3
 	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/containernetworking/plugins v1.3.0
-	github.com/containers/podman/v4 v4.9.4
+	github.com/containers/podman/v4 v4.9.5
 	github.com/coreos/go-systemd/v22 v22.5.1-0.20231103132048-7d375ecc2b09
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.7.0
