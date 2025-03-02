@@ -136,7 +136,7 @@ replace (
 	github.com/go-openapi/swag => github.com/go-openapi/swag v0.21.1
 	github.com/opencontainers/runc => github.com/opencontainers/runc v1.1.9
 	github.com/stretchr/testify => github.com/stretchr/testify v1.8.0
-	github.com/uber-go/atomic => go.uber.org/atomic v1.5.1
+	github.com/uber-go/atomic => go.uber.org/atomic v1.11.0
 	golang.org/x/text => golang.org/x/text v0.7.0
 	google.golang.org/grpc => google.golang.org/grpc v1.47.0
 	gopkg.in/yaml.v3 => gopkg.in/yaml.v3 v3.0.1
