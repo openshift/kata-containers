@@ -13,7 +13,7 @@ require (
 	github.com/containerd/containerd v1.7.16
 	github.com/containerd/cri-containerd v1.19.0
 	github.com/containerd/fifo v1.1.0
-	github.com/containerd/ttrpc v1.2.3
+	github.com/containerd/ttrpc v1.2.7
 	github.com/containerd/typeurl/v2 v2.1.1
 	github.com/containernetworking/plugins v1.3.0
 	github.com/containers/podman/v4 v4.9.4
