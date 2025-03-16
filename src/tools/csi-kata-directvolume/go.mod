@@ -68,7 +68,7 @@ replace k8s.io/cri-api => k8s.io/cri-api v0.28.2
 
 replace k8s.io/csi-translation-lib => k8s.io/csi-translation-lib v0.28.2
 
-replace k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.28.2
+replace k8s.io/dynamic-resource-allocation => k8s.io/dynamic-resource-allocation v0.32.3
 
 replace k8s.io/kms => k8s.io/kms v0.28.2
 
