@@ -205,8 +205,8 @@ github.com/containerd/cri-containerd/pkg/api/runtimeoptions/v1
 # github.com/containerd/fifo v1.1.0
 ## explicit; go 1.18
 github.com/containerd/fifo
-# github.com/containerd/go-runc v1.0.0
-## explicit; go 1.13
+# github.com/containerd/go-runc v1.1.0
+## explicit; go 1.18
 github.com/containerd/go-runc
 # github.com/containerd/log v0.1.0
 ## explicit; go 1.20
@@ -429,6 +429,7 @@ github.com/opencontainers/runc/libcontainer/utils
 # github.com/opencontainers/runtime-spec v1.1.1-0.20230922153023-c0e90434df2a
 ## explicit
 github.com/opencontainers/runtime-spec/specs-go
+github.com/opencontainers/runtime-spec/specs-go/features
 # github.com/opencontainers/runtime-tools v0.9.1-0.20230914150019-408c51e934dc
 ## explicit; go 1.19
 github.com/opencontainers/runtime-tools/generate
