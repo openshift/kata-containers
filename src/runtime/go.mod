@@ -128,8 +128,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
-	tags.cncf.io/container-device-interface v0.7.2 // indirect
-	tags.cncf.io/container-device-interface/specs-go v0.7.0 // indirect
+	tags.cncf.io/container-device-interface v0.8.1 // indirect
+	tags.cncf.io/container-device-interface/specs-go v0.8.0 // indirect
 )
 
 replace (
