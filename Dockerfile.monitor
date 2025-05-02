@@ -5,7 +5,10 @@ COPY ./VERSION /workdir/VERSION
 COPY ./.git /workdir/.git
 COPY ./src/runtime /workdir/src/runtime
 WORKDIR /workdir/src/runtime
-RUN CGO_ENABLED=1 GOFLAGS=-tags=strictfipsruntime make monitor
+# Using the "SKIP_GO_VERSION_CHECK" flag to skip version checcking, because it
+# requires yq, which then gets installed at build time.
+# In a hermetic build environment, this is causing failure.
+RUN SKIP_GO_VERSION_CHECK=true CGO_ENABLED=1 GOFLAGS=-tags=strictfipsruntime make monitor
 
 # Add only required capabilities for the monitor
 RUN chmod u-s kata-monitor
