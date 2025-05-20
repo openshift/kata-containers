@@ -29,6 +29,7 @@ BASE_TARBALLS = serial-targets \
 	ovmf-sev-tarball \
 	ovmf-tarball \
 	qemu-snp-experimental-tarball \
+	qemu-tdx-experimental-tarball \
 	qemu-tarball \
 	stratovirt-tarball \
 	shim-v2-tarball \
@@ -146,6 +147,9 @@ ovmf-tarball:
 qemu-snp-experimental-tarball:
 	${MAKE} $@-build
 
+qemu-tdx-experimental-tarball:
+	${MAKE} $@-build
+
 qemu-tarball:
 	${MAKE} $@-build
 
@@ -172,10 +176,10 @@ rootfs-initrd-tarball: agent-tarball
 
 runk-tarball: copy-scripts-for-the-tools-build
 	${MAKE} $@-build
-rootfs-nvidia-gpu-image-tarball: agent-tarball busybox-tarball
+rootfs-nvidia-gpu-image-tarball: agent-tarball busybox-tarball kernel-nvidia-gpu-tarball
 	${MAKE} $@-build
 
-rootfs-nvidia-gpu-initrd-tarball: agent-tarball busybox-tarball
+rootfs-nvidia-gpu-initrd-tarball: agent-tarball busybox-tarball kernel-nvidia-gpu-tarball
 	${MAKE} $@-build
 
 rootfs-nvidia-gpu-confidential-image-tarball: agent-tarball busybox-tarball pause-image-tarball coco-guest-components-tarball kernel-nvidia-gpu-confidential-tarball

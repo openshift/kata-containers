@@ -348,22 +348,29 @@ impl ToQemuParams for Smp {
 
 #[derive(Debug)]
 struct Cpu {
+    r#type: String,
     cpu_features: String,
 }
 
 impl Cpu {
     fn new(config: &HypervisorConfig) -> Cpu {
         Cpu {
+            // '-cpu host' has always to be used when using KVM
+            r#type: "host".to_owned(),
             cpu_features: config.cpu_info.cpu_features.clone(),
         }
+    }
+
+    fn set_type(&mut self, cpu_type: &str) -> &mut Self {
+        self.r#type = cpu_type.to_owned();
+        self
     }
 }
 
 #[async_trait]
 impl ToQemuParams for Cpu {
     async fn qemu_params(&self) -> Result<Vec<String>> {
-        // '-cpu host' has always to be used when using KVM
-        let mut params = vec!["host".to_owned()];
+        let mut params = vec![self.r#type.clone()];
         params.push(self.cpu_features.clone());
         Ok(vec!["-cpu".to_owned(), params.join(",")])
     }
@@ -371,6 +378,7 @@ impl ToQemuParams for Cpu {
 
 /// Error type for CCW Subchannel operations
 #[derive(Debug)]
+#[allow(dead_code)]
 enum CcwError {
     DeviceAlreadyExists(String), // Error when trying to add an existing device
     #[allow(dead_code)]
@@ -379,7 +387,7 @@ enum CcwError {
 
 /// Represents a CCW subchannel for managing devices
 #[derive(Debug)]
-struct CcwSubChannel {
+pub struct CcwSubChannel {
     devices: HashMap<String, u32>, // Maps device IDs to slot indices
     addr: u32,                     // Subchannel address
     next_slot: u32,                // Next available slot index
@@ -420,7 +428,7 @@ impl CcwSubChannel {
     ///
     /// # Returns
     /// - `Result<(), CcwError>`: Ok(()) if the device was removed
-    ///  or an error if the device was not found
+    ///   or an error if the device was not found
     #[allow(dead_code)]
     fn remove_device(&mut self, dev_id: &str) -> Result<(), CcwError> {
         if self.devices.remove(dev_id).is_some() {
@@ -458,6 +466,7 @@ struct Machine {
     options: String,
     nvdimm: bool,
     kernel_irqchip: Option<String>,
+    confidential_guest_support: String,
 
     is_nvdimm_supported: bool,
     memory_backend: Option<String>,
@@ -467,14 +476,14 @@ impl Machine {
     fn new(config: &HypervisorConfig) -> Machine {
         #[cfg(any(
             target_arch = "aarch64",
-            target_arch = "powerpc64",
+            all(target_arch = "powerpc64", target_endian = "little"),
             target_arch = "x86",
             target_arch = "x86_64",
         ))]
         let is_nvdimm_supported = config.machine_info.machine_type != "microvm";
         #[cfg(not(any(
             target_arch = "aarch64",
-            target_arch = "powerpc64",
+            all(target_arch = "powerpc64", target_endian = "little"),
             target_arch = "x86",
             target_arch = "x86_64",
         )))]
@@ -486,6 +495,7 @@ impl Machine {
             options: config.machine_info.machine_accelerators.clone(),
             nvdimm: false,
             kernel_irqchip: None,
+            confidential_guest_support: "".to_owned(),
             is_nvdimm_supported,
             memory_backend: None,
         }
@@ -508,6 +518,11 @@ impl Machine {
         self.kernel_irqchip = Some(kernel_irqchip.to_owned());
         self
     }
+
+    fn set_confidential_guest_support(&mut self, scheme: &str) -> &mut Self {
+        self.confidential_guest_support = scheme.to_owned();
+        self
+    }
 }
 
 #[async_trait]
@@ -528,7 +543,31 @@ impl ToQemuParams for Machine {
         if let Some(mem_backend) = &self.memory_backend {
             params.push(format!("memory-backend={}", mem_backend));
         }
+        if !self.confidential_guest_support.is_empty() {
+            params.push(format!(
+                "confidential-guest-support={}",
+                self.confidential_guest_support
+            ));
+        }
         Ok(vec!["-machine".to_owned(), params.join(",")])
+    }
+}
+
+#[derive(Debug)]
+struct Bios {
+    filepath: String,
+}
+
+impl Bios {
+    fn new(filepath: String) -> Self {
+        Bios { filepath }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for Bios {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec!["-bios".to_owned(), self.filepath.clone()])
     }
 }
 
@@ -851,13 +890,13 @@ struct BlockBackend {
 }
 
 impl BlockBackend {
-    fn new(id: &str, path: &str) -> BlockBackend {
+    fn new(id: &str, path: &str, cache_direct: bool) -> BlockBackend {
         BlockBackend {
             driver: "file".to_owned(),
             id: id.to_owned(),
             path: path.to_owned(),
             aio: "threads".to_owned(),
-            cache_direct: true,
+            cache_direct,
             cache_no_flush: false,
             read_only: true,
         }
@@ -1180,17 +1219,26 @@ pub struct DeviceVirtioNet {
 
     num_queues: u32,
     iommu_platform: bool,
+    bus_type: VirtioBusType,
+    devno: Option<String>,
 }
 
 impl DeviceVirtioNet {
-    fn new(netdev_id: &str, mac_address: Address) -> DeviceVirtioNet {
+    fn new(
+        netdev_id: &str,
+        mac_address: Address,
+        bus_type: VirtioBusType,
+        devno: Option<String>,
+    ) -> DeviceVirtioNet {
         DeviceVirtioNet {
-            device_driver: "virtio-net-pci".to_owned(),
+            device_driver: format!("virtio-net-{}", bus_type),
             netdev_id: netdev_id.to_owned(),
             mac_address,
             disable_modern: false,
             num_queues: 1,
             iommu_platform: false,
+            bus_type,
+            devno,
         }
     }
 
@@ -1248,8 +1296,14 @@ impl ToQemuParams for DeviceVirtioNet {
             params.push("iommu_platform=on".to_owned());
         }
 
+        if let Some(devno) = &self.devno {
+            params.push(format!("devno={}", devno));
+        }
+
         params.push("mq=on".to_owned());
-        params.push(format!("vectors={}", 2 * self.num_queues + 2));
+        if self.bus_type == VirtioBusType::Pci {
+            params.push(format!("vectors={}", 2 * self.num_queues + 2));
+        }
 
         Ok(vec!["-device".to_owned(), params.join(",")])
     }
@@ -1539,13 +1593,14 @@ impl MonitorProtocol {
     }
 }
 
-impl ToString for MonitorProtocol {
-    fn to_string(&self) -> String {
-        match *self {
+impl std::fmt::Display for MonitorProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let to_string = match *self {
             MonitorProtocol::Hmp => "monitor".to_string(),
             MonitorProtocol::QmpPretty => "qmp-pretty".to_string(),
             _ => "qmp".to_string(),
-        }
+        };
+        write!(f, "{}", to_string)
     }
 }
 
@@ -1603,7 +1658,7 @@ impl QmpSocket {
 #[async_trait]
 impl ToQemuParams for QmpSocket {
     async fn qemu_params(&self) -> Result<Vec<String>> {
-        let param_qmp = format!("-{}", self.protocol.to_string());
+        let param_qmp = format!("-{}", self.protocol);
 
         let mut params: Vec<String> = Vec::new();
 
@@ -1700,6 +1755,75 @@ impl ToQemuParams for ObjectIoThread {
     }
 }
 
+#[derive(Debug)]
+struct ObjectSeGuest {
+    id: String,
+}
+
+impl ObjectSeGuest {
+    fn new(id: &str) -> Self {
+        ObjectSeGuest { id: id.to_owned() }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for ObjectSeGuest {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        let mut params = Vec::new();
+        params.push("s390-pv-guest".to_owned());
+        params.push(format!("id={}", self.id));
+
+        Ok(vec!["-object".to_owned(), params.join(",")])
+    }
+}
+
+#[derive(Debug)]
+struct ObjectSevSnpGuest {
+    id: String,
+    cbitpos: u32,
+    reduced_phys_bits: u32,
+    kernel_hashes: bool,
+
+    is_snp: bool,
+}
+
+impl ObjectSevSnpGuest {
+    fn new(is_snp: bool, cbitpos: u32) -> Self {
+        ObjectSevSnpGuest {
+            id: (if is_snp { "snp" } else { "sev" }).to_owned(),
+            cbitpos,
+            reduced_phys_bits: 1,
+            kernel_hashes: true,
+            is_snp,
+        }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for ObjectSevSnpGuest {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        let mut params = Vec::new();
+        params.push(
+            (if self.is_snp {
+                "sev-snp-guest"
+            } else {
+                "sev-guest"
+            })
+            .to_owned(),
+        );
+        params.push(format!("id={}", self.id));
+        params.push(format!("cbitpos={}", self.cbitpos));
+        params.push(format!("reduced-phys-bits={}", self.reduced_phys_bits));
+        if self.is_snp {
+            params.push(format!(
+                "kernel-hashes={}",
+                if self.kernel_hashes { "on" } else { "off" }
+            ));
+        }
+        Ok(vec!["-object".to_owned(), params.join(",")])
+    }
+}
+
 fn is_running_in_vm() -> Result<bool> {
     let res = read_to_string("/proc/cpuinfo")?
         .lines()
@@ -1791,6 +1915,10 @@ impl<'a> QemuCmdLine<'a> {
 
         if config.blockdev_info.block_device_driver == VIRTIO_SCSI {
             qemu_cmd_line.add_scsi_controller();
+        }
+
+        if config.device_info.reclaim_guest_freed_memory {
+            qemu_cmd_line.add_virtio_balloon();
         }
 
         Ok(qemu_cmd_line)
@@ -1953,9 +2081,9 @@ impl<'a> QemuCmdLine<'a> {
         Ok(())
     }
 
-    pub fn add_block_device(&mut self, device_id: &str, path: &str) -> Result<()> {
+    pub fn add_block_device(&mut self, device_id: &str, path: &str, is_direct: bool) -> Result<()> {
         self.devices
-            .push(Box::new(BlockBackend::new(device_id, path)));
+            .push(Box::new(BlockBackend::new(device_id, path, is_direct)));
         let devno = get_devno_ccw(&mut self.ccw_subchannel, device_id);
         self.devices.push(Box::new(DeviceVirtioBlk::new(
             device_id,
@@ -1976,8 +2104,12 @@ impl<'a> QemuCmdLine<'a> {
     }
 
     pub fn add_network_device(&mut self, host_dev_name: &str, guest_mac: Address) -> Result<()> {
-        let (netdev, virtio_net_device) =
-            get_network_device(self.config, host_dev_name, guest_mac)?;
+        let (netdev, virtio_net_device) = get_network_device(
+            self.config,
+            host_dev_name,
+            guest_mac,
+            &mut self.ccw_subchannel,
+        )?;
 
         self.devices.push(Box::new(netdev));
         self.devices.push(Box::new(virtio_net_device));
@@ -2005,6 +2137,59 @@ impl<'a> QemuCmdLine<'a> {
         console_socket_chardev.set_server(true);
         console_socket_chardev.set_wait(false);
         self.devices.push(Box::new(console_socket_chardev));
+    }
+
+    pub fn add_virtio_balloon(&mut self) {
+        let balloon_device = DeviceVirtioBalloon::new();
+        self.devices.push(Box::new(balloon_device));
+    }
+
+    pub fn add_se_protection_device(&mut self) {
+        let se_object = ObjectSeGuest::new("pv0");
+        self.devices.push(Box::new(se_object));
+
+        self.machine
+            .set_confidential_guest_support("pv0")
+            .set_nvdimm(false);
+
+        self.kernel.params.remove_all_by_key("reboot".to_string());
+        self.kernel
+            .params
+            .remove_all_by_key("systemd.unit".to_string());
+        self.kernel
+            .params
+            .remove_all_by_key("systemd.mask".to_string());
+        self.kernel.params.remove_all_by_key("root".to_string());
+        self.kernel
+            .params
+            .remove_all_by_key("rootflags".to_string());
+        self.kernel
+            .params
+            .remove_all_by_key("rootfstype".to_string());
+    }
+
+    pub fn add_sev_protection_device(&mut self, cbitpos: u32, firmware: &str) {
+        let sev_object = ObjectSevSnpGuest::new(false, cbitpos);
+        self.devices.push(Box::new(sev_object));
+
+        self.devices.push(Box::new(Bios::new(firmware.to_owned())));
+
+        self.machine
+            .set_confidential_guest_support("sev")
+            .set_nvdimm(false);
+    }
+
+    pub fn add_sev_snp_protection_device(&mut self, cbitpos: u32, firmware: &str) {
+        let sev_snp_object = ObjectSevSnpGuest::new(true, cbitpos);
+        self.devices.push(Box::new(sev_snp_object));
+
+        self.devices.push(Box::new(Bios::new(firmware.to_owned())));
+
+        self.machine
+            .set_confidential_guest_support("snp")
+            .set_nvdimm(false);
+
+        self.cpu.set_type("EPYC-v4");
     }
 
     pub async fn build(&self) -> Result<Vec<String>> {
@@ -2035,6 +2220,7 @@ pub fn get_network_device(
     config: &HypervisorConfig,
     host_dev_name: &str,
     guest_mac: Address,
+    ccw_subchannel: &mut Option<CcwSubChannel>,
 ) -> Result<(Netdev, DeviceVirtioNet)> {
     let mut netdev = Netdev::new(
         &format!("network-{}", host_dev_name),
@@ -2045,7 +2231,9 @@ pub fn get_network_device(
         netdev.set_disable_vhost_net(true);
     }
 
-    let mut virtio_net_device = DeviceVirtioNet::new(&netdev.id, guest_mac);
+    let devno = get_devno_ccw(ccw_subchannel, &netdev.id);
+    let mut virtio_net_device =
+        DeviceVirtioNet::new(&netdev.id, guest_mac, bus_type(config), devno);
 
     if should_disable_modern() {
         virtio_net_device.set_disable_modern(true);
@@ -2070,4 +2258,23 @@ fn get_devno_ccw(ccw_subchannel: &mut Option<CcwSubChannel>, device_name: &str) 
             |slot| Some(subchannel.address_format_ccw(slot)),
         )
     })
+}
+
+#[derive(Debug)]
+struct DeviceVirtioBalloon {}
+
+impl DeviceVirtioBalloon {
+    fn new() -> Self {
+        DeviceVirtioBalloon {}
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for DeviceVirtioBalloon {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec![
+            "-device".to_owned(),
+            "virtio-balloon,free-page-reporting=on".to_owned(),
+        ])
+    }
 }

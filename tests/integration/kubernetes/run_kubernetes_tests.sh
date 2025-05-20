@@ -74,6 +74,7 @@ else
 		"k8s-policy-hard-coded.bats" \
 		"k8s-policy-deployment.bats" \
 		"k8s-policy-job.bats" \
+		"k8s-policy-logs.bats" \
 		"k8s-policy-pod.bats" \
 		"k8s-policy-pvc.bats" \
 		"k8s-policy-rc.bats" \
@@ -131,8 +132,9 @@ ensure_yq
 info "Running tests with bats version: $(bats --version)"
 
 tests_fail=()
-for K8S_TEST_ENTRY in ${K8S_TEST_UNION[@]}
+for K8S_TEST_ENTRY in "${K8S_TEST_UNION[@]}"
 do
+	K8S_TEST_ENTRY=$(echo "$K8S_TEST_ENTRY" | tr -d '[:space:][:cntrl:]')
 	info "$(kubectl get pods --all-namespaces 2>&1)"
 	info "Executing ${K8S_TEST_ENTRY}"
 	if ! bats --show-output-of-passing-tests "${K8S_TEST_ENTRY}"; then

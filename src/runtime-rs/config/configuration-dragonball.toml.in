@@ -98,11 +98,15 @@ default_maxvcpus = @DEFMAXVCPUS_DB@
 # > 5                --> will be set to 5
 default_bridges = @DEFBRIDGES@
 
-# Enable balloon f_reporting
-# Enabling this will result in the VM balloon device having f_reporting=on set
+# Reclaim guest freed memory.
+# Enabling this will result in the VM balloon device having f_reporting=on set.
+# Then the hypervisor will use it to reclaim guest freed memory.
+# This is useful for reducing the amount of memory used by a VM.
+# Enabling this feature may sometimes reduce the speed of memory access in
+# the VM.
 #
 # Default false
-#enable_balloon_f_reporting = true
+#reclaim_guest_freed_memory = true
 
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
@@ -134,7 +138,7 @@ block_device_driver = "@DEFBLOCKSTORAGEDRIVER_DB@"
 # - error
 # - critical
 # Default: info
-#log_level = info
+#log_level = "info"
 
 # Disable the customizations done in the runtime when it detects
 # that it is running on top a VMM. This will result in the runtime
@@ -200,6 +204,11 @@ virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
 #    Metadata, data, and pathname lookup are cached in guest and never expire.
 virtio_fs_cache = "@DEFVIRTIOFSCACHE@"
 
+# Specifies cache-related options for block devices.
+# Denotes whether use of O_DIRECT (bypass the host page cache) is enabled.
+# Default false
+#block_device_cache_direct = true
+
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory
 # being allocated using huge pages.
@@ -207,6 +216,23 @@ virtio_fs_cache = "@DEFVIRTIOFSCACHE@"
 # stacks within the container. This will automatically
 # result in memory pre allocation
 #enable_hugepages = true
+
+# Enable swap in the guest. Default false.
+# When enable_guest_swap is enabled, insert a raw file to the guest as the swap device.
+#enable_guest_swap = true
+
+# If enable_guest_swap is enabled, the swap device will be created in the guest
+# at this path. Default "/run/kata-containers/swap".
+#guest_swap_path = "/run/kata-containers/swap"
+
+# The percentage of the total memory to be used as swap device.
+# Default 100.
+#guest_swap_size_percent = 100
+
+# The threshold in seconds to create swap device in the guest.
+# Kata will wait guest_swap_create_threshold_secs seconds before creating swap device.
+# Default 60.
+#guest_swap_create_threshold_secs = 60
 
 [agent.@PROJECT_TYPE@]
 container_pipe_size=@PIPESIZE@
@@ -223,7 +249,7 @@ container_pipe_size=@PIPESIZE@
 # - error
 # - critical
 # (default: info)
-#log_level = info
+#log_level = "info"
 
 # Enable agent tracing.
 #
@@ -370,7 +396,7 @@ container_pipe_size=@PIPESIZE@
 # - error
 # - critical
 # (default: info)
-#log_level = info
+#log_level = "info"
 
 # If enabled, enabled, it means that 1) if the runtime exits abnormally,
 # the cleanup process will be skipped, and 2) the runtime will not exit

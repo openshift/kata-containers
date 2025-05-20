@@ -30,7 +30,7 @@ jobs:
 
   publish-kata-deploy-payload-amd64:
     needs: build-kata-static-tarball-amd64
-    uses: ./.github/workflows/publish-kata-deploy-payload-amd64.yaml
+    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -38,6 +38,8 @@ jobs:
       tag: ${{ inputs.tag }}-amd64
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
+      runner: ubuntu-22.04
+      arch: amd64
     secrets: inherit
 
   build-kata-static-tarball-arm64:
@@ -49,7 +51,7 @@ jobs:
 
   publish-kata-deploy-payload-arm64:
     needs: build-kata-static-tarball-arm64
-    uses: ./.github/workflows/publish-kata-deploy-payload-arm64.yaml
+    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -57,6 +59,8 @@ jobs:
       tag: ${{ inputs.tag }}-arm64
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
+      runner: ubuntu-22.04-arm
+      arch: arm64
     secrets: inherit
 
   build-kata-static-tarball-s390x:
@@ -76,7 +80,7 @@ jobs:
 
   publish-kata-deploy-payload-s390x:
     needs: build-kata-static-tarball-s390x
-    uses: ./.github/workflows/publish-kata-deploy-payload-s390x.yaml
+    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -84,11 +88,13 @@ jobs:
       tag: ${{ inputs.tag }}-s390x
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
+      runner: s390x
+      arch: s390x
     secrets: inherit
 
   publish-kata-deploy-payload-ppc64le:
     needs: build-kata-static-tarball-ppc64le
-    uses: ./.github/workflows/publish-kata-deploy-payload-ppc64le.yaml
+    uses: ./.github/workflows/publish-kata-deploy-payload.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -96,6 +102,8 @@ jobs:
       tag: ${{ inputs.tag }}-ppc64le
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
+      runner: ppc64le
+      arch: ppc64le
     secrets: inherit
 
   build-and-publish-tee-confidential-unencrypted-image:
@@ -114,20 +122,20 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target-branch }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Login to Kata Containers ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           tags: ghcr.io/kata-containers/test-images:unencrypted-${{ inputs.pr-number }}
           push: true
@@ -167,17 +175,17 @@ jobs:
           cp /opt/kata/bin/csi-kata-directvolume src/tools/csi-kata-directvolume/bin/directvolplugin
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
       - name: Login to Kata Containers ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           tags: ghcr.io/kata-containers/csi-kata-directvolume:${{ inputs.pr-number }}
           push: true
@@ -221,6 +229,18 @@ jobs:
       target-branch: ${{ inputs.target-branch }}
     secrets: inherit
 
+  run-k8s-tests-on-arm64:
+    if: ${{ inputs.skip-test != 'yes' }}
+    needs: publish-kata-deploy-payload-arm64
+    uses: ./.github/workflows/run-k8s-tests-on-arm64.yaml
+    with:
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ inputs.tag }}-arm64
+      commit-hash: ${{ inputs.commit-hash }}
+      pr-number: ${{ inputs.pr-number }}
+      target-branch: ${{ inputs.target-branch }}
+
   run-kata-coco-tests:
     if: ${{ inputs.skip-test != 'yes' }}
     needs:
@@ -263,13 +283,28 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
 
+  run-kata-deploy-tests:
+    if: ${{ inputs.skip-test != 'yes' }}
+    needs: [publish-kata-deploy-payload-amd64]
+    uses: ./.github/workflows/run-kata-deploy-tests.yaml
+    with:
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ inputs.tag }}-amd64
+      commit-hash: ${{ inputs.commit-hash }}
+      pr-number: ${{ inputs.pr-number }}
+      target-branch: ${{ inputs.target-branch }}
+
   run-metrics-tests:
     if: ${{ inputs.skip-test != 'yes' }}
     needs: build-kata-static-tarball-amd64
     uses: ./.github/workflows/run-metrics.yaml
     with:
-      tarball-suffix: -${{ inputs.tag }}
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ inputs.tag }}-amd64
       commit-hash: ${{ inputs.commit-hash }}
+      pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
 
   run-basic-amd64-tests:

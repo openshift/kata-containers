@@ -25,6 +25,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
 )
 
 // Machine describes the machine type qemu will emulate.
@@ -300,10 +302,6 @@ type Object struct {
 	// and UEFI program image.
 	FirmwareVolume string
 
-	// The path to the file containing the AMD SEV-SNP certificate chain
-	// (including VCEK/VLEK certificates).
-	SnpCertsPath string
-
 	// CBitPos is the location of the C-bit in a guest page table entry
 	// This is only relevant for sev-guest objects
 	CBitPos uint32
@@ -320,6 +318,14 @@ type Object struct {
 
 	// QgsPort defines Intel Quote Generation Service port exposed from the host
 	QgsPort uint32
+
+	// SnpIdBlock is the 96-byte, base64-encoded blob to provide the ‘ID Block’ structure
+	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
+	SnpIdBlock string
+
+	// SnpIdAuth is the 4096-byte, base64-encoded blob to provide the ‘ID Authentication Information Structure’
+	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
+	SnpIdAuth string
 }
 
 // Valid returns true if the Object structure is valid and complete.
@@ -383,7 +389,6 @@ func (object Object) QemuParams(config *Config) []string {
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
 		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
 		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
-
 		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
 		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
 	case SNPGuest:
@@ -392,12 +397,13 @@ func (object Object) QemuParams(config *Config) []string {
 		objectParams = append(objectParams, fmt.Sprintf("cbitpos=%d", object.CBitPos))
 		objectParams = append(objectParams, fmt.Sprintf("reduced-phys-bits=%d", object.ReducedPhysBits))
 		objectParams = append(objectParams, "kernel-hashes=on")
-		if object.SnpCertsPath != "" {
-			objectParams = append(objectParams, fmt.Sprintf("certs-path=%s", object.SnpCertsPath))
+		if object.SnpIdBlock != "" {
+			objectParams = append(objectParams, fmt.Sprintf("id-block=%s", object.SnpIdBlock))
 		}
-
-		driveParams = append(driveParams, "if=pflash,format=raw,readonly=on")
-		driveParams = append(driveParams, fmt.Sprintf("file=%s", object.File))
+		if object.SnpIdAuth != "" {
+			objectParams = append(objectParams, fmt.Sprintf("id-auth=%s", object.SnpIdAuth))
+		}
+		config.Bios = object.File
 	case SecExecGuest:
 		objectParams = append(objectParams, string(object.Type))
 		objectParams = append(objectParams, fmt.Sprintf("id=%s", object.ID))
@@ -1869,6 +1875,9 @@ func (b PCIeSwitchDownstreamPortDevice) Valid() bool {
 
 // VFIODevice represents a qemu vfio device meant for direct access by guest OS.
 type VFIODevice struct {
+	// ID index of the vfio device in devfs or sysfs used for IOMMUFD
+	ID string
+
 	// Bus-Device-Function of device
 	BDF string
 
@@ -1892,6 +1901,9 @@ type VFIODevice struct {
 
 	// SysfsDev specifies the sysfs matrix entry for the AP device
 	SysfsDev string
+
+	// DevfsDev is used to identify a VFIO Group device or IOMMMUFD VFIO device
+	DevfsDev string
 }
 
 // VFIODeviceTransport is a map of the vfio device name that corresponds to
@@ -1944,6 +1956,12 @@ func (vfioDev VFIODevice) QemuParams(config *Config) []string {
 
 	if vfioDev.Transport.isVirtioCCW(config) {
 		deviceParams = append(deviceParams, fmt.Sprintf("devno=%s", vfioDev.DevNo))
+	}
+
+	if strings.HasPrefix(vfioDev.DevfsDev, drivers.IommufdDevPath) {
+		qemuParams = append(qemuParams, "-object")
+		qemuParams = append(qemuParams, fmt.Sprintf("iommufd,id=iommufd%s", vfioDev.ID))
+		deviceParams = append(deviceParams, fmt.Sprintf("iommufd=iommufd%s", vfioDev.ID))
 	}
 
 	qemuParams = append(qemuParams, "-device")

@@ -38,8 +38,8 @@ default StopTracingRequest := false
 default TtyWinResizeRequest := true
 default UpdateContainerRequest := false
 default UpdateEphemeralMountsRequest := false
-default UpdateInterfaceRequest := true
-default UpdateRoutesRequest := true
+default UpdateInterfaceRequest := false
+default UpdateRoutesRequest := false
 default WaitProcessRequest := true
 default WriteStreamRequest := false
 
@@ -86,7 +86,7 @@ CreateContainerRequest:= {"ops": ops, "allowed": true} {
     i_namespace := i_oci.Annotations[S_NAMESPACE_KEY]
     print ("CreateContainerRequest: p_namespace =", p_namespace, "i_namespace =", i_namespace)
     add_namespace_to_state := allow_namespace(p_namespace, i_namespace)
-    ops := concat_op_if_not_null(ops_builder1, add_namespace_to_state)
+    ops_builder2 := concat_op_if_not_null(ops_builder1, add_namespace_to_state)
 
     print("CreateContainerRequest: p Version =", p_oci.Version, "i Version =", i_oci.Version)
     p_oci.Version == i_oci.Version
@@ -102,7 +102,10 @@ CreateContainerRequest:= {"ops": ops, "allowed": true} {
     p_devices := p_container.devices
     allow_devices(p_devices, i_devices)
 
-    allow_linux(p_oci, i_oci)
+    ret := allow_linux(ops_builder2, p_oci, i_oci)
+    ret.allowed
+
+    ops := ret.ops
 
     print("CreateContainerRequest: true")
 }
@@ -129,7 +132,6 @@ allow_create_container_input {
     is_null(i_linux.Resources.Network)
     is_null(i_linux.Resources.Pids)
     is_null(i_linux.Seccomp)
-    i_linux.Sysctl == {}
 
     i_process := i_oci.Process
     count(i_process.SelinuxLabel) == 0
@@ -150,11 +152,12 @@ allow_namespace(p_namespace, i_namespace) = add_namespace {
     add_namespace := state_allows("namespace", i_namespace)
 }
 
-# value hasn't been seen before, save it to state
+# key hasn't been seen before, save key, value pair to state
 state_allows(key, value) = action {
   state := get_state()
+  print("state_allows 1: state[key] =", state[key], "value =", value)
   not state[key]
-  print("state_allows: saving to state key =", key, "value =", value)
+  print("state_allows 1: saving to state key =", key, "value =", value)
   path := get_state_path(key) 
   action := {
     "op": "add",
@@ -165,9 +168,11 @@ state_allows(key, value) = action {
 
 # value matches what's in state, allow it
 state_allows(key, value) = action {
+  print("state_allows 2: start")
   state := get_state()
+  print("state_allows 2: state[key] =", state[key], "value =", value)
   value == state[key]
-  print("state_allows: found key =", key, "value =", value, " in state")
+  print("state_allows 2: found key =", key, "value =", value, " in state")
   action := null
 }
 
@@ -181,7 +186,7 @@ get_state_path(key) = path {
     path := concat("/", ["/pstate", key])
 }
 
-# Helper functions to conditionally concatenate if op is not null
+# Helper functions to conditionally concatenate op is not null
 concat_op_if_not_null(ops, op) = result {
     op == null
     result := ops
@@ -270,19 +275,10 @@ allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, s_name) {
 }
 
 allow_sandbox_name(p_s_name, i_s_name) {
-    print("allow_sandbox_name 1: start")
+    print("allow_sandbox_name: start")
+    regex.match(p_s_name, i_s_name)
 
-    p_s_name == i_s_name
-
-    print("allow_sandbox_name 1: true")
-}
-allow_sandbox_name(p_s_name, i_s_name) {
-    print("allow_sandbox_name 2: start")
-
-    # TODO: should generated names be handled differently?
-    contains(p_s_name, "$(generated-name)")
-
-    print("allow_sandbox_name 2: true")
+    print("allow_sandbox_name: true")
 }
 
 # Check that the "io.kubernetes.cri.container-type" and
@@ -439,20 +435,73 @@ allow_devices(p_devices, i_devices) {
     print("allow_devices: true")
 }
 
-allow_linux(p_oci, i_oci) {
+allow_linux(state_ops, p_oci, i_oci) := {"ops": ops, "allowed": true} {
     p_namespaces := p_oci.Linux.Namespaces
     print("allow_linux: p namespaces =", p_namespaces)
 
     i_namespaces := i_oci.Linux.Namespaces
     print("allow_linux: i namespaces =", i_namespaces)
 
-    p_namespaces == i_namespaces
+    i_namespace_without_network := [obj | obj := i_namespaces[_]; obj.Type != "network"]
+
+    print("allow_linux: i_namespace_without_network =", i_namespace_without_network)
+
+    p_namespaces == i_namespace_without_network
 
     allow_masked_paths(p_oci, i_oci)
     allow_readonly_paths(p_oci, i_oci)
     allow_linux_devices(p_oci.Linux.Devices, i_oci.Linux.Devices)
+    allow_linux_sysctl(p_oci.Linux, i_oci.Linux)
+    ret := allow_network_namespace_start(state_ops, p_oci, i_oci)
+    ret.allowed
+
+    ops := ret.ops
 
     print("allow_linux: true")
+}
+
+# Retrieve the "network" namespace from the input data and pass it on for the
+# network namespace policy checks.
+allow_network_namespace_start(state_ops, p_oci, i_oci) := {"ops": ops, "allowed": true} {
+    print("allow_network_namespace start: start")
+
+    p_namespaces := p_oci.Linux.Namespaces
+    print("allow_network_namespace start: p namespaces =", p_namespaces)
+
+    i_namespaces := i_oci.Linux.Namespaces
+    print("allow_network_namespace start: i namespaces =", i_namespaces)
+
+    # Return path of the "network" namespace
+    network_ns := [obj | obj := i_namespaces[_]; obj.Type == "network"]
+
+    print("allow_network_namespace start: network_ns =", network_ns)
+
+    ret := allow_network_namespace(state_ops, network_ns)
+    ret.allowed
+
+    ops := ret.ops
+}
+
+# This rule is when there's no network namespace in the input data.
+allow_network_namespace(state_ops, network_ns) := {"ops": ops, "allowed": true} {
+    count(network_ns) == 0
+
+    network_ns_path = ""
+
+    add_network_namespace_to_state := state_allows("network_namespace", network_ns_path)
+    ops := concat_op_if_not_null(state_ops, add_network_namespace_to_state)
+
+    print("allow_network_namespace 1: true")
+}
+
+# This rule is when there's exactly one network namespace in the input data.
+allow_network_namespace(state_ops, network_ns) := {"ops": ops, "allowed": true} {
+    count(network_ns) == 1
+
+    add_network_namespace_to_state := state_allows("network_namespace", network_ns[0].Path)
+    ops := concat_op_if_not_null(state_ops, add_network_namespace_to_state)
+
+    print("allow_network_namespace 2: true")
 }
 
 allow_masked_paths(p_oci, i_oci) {
@@ -547,6 +596,23 @@ allow_linux_devices(p_devices, i_devices) {
         i_device.Path == p_device.Path
     }
     print("allow_linux_devices: true")
+}
+
+allow_linux_sysctl(p_linux, i_linux) {
+    print("allow_linux_sysctl 1: start")
+    not i_linux.Sysctl
+    print("allow_linux_sysctl 1: true")
+}
+
+allow_linux_sysctl(p_linux, i_linux) {
+    print("allow_linux_sysctl 2: start")
+    p_sysctl := p_linux.Sysctl
+    i_sysctl := i_linux.Sysctl
+    every i_name, i_val in i_sysctl {
+        print("allow_linux_sysctl 2: i_name =", i_name, "i_val =", i_val)
+        p_sysctl[i_name] == i_val
+    }
+    print("allow_linux_sysctl 2: true")
 }
 
 # Check the consistency of the input "io.katacontainers.pkg.oci.bundle_path"
@@ -1242,6 +1308,49 @@ ExecProcessRequest {
     regex.match(p_regex, i_command)
 
     print("ExecProcessRequest 3: true")
+}
+
+UpdateRoutesRequest {
+    print("UpdateRoutesRequest: input =", input)
+    print("UpdateRoutesRequest: policy =", policy_data.request_defaults.UpdateRoutesRequest)
+
+    i_routes := input.routes.Routes
+    p_source_regex = policy_data.request_defaults.UpdateRoutesRequest.forbidden_source_regex
+    p_names = policy_data.request_defaults.UpdateRoutesRequest.forbidden_device_names
+
+    every i_route in i_routes {
+        print("i_route.source =", i_route.source)
+        every p_regex in p_source_regex {
+            print("p_regex =", p_regex)
+            not regex.match(p_regex, i_route.source)
+        }
+
+        print("i_route.device =", i_route.device)
+        not i_route.device in p_names
+    }
+
+    print("UpdateRoutesRequest: true")
+}
+
+UpdateInterfaceRequest {
+    print("UpdateInterfaceRequest: input =", input)
+    print("UpdateInterfaceRequest: policy =", policy_data.request_defaults.UpdateInterfaceRequest)
+
+    i_interface := input.interface
+    p_flags := policy_data.request_defaults.UpdateInterfaceRequest.allow_raw_flags
+
+    # Typically, just IFF_NOARP is used.
+    bits.and(i_interface.raw_flags, bits.negate(p_flags)) == 0
+
+    p_names := policy_data.request_defaults.UpdateInterfaceRequest.forbidden_names
+
+    not i_interface.name in p_names
+
+    p_hwaddrs := policy_data.request_defaults.UpdateInterfaceRequest.forbidden_hw_addrs
+
+    not i_interface.hwAddr in p_hwaddrs
+
+    print("UpdateInterfaceRequest: true")
 }
 
 CloseStdinRequest {

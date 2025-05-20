@@ -96,12 +96,12 @@ function kubectl_retry() {
 	local interval=15
 	local i=0
 	while true; do
-		kubectl $@ && return 0 || true
+		kubectl "$@" && return 0 || true
 		i=$((i + 1))
-		[ $i -lt $max_tries ] && echo "'kubectl $@' failed, retrying in $interval seconds" 1>&2 || break
+		[ $i -lt $max_tries ] && echo "'kubectl $*' failed, retrying in $interval seconds" 1>&2 || break
 		sleep $interval
 	done
-	echo "'kubectl $@' failed after $max_tries tries" 1>&2 && return 1
+	echo "'kubectl $*' failed after $max_tries tries" 1>&2 && return 1
 }
 
 function waitForProcess() {
@@ -298,23 +298,6 @@ function clean_env_ctr()
 	fi
 }
 
-# Kills running shim and hypervisor components
-function kill_kata_components() {
-	local ATTEMPTS=2
-	local TIMEOUT="30s"
-	local PID_NAMES=( "containerd-shim-kata-v2" "qemu-system-x86_64" "qemu-system-x86_64-tdx-experimental" "cloud-hypervisor" )
-
-	sudo systemctl stop containerd
-	# iterate over the list of kata components and stop them
-	for (( i=1; i<=ATTEMPTS; i++ )); do
-		for PID_NAME in "${PID_NAMES[@]}"; do
-			[[ ! -z "$(pidof ${PID_NAME})" ]] && sudo killall -w -s SIGKILL "${PID_NAME}" >/dev/null 2>&1 || true
-		done
-		sleep 1
-	done
-	sudo timeout -s SIGKILL "${TIMEOUT}" systemctl start containerd
-}
-
 # Restarts a systemd service while ensuring the start-limit-burst is set to 0.
 # Outputs warnings to stdio if something has gone wrong.
 #
@@ -332,8 +315,8 @@ function restart_systemd_service_with_no_burst_limit() {
 		local unit_file=$(systemctl show "$service.service" -p FragmentPath | cut -d'=' -f2)
 		[ -f "$unit_file" ] || { warn "Can't find $service's unit file: $unit_file"; return 1; }
 
-		# If the unit file is in /lib, copy it to /etc
-		if [[ $unit_file == /lib* ]]; then
+		# If the unit file is in /lib or /usr/lib, copy it to /etc
+		if [[ $unit_file =~ ^/(usr/)?lib/ ]]; then
 			tmp_unit_file="/etc/${unit_file#*lib/}"
 			sudo cp "$unit_file" "$tmp_unit_file"
 			unit_file="$tmp_unit_file"
@@ -492,7 +475,7 @@ function enabling_hypervisor() {
 	declare -r CONTAINERD_SHIM_KATA="/usr/local/bin/containerd-shim-kata-${KATA_HYPERVISOR}-v2"
 
 	case "${KATA_HYPERVISOR}" in
-		dragonball|cloud-hypervisor|qemu-runtime-rs)
+		dragonball|cloud-hypervisor|qemu-runtime-rs|qemu-se-runtime-rs)
 			sudo ln -sf "${KATA_DIR}/runtime-rs/bin/containerd-shim-kata-v2" "${CONTAINERD_SHIM_KATA}"
 			declare -r CONFIG_DIR="${KATA_DIR}/share/defaults/kata-containers/runtime-rs"
 			;;
@@ -601,7 +584,7 @@ function clone_cri_containerd() {
 # version: the version of the tarball that will be downloaded
 # tarball-name: the name of the tarball that will be downloaded
 function download_github_project_tarball() {
-	project="${1}" 
+	project="${1}"
 	version="${2}"
 	tarball_name="${3}"
 
@@ -731,7 +714,7 @@ OOMScoreAdjust=-999
 [Install]
 WantedBy=multi-user.target
 EOF
-	fi 
+	fi
 }
 
 # base_version: The version to be intalled in the ${major}.${minor} format
@@ -836,6 +819,7 @@ function arch_to_golang() {
 	case "${arch}" in
 		aarch64) echo "arm64";;
 		ppc64le) echo "${arch}";;
+		riscv64) echo "${arch}";;
 		x86_64) echo "amd64";;
 		s390x) echo "s390x";;
 		*) die "unsupported architecture: ${arch}";;
@@ -849,6 +833,7 @@ function arch_to_rust() {
 	case "${arch}" in
 		aarch64) echo "${arch}";;
 		ppc64le) echo "powerpc64le";;
+		riscv64) echo "riscv64gc";;
 		x86_64) echo "${arch}";;
 		s390x) echo "${arch}";;
 		*) die "unsupported architecture: ${arch}";;

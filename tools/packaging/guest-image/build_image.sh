@@ -44,7 +44,7 @@ build_initrd() {
 		ROOTFS_BUILD_DEST="${builddir}/initrd-image" \
 		USE_DOCKER=1 \
 		AGENT_TARBALL="${AGENT_TARBALL}" \
-		AGENT_INIT="yes" \
+		AGENT_INIT="${AGENT_INIT:-no}" \
 		AGENT_POLICY="${AGENT_POLICY:-}" \
 		PULL_TYPE="${PULL_TYPE:-default}" \
 		COCO_GUEST_COMPONENTS_TARBALL="${COCO_GUEST_COMPONENTS_TARBALL:-}" \
@@ -71,7 +71,7 @@ build_image() {
 		DISTRO="${os_name}" \
 		DEBUG="${DEBUG:-}" \
 		USE_DOCKER="1" \
-		IMG_OS_VERSION="${os_version}" \
+		OS_VERSION="${os_version}" \
 		ROOTFS_BUILD_DEST="${builddir}/rootfs-image" \
 		AGENT_TARBALL="${AGENT_TARBALL}" \
 		AGENT_POLICY="${AGENT_POLICY:-}" \

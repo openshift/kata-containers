@@ -34,15 +34,9 @@ jobs:
         stage:
           - ${{ inputs.stage }}
     steps:
-      - name: Prepare the self-hosted runner
-        timeout-minutes: 15
-        run: |
-            "${HOME}/scripts/prepare_runner.sh"
-            sudo rm -rf "$GITHUB_WORKSPACE"/*
-
       - name: Login to Kata Containers quay.io
         if: ${{ inputs.push-to-registry == 'yes' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DEPLOYER_USERNAME }}
@@ -93,15 +87,9 @@ jobs:
         stage:
           - ${{ inputs.stage }}
     steps:
-      - name: Prepare the self-hosted runner
-        timeout-minutes: 15
-        run: |
-            "${HOME}/scripts/prepare_runner.sh"
-            sudo rm -rf "$GITHUB_WORKSPACE"/*
-
       - name: Login to Kata Containers quay.io
         if: ${{ inputs.push-to-registry == 'yes' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DEPLOYER_USERNAME }}
@@ -159,7 +147,7 @@ jobs:
         asset:
           - agent
     steps:
-      - uses: geekyeggo/delete-artifact@v5
+      - uses: geekyeggo/delete-artifact@f275313e70c08f6120db482d7a6b98377786765b # v5.1.0
         if: ${{ inputs.stage == 'release' }}
         with:
           name: kata-artifacts-ppc64le-${{ matrix.asset}}${{ inputs.tarball-suffix }}
@@ -168,15 +156,9 @@ jobs:
     runs-on: ppc64le
     needs: [build-asset, build-asset-rootfs, remove-rootfs-binary-artifacts]
     steps:
-      - name: Prepare the self-hosted runner
-        timeout-minutes: 15
-        run: |
-            "${HOME}/scripts/prepare_runner.sh"
-            sudo rm -rf "$GITHUB_WORKSPACE"/*
-
       - name: Login to Kata Containers quay.io
         if: ${{ inputs.push-to-registry == 'yes' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_DEPLOYER_USERNAME }}

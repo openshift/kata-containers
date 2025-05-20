@@ -742,7 +742,7 @@ func (s *Sandbox) coldOrHotPlugVFIO(sandboxConfig *SandboxConfig) (bool, error) 
 			//
 			_, err := config.WithCDI(cdiSpec.Annotations, []string{}, cdiSpec)
 			if err != nil {
-				return coldPlugVFIO, fmt.Errorf("adding CDI devices failed")
+				return coldPlugVFIO, fmt.Errorf("adding CDI devices failed: %w", err)
 			}
 
 			for _, dev := range cdiSpec.Linux.Devices {
@@ -1172,7 +1172,7 @@ func (s *Sandbox) AddInterface(ctx context.Context, inf *pbTypes.Interface) (*pb
 	}()
 
 	// Add network for vm
-	inf.PciPath = endpoints[0].PciPath().String()
+	inf.DevicePath = endpoints[0].PciPath().String()
 	result, err := s.agent.updateInterface(ctx, inf)
 	if err != nil {
 		return nil, err

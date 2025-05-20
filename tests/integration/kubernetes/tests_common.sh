@@ -108,10 +108,7 @@ adapt_common_policy_settings_for_virtio_fs() {
 
 # adapt common policy settings for CBL-Mariner Hosts
 adapt_common_policy_settings_for_cbl_mariner() {
-	local settings_dir=$1
-
-	info "Adapting common policy settings for KATA_HOST_OS=cbl-mariner"
-	jq '.kata_config.oci_version = "1.1.0-rc.1"' "${settings_dir}/genpolicy-settings.json" > temp.json && sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+	true
 }
 
 # adapt common policy settings for various platforms
@@ -238,7 +235,7 @@ add_requests_to_policy_settings() {
 
 	auto_generate_policy_enabled || return 0
 
-	for request in ${requests[@]}
+	for request in "${requests[@]}"
 	do
 		info "${settings_dir}/genpolicy-settings.json: allowing ${request}"
 		jq ".request_defaults.${request} |= true" \
@@ -377,4 +374,22 @@ teardown_common() {
 		echo "DEBUG: system logs of node '$node' since test start time ($node_start_time)"
 		exec_host "${node}" journalctl -x -t "kata" --since '"'$node_start_time'"' || true
 	fi
+}
+
+# Invoke "kubectl exec", log its output, and check that a grep pattern is present in the output.
+#
+# Parameters:
+#	$1	- pod name
+#	$2	- the grep pattern
+#	$3+	- the command to execute using "kubectl exec"
+#
+grep_pod_exec_output() {
+	local -r pod_name="$1"
+	shift
+	local -r grep_arg="$1"
+	shift
+
+	local -r pod_env=$(kubectl exec "${pod_name}" -- "$@")
+	info "pod_env: ${pod_env}"
+	echo "${pod_env}" | grep "${grep_arg}"
 }

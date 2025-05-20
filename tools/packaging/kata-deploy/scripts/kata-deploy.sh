@@ -150,12 +150,15 @@ function delete_runtimeclasses() {
 function get_container_runtime() {
 
 	local runtime=$(kubectl get node $NODE_NAME -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')
+	local microk8s=$(kubectl get node $NODE_NAME -o jsonpath='{.metadata.labels.microk8s\.io\/cluster}')
 	if [ "$?" -ne 0 ]; then
                 die "invalid node name"
 	fi
 
 	if echo "$runtime" | grep -qE "cri-o"; then
 		echo "cri-o"
+	elif [ "$microk8s" == "true" ]; then
+		echo "microk8s"
 	elif echo "$runtime" | grep -qE 'containerd.*-k3s'; then
 		if host_systemctl is-active --quiet rke2-agent; then
 			echo "rke2-agent"
@@ -166,8 +169,8 @@ function get_container_runtime() {
 		else
 			echo "k3s"
 		fi
-	# Note: we assumed you used a conventional k0s setup and k0s will generate a systemd entry k0scontroller.service and k0sworker.service respectively    
-	# and it is impossible to run this script without a kubelet, so this k0s controller must also have worker mode enabled 
+	# Note: we assumed you used a conventional k0s setup and k0s will generate a systemd entry k0scontroller.service and k0sworker.service respectively
+	# and it is impossible to run this script without a kubelet, so this k0s controller must also have worker mode enabled
 	elif host_systemctl is-active --quiet k0scontroller; then
 		echo "k0s-controller"
 	elif host_systemctl is-active --quiet k0sworker; then
@@ -193,6 +196,12 @@ function is_containerd_capable_of_using_drop_in_files() {
 		return
 	fi
 
+	if [ "$runtime" == "microk8s" ]; then
+		# microk8s use snap containerd
+		echo "false"
+		return
+	fi
+ 
 	local version_major=$(kubectl get node $NODE_NAME -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}' | grep -oE '[0-9]+\.[0-9]+' | cut -d'.' -f1)
 	if [ $version_major -lt 2 ]; then
 		# Only containerd 2.0 does the merge of the plugins section from different snippets,
@@ -237,7 +246,7 @@ function get_kata_containers_config_path() {
 	# Map the runtime shim name to the appropriate configuration
 	# file directory.
 	case "$shim" in
-		cloud-hypervisor | dragonball | qemu-runtime-rs) config_path="$rust_config_path" ;;
+		cloud-hypervisor | dragonball | qemu-runtime-rs | qemu-se-runtime-rs) config_path="$rust_config_path" ;;
 		*) config_path="$golang_config_path" ;;
 	esac
 
@@ -249,7 +258,7 @@ function get_kata_containers_runtime_path() {
 
 	local runtime_path
 	case "$shim" in
-		cloud-hypervisor | dragonball | qemu-runtime-rs)
+		cloud-hypervisor | dragonball | qemu-runtime-rs | qemu-se-runtime-rs)
 			runtime_path="${dest_dir}/runtime-rs/bin/containerd-shim-kata-v2"
 			;;
 		*)
@@ -330,7 +339,7 @@ function adjust_qemu_cmdline() {
 	# Both qemu and qemu-coco-dev use exactly the same QEMU, so we can adjust
 	# the shim on the qemu-coco-dev case to qemu
 	[[ "${shim}" =~ ^(qemu|qemu-coco-dev)$ ]] && qemu_share="qemu"
-		
+
 	qemu_binary=$(tomlq '.hypervisor.qemu.path' ${config_path} | tr -d \")
 	qemu_binary_script="${qemu_binary}-installation-prefix"
 	qemu_binary_script_host_path="/host/${qemu_binary_script}"
@@ -421,7 +430,7 @@ function install_artifacts() {
 				*)
 					tdx_not_supported ${ID} ${VERSION_ID}
 					;;
-			esac	
+			esac
 		fi
 
 		if [ "${dest_dir}" != "${default_dest_dir}" ]; then
@@ -465,13 +474,15 @@ function configure_cri_runtime() {
 	crio)
 		configure_crio
 		;;
-	containerd | k3s | k3s-agent | rke2-agent | rke2-server | k0s-controller | k0s-worker)
+	containerd | k3s | k3s-agent | rke2-agent | rke2-server | k0s-controller | k0s-worker | microk8s)
 		configure_containerd "$1"
 		;;
 	esac
 	if [ "$1" == "k0s-worker" ] || [ "$1" == "k0s-controller" ]; then
 		# do nothing, k0s will automatically load the config on the fly
 		:
+	elif [ "$1" == "microk8s" ]; then
+		host_systemctl restart snap.microk8s.daemon-containerd.service
 	else
 		host_systemctl daemon-reload
 		host_systemctl restart "$1"
@@ -595,19 +606,19 @@ function configure_containerd_runtime() {
 	local runtime_type=\"io.containerd."${runtime}".v2\"
 	local runtime_config_path=\"$(get_kata_containers_config_path "${shim}")/${configuration}.toml\"
 	local runtime_path=\"$(get_kata_containers_runtime_path "${shim}")\"
-	
+
 	tomlq -i -t $(printf '%s.runtime_type=%s' ${runtime_table} ${runtime_type}) ${configuration_file}
 	tomlq -i -t $(printf '%s.runtime_path=%s' ${runtime_table} ${runtime_path}) ${configuration_file}
 	tomlq -i -t $(printf '%s.privileged_without_host_devices=true' ${runtime_table}) ${configuration_file}
 	tomlq -i -t $(printf '%s.pod_annotations=["io.katacontainers.*"]' ${runtime_table}) ${configuration_file}
 	tomlq -i -t $(printf '%s.ConfigPath=%s' ${runtime_options_table} ${runtime_config_path}) ${configuration_file}
-	
+
 	if [ "${DEBUG}" == "true" ]; then
 		tomlq -i -t '.debug.level = "debug"' ${configuration_file}
 	fi
 
 	if [ -n "${SNAPSHOTTER_HANDLER_MAPPING}" ]; then
-		for m in ${snapshotters[@]}; do
+		for m in "${snapshotters[@]}"; do
 			key="${m%$snapshotters_delimiter*}"
 
 			if [ "${key}" != "${shim}" ]; then
@@ -658,6 +669,8 @@ function restart_cri_runtime() {
 	if [ "${runtime}" == "k0s-worker" ] || [ "${runtime}" == "k0s-controller" ]; then
 		# do nothing, k0s will automatically unload the config on the fly
 		:
+	elif [ "$1" == "microk8s" ]; then
+		host_systemctl restart snap.microk8s.daemon-containerd.service
 	else
 		host_systemctl daemon-reload
 		host_systemctl restart "${runtime}"
@@ -669,7 +682,7 @@ function cleanup_cri_runtime() {
 	crio)
 		cleanup_crio
 		;;
-	containerd | k3s | k3s-agent | rke2-agent | rke2-server | k0s-controller | k0s-worker)
+	containerd | k3s | k3s-agent | rke2-agent | rke2-server | k0s-controller | k0s-worker | microk8s)
 		cleanup_containerd
 		;;
 	esac
@@ -733,7 +746,7 @@ function snapshotter_handler_mapping_validation_check() {
 		return
 	fi
 
-	for m in ${snapshotters[@]}; do
+	for m in "${snapshotters[@]}"; do
 		shim="${m%$snapshotters_delimiter*}"
 		snapshotter="${m#*$snapshotters_delimiter}"
 
@@ -793,11 +806,14 @@ function main() {
 	# CRI-O isn't consistent with the naming -- let's use crio to match the service file
 	if [ "$runtime" == "cri-o" ]; then
 		runtime="crio"
+	elif [ "$runtime" == "microk8s" ]; then
+		containerd_conf_file="/etc/containerd/containerd-template.toml"
+		containerd_conf_file_backup="${containerd_conf_file}.bak"
 	elif [[ "$runtime" =~ ^(k3s|k3s-agent|rke2-agent|rke2-server)$ ]]; then
 		containerd_conf_tmpl_file="${containerd_conf_file}.tmpl"
 		containerd_conf_file_backup="${containerd_conf_tmpl_file}.bak"
 	elif [[ "$runtime" =~ ^(k0s-worker|k0s-controller)$ ]]; then
-		# From 1.27.1 onwards k0s enables dynamic configuration on containerd CRI runtimes. 
+		# From 1.27.1 onwards k0s enables dynamic configuration on containerd CRI runtimes.
 		# This works by k0s creating a special directory in /etc/k0s/containerd.d/ where user can drop-in partial containerd configuration snippets.
 		# k0s will automatically pick up these files and adds these in containerd configuration imports list.
 		containerd_conf_file="/etc/containerd/containerd.d/kata-containers.toml"
@@ -809,7 +825,7 @@ function main() {
 
 
 	# only install / remove / update if we are dealing with CRIO or containerd
-	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent|rke2-agent|rke2-server|k0s-worker|k0s-controller)$ ]]; then
+	if [[ "$runtime" =~ ^(crio|containerd|k3s|k3s-agent|rke2-agent|rke2-server|k0s-worker|k0s-controller|microk8s)$ ]]; then
 		if [ "$runtime" != "crio" ]; then
 			containerd_snapshotter_version_check
 			snapshotter_handler_mapping_validation_check

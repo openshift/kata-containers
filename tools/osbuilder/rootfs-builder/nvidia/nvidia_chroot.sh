@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 #!/bin/bash
-set -xe
+set -euo pipefail
 
 shopt -s nullglob
 shopt -s extglob
@@ -13,13 +13,55 @@ shopt -s extglob
 run_file_name=$2
 run_fm_file_name=$3
 arch_target=$4
-driver_version="$5"
-driver_type="open"
+nvidia_gpu_stack="$5"
+driver_version=""
+driver_type="-open"
 supported_gpu_devids="/supported-gpu.devids"
+base_os="jammy"
 
 APT_INSTALL="apt -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -yqq --no-install-recommends install"
 
+export KBUILD_SIGN_PIN="${6:-}"
+
 export DEBIAN_FRONTEND=noninteractive
+
+is_feature_enabled() {
+	local feature="$1"
+	# Check if feature is in the comma-separated list
+	if [[ ",${nvidia_gpu_stack}," == *",${feature},"* ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+set_driver_version_type() {
+	echo "chroot: Setting the correct driver version"
+
+	if [[ ",${nvidia_gpu_stack}," == *",latest,"* ]]; then
+		driver_version="latest"
+	elif [[ ",${nvidia_gpu_stack}," == *",lts,"* ]]; then
+		driver_version="lts"
+	elif [[ "${nvidia_gpu_stack}" =~ version=([^,]+) ]]; then
+		driver_version="${BASH_REMATCH[1]}"
+	else
+		echo "No known driver spec found. Please specify \"latest\", \"lts\", or \"version=<VERSION>\"."
+		exit 1
+	fi
+
+	echo "chroot: driver_version: ${driver_version}"
+
+	echo "chroot: Setting the correct driver type"
+
+	# driver       -> enable open or closed drivers
+	if [[ "${nvidia_gpu_stack}" =~ (^|,)driver=open($|,) ]]; then
+		driver_type="-open"
+	elif [[ "${nvidia_gpu_stack}" =~ (^|,)driver=closed($|,) ]]; then
+		driver_type=""
+	fi
+
+	echo "chroot: driver_type: ${driver_type}"
+}
 
 install_nvidia_ctk() {
 	echo "chroot: Installing NVIDIA GPU container runtime"
@@ -29,8 +71,12 @@ install_nvidia_ctk() {
 }
 
 install_nvidia_fabricmanager() {
+	is_feature_enabled "nvswitch" || {
+		echo "chroot: Skipping NVIDIA fabricmanager installation"
+		return
+	}
 	# if run_fm_file_name exists run it
-	if [ -f /"${run_fm_file_name}" ]; then
+	if [[ -f /"${run_fm_file_name}" ]]; then
 		install_nvidia_fabricmanager_from_run_file
 	else
 		install_nvidia_fabricmanager_from_distribution
@@ -52,27 +98,43 @@ install_nvidia_fabricmanager_from_distribution() {
 }
 
 build_nvidia_drivers() {
+	is_feature_enabled "compute" || {
+		echo "chroot: Skipping NVIDIA drivers build"
+		return
+	}
+
 	echo "chroot: Build NVIDIA drivers"
 	pushd "${driver_source_files}" >> /dev/null
 
+	local certs_dir
 	local kernel_version
 	for version in /lib/modules/*; do
 		kernel_version=$(basename "${version}")
+		certs_dir=/lib/modules/"${kernel_version}"/build/certs
+		signing_key=${certs_dir}/signing_key.pem
+
 	        echo "chroot: Building GPU modules for: ${kernel_version}"
 		cp /boot/System.map-"${kernel_version}" /lib/modules/"${kernel_version}"/build/System.map
 
-		if [ "${arch_target}" == "aarch64" ]; then
+		if [[ "${arch_target}" == "aarch64" ]]; then
 			ln -sf /lib/modules/"${kernel_version}"/build/arch/arm64 /lib/modules/"${kernel_version}"/build/arch/aarch64
 		fi
 
-		if [ "${arch_target}" == "x86_64" ]; then
+		if [[ "${arch_target}" == "x86_64" ]]; then
 			ln -sf /lib/modules/"${kernel_version}"/build/arch/x86 /lib/modules/"${kernel_version}"/build/arch/amd64
 		fi
 
 		make -j "$(nproc)" CC=gcc SYSSRC=/lib/modules/"${kernel_version}"/build > /dev/null
+
+		if [[ -n "${KBUILD_SIGN_PIN}" ]]; then
+			mkdir -p "${certs_dir}" && mv /signing_key.* "${certs_dir}"/.
+		fi
+
 		make INSTALL_MOD_STRIP=1 -j "$(nproc)" CC=gcc SYSSRC=/lib/modules/"${kernel_version}"/build modules_install
 		make -j "$(nproc)" CC=gcc SYSSRC=/lib/modules/"${kernel_version}"/build clean > /dev/null
-
+		# The make clean above should clear also the certs directory but just in case something
+		# went wroing make sure the signing_key.pem is removed
+		[[ -e "${signing_key}" ]] && rm -f "${signing_key}"
 	done
 	# Save the modules for later so that a linux-image purge does not remove it
 	tar cvfa /lib/modules.save_from_purge.tar.zst /lib/modules
@@ -80,14 +142,14 @@ build_nvidia_drivers() {
 }
 
 install_userspace_components() {
-	if [ ! -f /"${run_file_name}" ]; then
+	if [[ ! -f /"${run_file_name}" ]]; then
 		echo "chroot: Skipping NVIDIA userspace runfile components installation"
 		return
 	fi
 
 	pushd /NVIDIA-* >> /dev/null
 	# if aarch64 we need to remove --no-install-compat32-libs
-	if [ "${arch_target}" == "aarch64" ]; then
+	if [[ "${arch_target}" == "aarch64" ]]; then
 		./nvidia-installer --no-kernel-modules --no-systemd --no-nvidia-modprobe -s --x-prefix=/root
 	else
 		./nvidia-installer --no-kernel-modules --no-systemd --no-nvidia-modprobe -s --x-prefix=/root --no-install-compat32-libs
@@ -97,14 +159,13 @@ install_userspace_components() {
 }
 
 prepare_run_file_drivers() {
-	if [ "${driver_version}" == "latest" ]; then
+	if [[ "${driver_version}" == "latest" ]]; then
 		driver_version=""
 		echo "chroot: Resetting driver version not supported with run-file"
-	elif [ "${driver_version}" == "lts" ]; then
+	elif [[ "${driver_version}" == "lts" ]]; then
 		driver_version=""
 		echo "chroot: Resetting driver version not supported with run-file"
 	fi
-
 
 	echo "chroot: Prepare NVIDIA run file drivers"
 	pushd / >> /dev/null
@@ -115,21 +176,21 @@ prepare_run_file_drivers() {
 
 	# Sooner or later RIM files will be only available remotely
 	RIMFILE=$(ls NVIDIA-*/RIM_GH100PROD.swidtag)
-	if [ -e "${RIMFILE}" ]; then
+	if [[ -e "${RIMFILE}" ]]; then
 		cp NVIDIA-*/RIM_GH100PROD.swidtag /usr/share/nvidia/rim/.
 	fi
 	popd >> /dev/null
 }
 
 prepare_distribution_drivers() {
-	if [ "${driver_version}" == "latest" ]; then
+	if [[ "${driver_version}" == "latest" ]]; then
 		driver_version=$(apt-cache search --names-only 'nvidia-headless-no-dkms-.?.?.?-open' | awk '{ print $1 }' | tail -n 1 | cut -d'-' -f5)
-	elif [ "${driver_version}" == "lts" ]; then
+	elif [[ "${driver_version}" == "lts" ]]; then
 		driver_version="550"
 	fi
 
 	echo "chroot: Prepare NVIDIA distribution drivers"
-	eval "${APT_INSTALL}" nvidia-headless-no-dkms-"${driver_version}-${driver_type}" \
+	eval "${APT_INSTALL}" nvidia-headless-no-dkms-"${driver_version}${driver_type}" \
 		libnvidia-cfg1-"${driver_version}"       \
 		nvidia-compute-utils-"${driver_version}" \
 		nvidia-utils-"${driver_version}"         \
@@ -147,12 +208,12 @@ prepare_distribution_drivers() {
 prepare_nvidia_drivers() {
 	local driver_source_dir=""
 
-	if [ -f /"${run_file_name}" ]; then
+	if [[ -f /"${run_file_name}" ]]; then
 		prepare_run_file_drivers
 
 		for source_dir in /NVIDIA-*; do
-			if [ -d "${source_dir}" ]; then
-				driver_source_files="${source_dir}"/kernel-${driver_type}
+			if [[ -d "${source_dir}" ]]; then
+				driver_source_files="${source_dir}"/kernel${driver_type}
 				driver_source_dir="${source_dir}"
 				break
 			fi
@@ -163,7 +224,7 @@ prepare_nvidia_drivers() {
 		prepare_distribution_drivers
 
 		for source_dir in /usr/src/nvidia*; do
-			if [ -d "${source_dir}" ]; then
+			if [[ -d "${source_dir}" ]]; then
 				driver_source_files="${source_dir}"
 				driver_source_dir="${source_dir}"
 				break
@@ -191,21 +252,19 @@ setup_apt_repositories() {
 	touch /var/lib/dpkg/status
 	rm -f /etc/apt/sources.list.d/*
 
-	if [ "${arch_target}" == "aarch64" ]; then
-		cat <<-'CHROOT_EOF' > /etc/apt/sources.list.d/jammy.list
-			deb http://ports.ubuntu.com/ubuntu-ports/ jammy main restricted universe multiverse
-			deb http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main restricted universe multiverse
- 			deb http://ports.ubuntu.com/ubuntu-ports/ jammy-security main restricted universe multiverse
- 			deb http://ports.ubuntu.com/ubuntu-ports/ jammy-backports main restricted universe multiverse
-		CHROOT_EOF
-	else
-		cat <<-'CHROOT_EOF' > /etc/apt/sources.list.d/noble.list
-			deb http://us.archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
-			deb http://us.archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
-			deb http://us.archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
-			deb http://us.archive.ubuntu.com/ubuntu/ jammy-backports main restricted universe multiverse
-		CHROOT_EOF
-	fi
+	# Changing the reference here also means changes needed for cuda_keyring
+	# and cuda apt repository see install_dcgm for details
+	cat <<-CHROOT_EOF > /etc/apt/sources.list.d/"${base_os}".list
+		deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu ${base_os} main restricted universe multiverse
+		deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu ${base_os}-updates main restricted universe multiverse
+		deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu ${base_os}-security main restricted universe multiverse
+		deb [arch=amd64] http://us.archive.ubuntu.com/ubuntu ${base_os}-backports main restricted universe multiverse
+
+		deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${base_os} main restricted universe multiverse
+		deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${base_os}-updates main restricted universe multiverse
+		deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${base_os}-security main restricted universe multiverse
+		deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${base_os}-backports main restricted universe multiverse
+	CHROOT_EOF
 
 	apt update
 
@@ -227,13 +286,13 @@ get_supported_gpus_from_run_file() {
 	local source_dir="$1"
 	local supported_gpus_json="${source_dir}"/supported-gpus/supported-gpus.json
 
-	jq . < "${supported_gpus_json}"  | grep '"devid"' | awk '{ print $2 }' | tr -d ',"'  > ${supported_gpu_devids}
+	jq . < "${supported_gpus_json}"  | grep '"devid"' | awk '{ print $2 }' | tr -d ',"'  > "${supported_gpu_devids}"
 }
 
 get_supported_gpus_from_distro_drivers() {
 	local supported_gpus_json=/usr/share/doc/nvidia-kernel-common-"${driver_version}"/supported-gpus.json
 
-	jq . < "${supported_gpus_json}"  | grep '"devid"' | awk '{ print $2 }' | tr -d ',"'  > ${supported_gpu_devids}
+	jq . < "${supported_gpus_json}"  | grep '"devid"' | awk '{ print $2 }' | tr -d ',"'  > "${supported_gpu_devids}"
 }
 
 export_driver_version() {
@@ -245,18 +304,20 @@ export_driver_version() {
 
 
 install_nvidia_dcgm() {
-	curl -O https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb
-	dpkg -i cuda-keyring_1.0-1_all.deb && rm -f cuda-keyring_1.0-1_all.deb
+	is_feature_enabled "dcgm" || {
+		echo "chroot: Skipping NVIDIA DCGM installation"
+		return
+	}
 
-	if [ "${arch_target}" == "aarch64" ]; then
-		cat <<-'CHROOT_EOF' > /etc/apt/sources.list.d/cuda.list
-			deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/ /
-		CHROOT_EOF
-	else
-		cat <<-'CHROOT_EOF' > /etc/apt/sources.list.d/cuda.list
-			deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /
-		CHROOT_EOF
-	fi
+	arch="x86_64"
+	[[ ${arch_target} == "aarch64" ]] && arch="sbsa"
+	# shellcheck disable=SC2015
+	[[ ${base_os} == "jammy" ]] && osver="ubuntu2204" || die "Unknown base_os ${base_os} used"
+
+	keyring="cuda-keyring_1.1-1_all.deb"
+        curl -O "https://developer.download.nvidia.com/compute/cuda/repos/${osver}/${arch}/${keyring}"
+        dpkg -i "${keyring}" && rm -f "${keyring}"
+
 	apt update
 	eval "${APT_INSTALL}" datacenter-gpu-manager
 }
@@ -267,7 +328,7 @@ cleanup_rootfs() {
 	apt-mark hold libstdc++6 libzstd1 libgnutls30 pciutils
 	# noble=libgnutls30t64
 
-	if [ -n "${driver_version}" ]; then
+	if [[ -n "${driver_version}" ]]; then
 		apt-mark hold libnvidia-cfg1-"${driver_version}" \
 			nvidia-compute-utils-"${driver_version}" \
 			nvidia-utils-"${driver_version}"         \
@@ -292,11 +353,11 @@ cleanup_rootfs() {
 
 	apt purge -yqq jq make gcc wget libc6-dev git xz-utils curl gpg \
 		python3-pip software-properties-common ca-certificates  \
-		linux-libc-dev nuitka python3-minimal cuda-keyring
+		linux-libc-dev nuitka python3-minimal
 
-	if [ -n "${driver_version}" ]; then
-		apt purge -yqq nvidia-headless-no-dkms-"${driver_version}-${driver_type}" \
-			nvidia-kernel-source-"${driver_version}-${driver_type}" -yqq
+	if [[ -n "${driver_version}" ]]; then
+		apt purge -yqq nvidia-headless-no-dkms-"${driver_version}${driver_type}" \
+			nvidia-kernel-source-"${driver_version}${driver_type}" -yqq
 	fi
 
 	apt autoremove -yqq
@@ -325,7 +386,7 @@ cleanup_rootfs() {
 # Start of script
 echo "chroot: Setup NVIDIA GPU rootfs stage one"
 
-
+set_driver_version_type
 setup_apt_repositories
 install_kernel_dependencies
 install_build_dependencies

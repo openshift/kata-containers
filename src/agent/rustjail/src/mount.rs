@@ -18,12 +18,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::mem::MaybeUninit;
 use std::os::unix;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
 use std::path::{Component, Path, PathBuf};
 
 use path_absolutize::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 
 use crate::container::DEFAULT_DEVICES;
 use crate::selinux;
@@ -836,6 +837,7 @@ fn mount_from(
         if !src.is_dir() {
             let _ = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .write(true)
                 .open(&dest)
                 .map_err(|e| {
@@ -1009,16 +1011,29 @@ lazy_static! {
     };
 }
 
+fn permissions_from_path(path: &Path) -> Result<u32> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.permissions().mode()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn mknod_dev(dev: &LinuxDevice, relpath: &Path) -> Result<()> {
     let f = match LINUXDEVICETYPE.get(dev.typ().as_str()) {
         Some(v) => v,
         None => return Err(anyhow!("invalid spec".to_string())),
     };
 
+    let file_mode = match dev.file_mode().unwrap_or(0) {
+        0 => permissions_from_path(Path::new(dev.path()))?,
+        x => x,
+    };
+
     stat::mknod(
         relpath,
         *f,
-        Mode::from_bits_truncate(dev.file_mode().unwrap_or(0)),
+        Mode::from_bits_truncate(file_mode),
         nix::sys::stat::makedev(dev.major() as u64, dev.minor() as u64),
     )?;
 
