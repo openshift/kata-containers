@@ -17,5 +17,16 @@ RUN setcap "cap_dac_override+eip" kata-monitor
 FROM registry.access.redhat.com/ubi9
 COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
 
+# Red Hat labels
+LABEL name="openshift-sandboxed-containers-operator-monitor" \
+version="1.9.0" \
+com.redhat.component="osc-monitor-container" \
+summary="osc-monitor provides the kata-monitor binary to expose sandboxed containers custom metrics" \
+maintainer="support@redhat.com" \
+description="osc-monitor provides the kata-monitor binary to expose sandboxed containers custom metrics" \
+io.k8s.display-name="openshift-sandboxed-containers-monitor" \
+io.k8s.description="osc-monitor provides the kata-monitor binary to expose sandboxed containers custom metrics" \
+io.openshift.tags=""
+
 CMD ["-h"]
 ENTRYPOINT ["/usr/bin/kata-monitor"]
