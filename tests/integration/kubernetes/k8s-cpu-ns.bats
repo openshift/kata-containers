@@ -14,8 +14,9 @@ setup() {
 	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip "test not working see: ${dragonball_limitations}"
 	[ "${KATA_HYPERVISOR}" == "cloud-hypervisor" ] && skip "https://github.com/kata-containers/kata-containers/issues/9039"
 	[ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
+	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
 	( [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] || [ "${KATA_HYPERVISOR}" == "qemu-snp" ] || \
-		[ "${KATA_HYPERVISOR}" == "qemu-sev" ] || [ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
+		[ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
 		&& skip "TEEs do not support memory / CPU hotplug"
 
 
@@ -66,8 +67,18 @@ setup() {
 	# Check the total of cpus
 	for _ in $(seq 1 "$retries"); do
 		# Get number of cpus
-		total_cpus_container=$(kubectl exec pod/"$pod_name" -c "$container_name" \
+		# Retry "kubectl exec" several times in case it unexpectedly returns an empty output string,
+		# in an attempt to work around issues similar to https://github.com/kubernetes/kubernetes/issues/124571.
+		for _ in {1..10}; do
+			total_cpus_container=$(kubectl exec pod/"$pod_name" -c "$container_name" \
 			-- "${exec_num_cpus_cmd[@]}")
+			if [[ -n "${total_cpus_container}" ]]; then
+				break
+			fi
+			warn "Empty output from kubectl exec" >&2
+			sleep 1
+		done
+
 		# Verify number of cpus
 		[ "$total_cpus_container" -le "$total_cpus" ]
 		[ "$total_cpus_container" -eq "$total_cpus" ] && break
@@ -76,16 +87,29 @@ setup() {
 	[ "$total_cpus_container" -eq "$total_cpus" ]
 
 	# Check the total of requests
-	total_requests_container=$(kubectl exec $pod_name -c $container_name \
-		-- "${exec_weightsyspath_cmd[@]}")
+	for _ in {1..10}; do
+		total_requests_container=$(kubectl exec $pod_name -c $container_name \
+			-- "${exec_weightsyspath_cmd[@]}")
+		if [[ -n "${total_requests_container}" ]]; then
+			break
+		fi
+		warn "Empty output from kubectl exec" >&2
+		sleep 1
+	done
 	info "total_requests_container = $total_requests_container"
 
 	[ "$total_requests_container" -eq "$total_requests" ]
 
 	# Check the cpus inside the container
-
-	read total_cpu_quota total_cpu_period <<< $(kubectl exec $pod_name -c $container_name \
-		-- "${exec_maxsyspath_cmd[@]}")
+	for _ in {1..10}; do
+		maxsyspath=$(kubectl exec $pod_name -c $container_name -- "${exec_maxsyspath_cmd[@]}")
+		if [[ -n "${maxsyspath}" ]]; then
+			break
+		fi
+		warn "Empty output from kubectl exec" >&2
+		sleep 1
+	done
+	read total_cpu_quota total_cpu_period <<< ${maxsyspath}
 
 	division_quota_period=$(echo $((total_cpu_quota/total_cpu_period)))
 
@@ -97,9 +121,10 @@ teardown() {
 	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
 	[ "${KATA_HYPERVISOR}" == "dragonball" ] && skip "test not working see: ${dragonball_limitations}"
 	[ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
+	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
 	[ "${KATA_HYPERVISOR}" == "cloud-hypervisor" ] && skip "https://github.com/kata-containers/kata-containers/issues/9039"
 	( [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] || [ "${KATA_HYPERVISOR}" == "qemu-snp" ] || \
-		[ "${KATA_HYPERVISOR}" == "qemu-sev" ] || [ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
+		[ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
 		&& skip "TEEs do not support memory / CPU hotplug"
 
 	# Debugging information

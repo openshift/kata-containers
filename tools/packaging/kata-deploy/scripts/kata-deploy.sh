@@ -16,8 +16,33 @@ containerd_conf_file_backup="${containerd_conf_file}.bak"
 containerd_conf_tmpl_file=""
 use_containerd_drop_in_conf_file="false"
 
+# If we fail for any reason a message will be displayed
+die() {
+        msg="$*"
+        echo "ERROR: $msg" >&2
+        exit 1
+}
+
+warn() {
+        msg="$*"
+        echo "WARN: $msg" >&2
+}
+
+info() {
+	msg="$*"
+	echo "INFO: $msg" >&2
+}
+
+DEBUG="${DEBUG:-"false"}"
+
+SHIMS="${SHIMS:-"clh cloud-hypervisor dragonball fc qemu qemu-coco-dev qemu-runtime-rs qemu-se-runtime-rs qemu-snp qemu-tdx stratovirt qemu-nvidia-gpu qemu-nvidia-gpu-snp qemu-nvidia-gpu-tdx"}"
 IFS=' ' read -a shims <<< "$SHIMS"
+DEFAULT_SHIM="${DEFAULT_SHIM:-"qemu"}"
 default_shim="$DEFAULT_SHIM"
+
+CREATE_RUNTIMECLASSES="${CREATE_RUNTIMECLASSES:-"false"}"
+CREATE_DEFAULT_RUNTIMECLASS="${CREATE_DEFAULT_RUNTIMECLASS:-"false"}"
+
 ALLOWED_HYPERVISOR_ANNOTATIONS="${ALLOWED_HYPERVISOR_ANNOTATIONS:-}"
 
 IFS=' ' read -a non_formatted_allowed_hypervisor_annotations <<< "$ALLOWED_HYPERVISOR_ANNOTATIONS"
@@ -41,6 +66,9 @@ INSTALLATION_PREFIX="${INSTALLATION_PREFIX:-}"
 default_dest_dir="/opt/kata"
 dest_dir="${default_dest_dir}"
 if [ -n "${INSTALLATION_PREFIX}" ]; then
+	if [[ "${INSTALLATION_PREFIX:0:1}" != "/" ]]; then
+		die 'INSTALLATION_PREFIX must begin with a "/"(ex. /hoge/fuga)'
+	fi
 	# There's no `/` in between ${INSTALLATION_PREFIX} and ${default_dest_dir}
 	# as, otherwise, we'd have it doubled there, as: `/foo/bar//opt/kata`
 	dest_dir="${INSTALLATION_PREFIX}${default_dest_dir}"
@@ -59,25 +87,12 @@ host_install_dir="/host${dest_dir}"
 
 HELM_POST_DELETE_HOOK="${HELM_POST_DELETE_HOOK:-"false"}"
 
-# If we fail for any reason a message will be displayed
-die() {
-        msg="$*"
-        echo "ERROR: $msg" >&2
-        exit 1
-}
-
-warn() {
-        msg="$*"
-        echo "WARN: $msg" >&2
-}
-
-info() {
-	msg="$*"
-	echo "INFO: $msg" >&2
-}
-
 function host_systemctl() {
 	nsenter --target 1 --mount systemctl "${@}"
+}
+
+function host_exec() {
+	nsenter --target 1 --mount bash -c "$*"
 }
 
 function print_usage() {
@@ -125,10 +140,13 @@ function delete_runtimeclasses() {
 
 	for shim in "${shims[@]}"; do
 		echo "Deleting the kata-${shim} runtime class"
+		canonical_shim_name="kata-${shim}"
+		shim_name="${canonical_shim_name}"
 		if [ -n "${MULTI_INSTALL_SUFFIX}" ]; then
-			sed -i -e "s|kata-${shim}|kata-${shim}-${MULTI_INSTALL_SUFFIX}|g" /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
+			shim_name+="-${MULTI_INSTALL_SUFFIX}"
+			sed -i -e "s|${canonical_shim_name}|${shim_name}|g" /opt/kata-artifacts/runtimeclasses/${canonical_shim_name}.yaml
 		fi
-		kubectl delete -f /opt/kata-artifacts/runtimeclasses/kata-${shim}.yaml
+		kubectl delete --ignore-not-found -f /opt/kata-artifacts/runtimeclasses/${canonical_shim_name}.yaml
 	done
 
 
@@ -142,7 +160,7 @@ function delete_runtimeclasses() {
 		echo "Deleting the kata runtime class for the default shim (an alias for kata-${default_shim})"
 		cp /opt/kata-artifacts/runtimeclasses/kata-${default_shim}.yaml /tmp/kata.yaml
 		sed -i -e 's/name: kata-'${default_shim}'/name: kata/g' /tmp/kata.yaml
-		kubectl delete -f /tmp/kata.yaml
+		kubectl delete --ignore-not-found -f /tmp/kata.yaml
 		rm -f /tmp/kata.yaml
 	fi
 }
@@ -221,7 +239,7 @@ function get_kata_containers_config_path() {
 	local shim="$1"
 
 	# Directory holding pristine configuration files for the current default golang runtime.
-	local golang_config_path="${dest_dir}/share/defaults/kata-containers/"
+	local golang_config_path="${dest_dir}/share/defaults/kata-containers"
 
 	# Directory holding pristine configuration files for the new rust runtime.
 	#
@@ -292,7 +310,7 @@ function get_tdx_distro_instructions() {
 
 	case ${distro} in
 		ubuntu)
-			echo "https://github.com/canonical/tdx/tree/noble-24.04"
+			echo "https://github.com/canonical/tdx/tree/3.3"
 			;;
 		centos)
 			echo "https://sigs.centos.org/virt/tdx"
@@ -334,7 +352,7 @@ function adjust_qemu_cmdline() {
 	# The paths on the kata-containers tarball side look like:
 	# ${dest_dir}/opt/kata/share/kata-qemu/qemu
 	# ${dest_dir}/opt/kata/share/kata-qemu-snp-experimnental/qemu
-	[[ "${shim}" =~ ^(qemu-snp|qemu-nvidia-snp)$ ]] && qemu_share=${shim}-experimental
+	[[ "${shim}" =~ ^(qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx)$ ]] && qemu_share=${shim}-experimental
 
 	# Both qemu and qemu-coco-dev use exactly the same QEMU, so we can adjust
 	# the shim on the qemu-coco-dev case to qemu
@@ -409,7 +427,7 @@ function install_artifacts() {
 			case ${ID} in
 				ubuntu)
 					case ${VERSION_ID} in
-						24.04)
+						24.04|25.04)
 							tdx_supported ${ID} ${VERSION_ID} ${kata_config_file}
 							;;
 						*)
@@ -434,13 +452,23 @@ function install_artifacts() {
 		fi
 
 		if [ "${dest_dir}" != "${default_dest_dir}" ]; then
-			# We could always do this sed, regardless, but I have a strong preference
-			# on not touching the configuration files unless extremelly needed
-			sed -i -e "s|${default_dest_dir}|${dest_dir}|g" "${kata_config_file}"
+			kernel_path=$(tomlq ".hypervisor.${shim}.path" ${kata_config_file} | tr -d \")
+			if echo $kernel_path | grep -q "${dest_dir}"; then
+				# If we got to this point here, it means that we're dealing with
+				# a kata containers configuration file that has already been changed
+				# to support multi-install suffix, and we're here most likely due to
+				# and update or container restart, and we simply should not try to
+				# do anything else, thus just leave the conditional.
+				break
+			else
+				# We could always do this sed, regardless, but I have a strong preference
+				# on not touching the configuration files unless extremelly needed
+				sed -i -e "s|${default_dest_dir}|${dest_dir}|g" "${kata_config_file}"
 
-			# Let's only adjust qemu_cmdline for the QEMUs that we build and ship ourselves
-			[[ "${shim}" =~ ^(qemu|qemu-snp|qemu-nvidia-gpu|qemu-nvidia-gpu-snp|qemu-sev|qemu-se|qemu-coco-dev)$ ]] && \
-				adjust_qemu_cmdline "${shim}" "${kata_config_file}"
+				# Let's only adjust qemu_cmdline for the QEMUs that we build and ship ourselves
+				[[ "${shim}" =~ ^(qemu|qemu-snp|qemu-nvidia-gpu|qemu-nvidia-gpu-snp|qemu-nvidia-gpu-tdx|qemu-se|qemu-coco-dev)$ ]] && \
+					adjust_qemu_cmdline "${shim}" "${kata_config_file}"
+			fi
 		fi
 	done
 
@@ -855,9 +883,9 @@ function main() {
 			       mkdir -p $(dirname "$containerd_conf_file")
 			       touch "$containerd_conf_file"
 			elif [[ "$runtime" == "containerd" ]]; then
-			       if [ ! -f "$containerd_conf_file" ] && [ -d $(dirname "$containerd_conf_file") ] && [ -x $(command -v containerd) ]; then
-					containerd config default > "$containerd_conf_file"
-			       fi
+				if [ ! -f "$containerd_conf_file" ] && [ -d $(dirname "$containerd_conf_file") ]; then
+					host_exec containerd config default > "$containerd_conf_file"
+				fi
 			fi
 
 			if [ $use_containerd_drop_in_conf_file = "true" ]; then
@@ -909,8 +937,8 @@ function main() {
 			reset_runtime $runtime
 			;;
 		*)
-			echo invalid arguments
 			print_usage
+			die "invalid arguments"
 			;;
 		esac
 	fi

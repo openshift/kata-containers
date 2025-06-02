@@ -1,6 +1,7 @@
 module github.com/kata-containers/tests
 
-go 1.19
+// Keep in sync with version in versions.yaml
+go 1.24.6
 
 // WARNING: Do NOT use `replace` directives as those break dependabot:
 // https://github.com/kata-containers/kata-containers/issues/11020
@@ -22,7 +23,7 @@ require (
 	github.com/rivo/uniseg v0.2.0 // indirect
 	github.com/russross/blackfriday v1.6.0 // indirect
 	golang.org/x/sys v0.19.0 // indirect
-	gopkg.in/yaml.v3 v3.0.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 // WARNING: Do NOT use `replace` directives as those break dependabot:

@@ -4,21 +4,27 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{sync::Arc, thread};
+use std::{collections::HashMap, sync::Arc, thread};
 
-use agent::{types::Device, Agent, OnlineCPUMemRequest, Storage};
+use agent::{types::Device, ARPNeighbor, Agent, OnlineCPUMemRequest, Storage};
 use anyhow::{anyhow, Context, Ok, Result};
 use async_trait::async_trait;
 use hypervisor::{
     device::{
-        device_manager::{do_handle_device, get_block_driver, DeviceManager},
+        device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         util::{get_host_path, DEVICE_TYPE_CHAR},
         DeviceConfig, DeviceType,
     },
-    BlockConfig, Hypervisor, VfioConfig,
+    BlockConfig, BlockDeviceAio, Hypervisor, VfioConfig,
 };
-use kata_types::config::{hypervisor::TopologyConfigInfo, TomlConfig};
-use kata_types::mount::Mount;
+use kata_types::mount::{
+    Mount, DEFAULT_KATA_GUEST_SANDBOX_DIR, KATA_EPHEMERAL_VOLUME_TYPE, SHM_DIR,
+};
+use kata_types::{
+    config::{hypervisor::TopologyConfigInfo, TomlConfig},
+    mount::{adjust_rootfs_mounts, KATA_IMAGE_FORCE_GUEST_PULL},
+};
+use libc::NUD_PERMANENT;
 use oci::{Linux, LinuxCpu, LinuxResources};
 use oci_spec::runtime::{self as oci, LinuxDeviceType};
 use persist::sandbox_persist::Persist;
@@ -193,6 +199,19 @@ impl ResourceManagerInner {
                         .await
                         .context("do handle protection device failed.")?;
                 }
+                ResourceConfig::PortDevice(pd) => {
+                    do_handle_device(
+                        &self.device_manager,
+                        &DeviceConfig::PortDeviceCfg(pd.clone()),
+                    )
+                    .await
+                    .context("do handle port device failed.")?;
+                }
+                ResourceConfig::InitData(id) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::BlockCfg(id))
+                        .await
+                        .context("do handle initdata block device failed.")?;
+                }
             };
         }
 
@@ -244,7 +263,14 @@ impl ResourceManagerInner {
     }
 
     async fn handle_neighbours(&self, network: &dyn Network) -> Result<()> {
-        let neighbors = network.neighs().await.context("neighs")?;
+        let all_neighbors = network.neighs().await.context("neighs")?;
+
+        // We add only static ARP entries
+        let neighbors: Vec<ARPNeighbor> = all_neighbors
+            .iter()
+            .filter(|n| n.state == NUD_PERMANENT as i32)
+            .cloned()
+            .collect();
         if !neighbors.is_empty() {
             info!(sl!(), "update neighbors {:?}", neighbors);
             self.agent
@@ -272,6 +298,11 @@ impl ResourceManagerInner {
     }
 
     pub async fn setup_after_start_vm(&mut self) -> Result<()> {
+        self.cgroups_resource
+            .setup_after_start_vm(self.hypervisor.as_ref())
+            .await
+            .context("setup cgroups after start vm")?;
+
         if let Some(share_fs) = self.share_fs.as_ref() {
             share_fs
                 .setup_device_after_start_vm(self.hypervisor.as_ref(), &self.device_manager)
@@ -297,12 +328,33 @@ impl ResourceManagerInner {
         Ok(())
     }
 
-    pub async fn get_storage_for_sandbox(&self) -> Result<Vec<Storage>> {
+    pub async fn get_storage_for_sandbox(&self, shm_size: u64) -> Result<Vec<Storage>> {
         let mut storages = vec![];
         if let Some(d) = self.share_fs.as_ref() {
             let mut s = d.get_storages().await.context("get storage")?;
             storages.append(&mut s);
         }
+
+        let shm_size_option = format!("size={}", shm_size);
+        let mount_point = format!("{}/{}", DEFAULT_KATA_GUEST_SANDBOX_DIR, SHM_DIR);
+
+        let shm_storage = Storage {
+            driver: KATA_EPHEMERAL_VOLUME_TYPE.to_string(),
+            mount_point,
+            source: "shm".to_string(),
+            fs_type: "tmpfs".to_string(),
+            options: vec![
+                "noexec".to_string(),
+                "nosuid".to_string(),
+                "nodev".to_string(),
+                "mode=1777".to_string(),
+                shm_size_option,
+            ],
+            ..Default::default()
+        };
+
+        storages.push(shm_storage);
+
         Ok(storages)
     }
 
@@ -312,7 +364,18 @@ impl ResourceManagerInner {
         root: &oci::Root,
         bundle_path: &str,
         rootfs_mounts: &[Mount],
+        annotations: &HashMap<String, String>,
     ) -> Result<Arc<dyn Rootfs>> {
+        let adjust_rootfs_mounts = if !self
+            .config()
+            .runtime
+            .is_experiment_enabled(KATA_IMAGE_FORCE_GUEST_PULL)
+        {
+            rootfs_mounts.to_vec()
+        } else {
+            adjust_rootfs_mounts()?
+        };
+
         self.rootfs_resource
             .handler_rootfs(
                 &self.share_fs,
@@ -322,7 +385,8 @@ impl ResourceManagerInner {
                 cid,
                 root,
                 bundle_path,
-                rootfs_mounts,
+                &adjust_rootfs_mounts,
+                annotations,
             )
             .await
     }
@@ -351,11 +415,17 @@ impl ResourceManagerInner {
         for d in linux_devices.iter() {
             match d.typ() {
                 LinuxDeviceType::B => {
-                    let block_driver = get_block_driver(&self.device_manager).await;
+                    let block_driver = get_block_device_info(&self.device_manager)
+                        .await
+                        .block_device_driver;
+                    let aio = get_block_device_info(&self.device_manager)
+                        .await
+                        .block_device_aio;
                     let dev_info = DeviceConfig::BlockCfg(BlockConfig {
                         major: d.major(),
                         minor: d.minor(),
                         driver_option: block_driver,
+                        blkdev_aio: BlockDeviceAio::new(&aio),
                         ..Default::default()
                     });
 
@@ -535,7 +605,7 @@ impl ResourceManagerInner {
 
         // we should firstly update the vcpus and mems, and then update the host cgroups
         self.cgroups_resource
-            .update_cgroups(cid, linux_resources, op, self.hypervisor.as_ref())
+            .update(cid, linux_resources, op, self.hypervisor.as_ref())
             .await?;
 
         if let Some(swap) = self.swap_resource.as_ref() {

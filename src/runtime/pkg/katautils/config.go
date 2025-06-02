@@ -109,6 +109,7 @@ type hypervisor struct {
 	RemoteHypervisorSocket         string                    `toml:"remote_hypervisor_socket"`
 	SnpIdBlock                     string                    `toml:"snp_id_block"`
 	SnpIdAuth                      string                    `toml:"snp_id_auth"`
+	SnpGuestPolicy                 *uint64                   `toml:"snp_guest_policy"`
 	HypervisorPathList             []string                  `toml:"valid_hypervisor_paths"`
 	JailerPathList                 []string                  `toml:"valid_jailer_paths"`
 	VirtioFSDaemonList             []string                  `toml:"valid_virtio_fs_daemon_paths"`
@@ -147,6 +148,7 @@ type hypervisor struct {
 	VhostUserDeviceReconnect       uint32                    `toml:"vhost_user_reconnect_timeout_sec"`
 	DisableBlockDeviceUse          bool                      `toml:"disable_block_device_use"`
 	MemPrealloc                    bool                      `toml:"enable_mem_prealloc"`
+	ReclaimGuestFreedMemory        bool                      `toml:"reclaim_guest_freed_memory"`
 	HugePages                      bool                      `toml:"enable_hugepages"`
 	VirtioMem                      bool                      `toml:"enable_virtio_mem"`
 	IOMMU                          bool                      `toml:"enable_iommu"`
@@ -192,6 +194,7 @@ type runtime struct {
 	DisableGuestEmptyDir      bool     `toml:"disable_guest_empty_dir"`
 	CreateContainerTimeout    uint64   `toml:"create_container_timeout"`
 	DanConf                   string   `toml:"dan_conf"`
+	ForceGuestPull            bool     `toml:"experimental_force_guest_pull"`
 }
 
 type agent struct {
@@ -949,6 +952,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSQueueSize:        h.VirtioFSQueueSize,
 		VirtioFSExtraArgs:        h.VirtioFSExtraArgs,
 		MemPrealloc:              h.MemPrealloc,
+		ReclaimGuestFreedMemory:  h.ReclaimGuestFreedMemory,
 		HugePages:                h.HugePages,
 		IOMMU:                    h.IOMMU,
 		IOMMUPlatform:            h.getIOMMUPlatform(),
@@ -990,6 +994,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		ExtraMonitorSocket:       extraMonitorSocket,
 		SnpIdBlock:               h.SnpIdBlock,
 		SnpIdAuth:                h.SnpIdAuth,
+		SnpGuestPolicy:           h.SnpGuestPolicy,
 	}, nil
 }
 
@@ -1082,6 +1087,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSCacheSize:              h.VirtioFSCacheSize,
 		VirtioFSCache:                  h.VirtioFSCache,
 		MemPrealloc:                    h.MemPrealloc,
+		ReclaimGuestFreedMemory:        h.ReclaimGuestFreedMemory,
 		HugePages:                      h.HugePages,
 		FileBackedMemRootDir:           h.FileBackedMemRootDir,
 		FileBackedMemRootList:          h.FileBackedMemRootList,
@@ -1092,6 +1098,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		BlockDeviceCacheDirect:         h.BlockDeviceCacheDirect,
 		EnableIOThreads:                h.EnableIOThreads,
 		Msize9p:                        h.msize9p(),
+		DisableImageNvdimm:             h.DisableImageNvdimm,
 		ColdPlugVFIO:                   h.coldPlugVFIO(),
 		HotPlugVFIO:                    h.hotPlugVFIO(),
 		PCIeRootPort:                   h.pcieRootPort(),
@@ -1434,6 +1441,7 @@ func GetDefaultHypervisorConfig() vc.HypervisorConfig {
 		DisableBlockDeviceUse:    defaultDisableBlockDeviceUse,
 		DefaultBridges:           defaultBridgesCount,
 		MemPrealloc:              defaultEnableMemPrealloc,
+		ReclaimGuestFreedMemory:  defaultEnableReclaimGuestFreedMemory,
 		HugePages:                defaultEnableHugePages,
 		IOMMU:                    defaultEnableIOMMU,
 		IOMMUPlatform:            defaultEnableIOMMUPlatform,
@@ -1583,6 +1591,8 @@ func LoadConfiguration(configPath string, ignoreLogging bool) (resolvedConfigPat
 	if err := checkConfig(config); err != nil {
 		return "", config, err
 	}
+
+	config.ForceGuestPull = tomlConf.Runtime.ForceGuestPull
 
 	return resolved, config, nil
 }

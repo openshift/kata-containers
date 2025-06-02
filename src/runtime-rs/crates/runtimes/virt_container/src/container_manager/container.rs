@@ -17,8 +17,12 @@ use common::{
     },
 };
 use kata_sys_util::k8s::update_ephemeral_storage_type;
-use kata_types::k8s;
-use oci_spec::runtime as oci;
+use kata_types::{
+    annotations::{BUNDLE_PATH_KEY, CONTAINER_TYPE_KEY},
+    container::{update_ocispec_annotations, POD_CONTAINER, POD_SANDBOX},
+    k8s::{self, container_type},
+};
+use oci_spec::runtime::{self as oci, LinuxDeviceCgroup};
 
 use oci::{LinuxResources, Process as OCIProcess};
 use resource::{
@@ -110,6 +114,19 @@ impl Container {
             // is 'true'.
             None => true,
         };
+        let annotations = spec.annotations().clone().unwrap_or_default();
+        let container_typ = container_type(&spec);
+        let pod_type_anno = if container_typ.is_pod_container() {
+            (CONTAINER_TYPE_KEY.to_string(), POD_CONTAINER.to_string())
+        } else {
+            (CONTAINER_TYPE_KEY.to_string(), POD_SANDBOX.to_string())
+        };
+
+        let bund_path_anno = (BUNDLE_PATH_KEY.to_string(), config.bundle.clone());
+        let updated_annotations =
+            update_ocispec_annotations(&annotations, &[], &[pod_type_anno, bund_path_anno]);
+        spec.set_annotations(Some(updated_annotations.clone()));
+
         amend_spec(
             &mut spec,
             toml_config.runtime.disable_guest_seccomp,
@@ -131,6 +148,7 @@ impl Container {
                 root,
                 &config.bundle,
                 &config.rootfs_mounts,
+                &annotations,
             )
             .await
             .context("handler rootfs")?;
@@ -590,26 +608,42 @@ fn amend_spec(
     disable_guest_selinux: bool,
 ) -> Result<()> {
     // Only the StartContainer hook needs to be reserved for execution in the guest
-    let start_container_hooks = if let Some(hooks) = spec.hooks().as_ref() {
-        hooks.start_container().clone()
-    } else {
-        None
-    };
-
-    let mut oci_hooks = oci::Hooks::default();
-    oci_hooks.set_start_container(start_container_hooks);
-    spec.set_hooks(Some(oci_hooks));
+    if let Some(hooks) = spec.hooks().as_ref() {
+        let mut oci_hooks = oci::Hooks::default();
+        oci_hooks.set_start_container(hooks.start_container().clone());
+        spec.set_hooks(Some(oci_hooks));
+    }
 
     // special process K8s ephemeral volumes.
     update_ephemeral_storage_type(spec);
 
-    if let Some(linux) = spec.linux_mut() {
+    if let Some(linux) = &mut spec.linux_mut() {
         if disable_guest_seccomp {
             linux.set_seccomp(None);
         }
 
-        if let Some(_resource) = linux.resources_mut() {
-            LinuxResources::default();
+        // In certain scenarios, particularly under CoCo/Agent Policy enforcement, the default initial value of `Linux.Resources.Devices`
+        // is considered non-compliant, leading to container creation failures. To address this issue and ensure consistency with the behavior
+        // in `runtime-go`, the default value of `Linux.Resources.Devices` from the OCI Spec should be removed.
+        if let Some(resources) = linux.resources_mut() {
+            if let Some(devices) = resources.devices_mut().take() {
+                let cleaned_devices: Vec<LinuxDeviceCgroup> = devices
+                    .into_iter()
+                    .filter(|device| {
+                        !(!device.allow()
+                            && device.typ().is_none()
+                            && device.major().is_none()
+                            && device.minor().is_none()
+                            && device.access().as_deref() == Some("rwm"))
+                    })
+                    .collect();
+
+                resources.set_devices(if cleaned_devices.is_empty() {
+                    None
+                } else {
+                    Some(cleaned_devices)
+                });
+            }
         }
 
         // Host pidns path does not make sense in kata. Let's just align it with

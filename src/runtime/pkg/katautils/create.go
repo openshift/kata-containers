@@ -130,7 +130,7 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	}
 
 	if !rootFs.Mounted && len(sandboxConfig.Containers) == 1 {
-		if rootFs.Source != "" && !vc.HasOptionPrefix(rootFs.Options, vc.VirtualVolumePrefix) {
+		if rootFs.Source != "" && !vc.HasOptionPrefix(rootFs.Options, vc.VirtualVolumePrefix) && !vc.IsErofsRootFS(rootFs) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return nil, vc.Process{}, err
@@ -166,6 +166,10 @@ func CreateSandbox(ctx context.Context, vci vc.VC, ociSpec specs.Spec, runtimeCo
 	// The value of this annotation is sent to the sandbox using SetPolicy.
 	delete(ociSpec.Annotations, vcAnnotations.Policy)
 	delete(sandboxConfig.Annotations, vcAnnotations.Policy)
+
+	// The value of this annotation is sent to the sandbox using init data.
+	delete(ociSpec.Annotations, vcAnnotations.Initdata)
+	delete(sandboxConfig.Annotations, vcAnnotations.Initdata)
 
 	sandbox, err := vci.CreateSandbox(ctx, sandboxConfig, func(ctx context.Context) error {
 		// Run pre-start OCI hooks, in the runtime namespace.
@@ -236,6 +240,9 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	// The value of this annotation is sent to the sandbox using SetPolicy.
 	delete(ociSpec.Annotations, vcAnnotations.Policy)
 
+	// The value of this annotation is sent to the sandbox using init data.
+	delete(ociSpec.Annotations, vcAnnotations.Initdata)
+
 	ociSpec = SetEphemeralStorageType(ociSpec, disableGuestEmptyDir)
 
 	contConfig, err := oci.ContainerConfig(ociSpec, bundlePath, containerID, disableOutput)
@@ -244,7 +251,7 @@ func CreateContainer(ctx context.Context, sandbox vc.VCSandbox, ociSpec specs.Sp
 	}
 
 	if !rootFs.Mounted {
-		if rootFs.Source != "" && !vc.IsNydusRootFSType(rootFs.Type) {
+		if rootFs.Source != "" && !vc.IsNydusRootFSType(rootFs.Type) && !vc.IsErofsRootFS(rootFs) {
 			realPath, err := ResolvePath(rootFs.Source)
 			if err != nil {
 				return vc.Process{}, err

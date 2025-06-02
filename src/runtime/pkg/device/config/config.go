@@ -439,6 +439,14 @@ type RNGDev struct {
 	Filename string
 }
 
+// BalloonDev represents a balloon device
+type BalloonDev struct {
+	ID                string
+	DeflateOnOOM      bool
+	DisableModern     bool
+	FreePageReporting bool
+}
+
 // VhostUserDeviceAttrs represents data shared by most vhost-user devices
 type VhostUserDeviceAttrs struct {
 	DevID      string
@@ -697,7 +705,14 @@ func WithCDI(annotations map[string]string, cdiSpecDirs []string, spec *specs.Sp
 	if _, err := registry.InjectDevices(spec, devsFromAnnotations...); err != nil {
 		return nil, fmt.Errorf("CDI device injection failed: %w", err)
 	}
-
+	// Once we injected the device into the ociSpec we do not need to CDI
+	// device annotation from the outer runtime. The runtime will create the
+	// appropriate inner runtime CDI annotation dependent on the device.
+	for key := range spec.Annotations {
+		if strings.HasPrefix(key, cdi.AnnotationPrefix) {
+			delete(spec.Annotations, key)
+		}
+	}
 	// One crucial thing to keep in mind is that CDI device injection
 	// might add OCI Spec environment variables, hooks, and mounts as
 	// well. Therefore it is important that none of the corresponding

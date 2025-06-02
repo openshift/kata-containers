@@ -7,10 +7,14 @@ package virtcontainers
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -150,7 +154,11 @@ func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Par
 			kernelRootParams = append(kernelRootParams, Param{"rootflags", "ro"})
 		}
 	case XFS:
-		fallthrough
+		if dax {
+			kernelRootParams = append(kernelRootParams, Param{"rootflags", "dax ro"})
+		} else {
+			kernelRootParams = append(kernelRootParams, Param{"rootflags", "ro"})
+		}
 	// EXT4 filesystem is used by default.
 	case EXT4:
 		if dax {
@@ -469,6 +477,9 @@ type HypervisorConfig struct {
 	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
 	SnpIdAuth string
 
+	// SnpGuestPolicy is the integer representation of the SEV-SNP guest policy.
+	SnpGuestPolicy *uint64
+
 	// KernelParams are additional guest kernel parameters.
 	KernelParams []Param
 
@@ -612,6 +623,9 @@ type HypervisorConfig struct {
 	// MemPrealloc specifies if the memory should be pre-allocated
 	MemPrealloc bool
 
+	// ReclaimGuestFreedMemory is a sandbox annotation that specifies whether the memory freed by the guest will be reclaimed by the hypervisor or not.
+	ReclaimGuestFreedMemory bool
+
 	// HugePages specifies if the memory should be pre-allocated from huge pages
 	HugePages bool
 
@@ -681,6 +695,14 @@ type HypervisorConfig struct {
 
 	// Initdata defines the initdata passed into guest when CreateVM
 	Initdata string
+
+	// InitdataDigest represents opaque binary data attached to a TEE and typically used
+	// for Guest attestation. This will be encoded in the format expected by QEMU for each TEE type.
+	InitdataDigest []byte
+
+	// The initdata image on the host side to store the initdata and be mounted
+	// as a raw block device to guest
+	InitdataImage string
 
 	// GPU specific annotations (currently only applicable for Remote Hypervisor)
 	//DefaultGPUs specifies the number of GPUs required for the Kata VM
@@ -1165,4 +1187,95 @@ func KernelParamFields(s string) []string {
 	}
 
 	return params
+}
+
+// prepareInitdataMount prepares the on-disk initdata image for a VM/sandbox.
+//
+// It reads the initdata payload from config.Initdata, creates a working directory
+// at /run/kata-containers/shared/initdata/<id>, builds the image file
+// (data.img) via prepareInitdataImage, and sets config.InitdataImage to the
+// resulting absolute path.
+func prepareInitdataMount(logger *logrus.Entry, id string, config *HypervisorConfig) error {
+	if len(config.Initdata) == 0 {
+		logger.Info("No initdata provided. Skip prepare initdata device")
+		return nil
+	}
+
+	logger.Info("Start to prepare initdata")
+	initdataWorkdir := filepath.Join("/run/kata-containers/shared/initdata", id)
+	initdataImagePath := filepath.Join(initdataWorkdir, "data.img")
+
+	if err := os.MkdirAll(initdataWorkdir, 0o755); err != nil {
+		logger.WithField("initdata", "create initdata image path").WithError(err).Error("mkdir failed")
+		return err
+	}
+
+	if err := prepareInitdataImage(config.Initdata, initdataImagePath); err != nil {
+		logger.WithField("initdata", "prepare initdata image").WithError(err).Error("prepare failed")
+		return err
+	}
+
+	config.InitdataImage = initdataImagePath
+	return nil
+}
+
+// prepareInitdataImage will create an image with a very simple layout
+//
+// There will be multiple sectors. The first 8 bytes are Magic number "initdata".
+// Then a "length" field of 8 bytes follows (unsigned int64).
+// Finally the gzipped initdata toml. The image will be padded to an
+// integer multiple of the sector size for alignment.
+//
+// offset 0                                8                    16
+// 0	  'i' 'n' 'i' 't' 'd' 'a' 't' 'a'  | gzip length in le  |
+// 16	  gzip(initdata toml) ...
+// (end of the last sector)  '\0' paddings
+func prepareInitdataImage(initdata string, imagePath string) error {
+	SectorSize := 512
+	var buf bytes.Buffer
+	gzipper := gzip.NewWriter(&buf)
+	defer gzipper.Close()
+
+	gzipper.Write([]byte(initdata))
+	err := gzipper.Close()
+	if err != nil {
+		return fmt.Errorf("failed to compress initdata: %v", err)
+	}
+
+	compressedInitdata := buf.Bytes()
+
+	compressedInitdataLength := len(compressedInitdata)
+	lengthBuffer := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lengthBuffer, uint64(compressedInitdataLength))
+
+	paddingLength := (compressedInitdataLength+16+SectorSize-1)/SectorSize*SectorSize - (compressedInitdataLength + 16)
+	paddingBuffer := make([]byte, paddingLength)
+
+	file, err := os.OpenFile(imagePath, os.O_CREATE|os.O_RDWR, 0640)
+	if err != nil {
+		return fmt.Errorf("failed to create initdata image: %v", err)
+	}
+	defer file.Close()
+
+	_, err = file.Write([]byte("initdata"))
+	if err != nil {
+		return fmt.Errorf("failed to write magic number to initdata image: %v", err)
+	}
+
+	_, err = file.Write(lengthBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to write data length to initdata image: %v", err)
+	}
+
+	_, err = file.Write([]byte(compressedInitdata))
+	if err != nil {
+		return fmt.Errorf("failed to write compressed initdata to initdata image: %v", err)
+	}
+
+	_, err = file.Write(paddingBuffer)
+	if err != nil {
+		return fmt.Errorf("failed to write compressed initdata to initdata image: %v", err)
+	}
+
+	return nil
 }

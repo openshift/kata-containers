@@ -8,14 +8,15 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::rand::RandomBytes;
-use kata_types::config::hypervisor::TopologyConfigInfo;
+use kata_types::config::hypervisor::{BlockDeviceInfo, TopologyConfigInfo, VIRTIO_SCSI};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     vhost_user_blk::VhostUserBlkDevice, BlockConfig, BlockDevice, HybridVsockDevice, Hypervisor,
-    NetworkDevice, ProtectionDevice, ShareFsDevice, VfioDevice, VhostUserConfig,
+    NetworkDevice, PCIePortDevice, ProtectionDevice, ShareFsDevice, VfioDevice, VhostUserConfig,
     VhostUserNetDevice, VsockDevice, KATA_BLK_DEV_TYPE, KATA_CCW_DEV_TYPE, KATA_MMIO_BLK_DEV_TYPE,
-    KATA_NVDIMM_DEV_TYPE, VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_MMIO, VIRTIO_BLOCK_PCI, VIRTIO_PMEM,
+    KATA_NVDIMM_DEV_TYPE, KATA_SCSI_DEV_TYPE, VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_MMIO,
+    VIRTIO_BLOCK_PCI, VIRTIO_PMEM,
 };
 
 use super::{
@@ -112,12 +113,12 @@ impl DeviceManager {
         })
     }
 
-    async fn get_block_driver(&self) -> String {
-        self.hypervisor
-            .hypervisor_config()
-            .await
-            .blockdev_info
-            .block_device_driver
+    pub fn get_pcie_topology(&self) -> Option<PCIeTopology> {
+        self.pcie_topology.clone()
+    }
+
+    async fn get_block_device_info(&self) -> BlockDeviceInfo {
+        self.hypervisor.hypervisor_config().await.blockdev_info
     }
 
     async fn try_add_device(&mut self, device_id: &str) -> Result<()> {
@@ -250,7 +251,10 @@ impl DeviceManager {
                         return Some(device_id.to_string());
                     }
                 }
-                DeviceType::HybridVsock(_) | DeviceType::Vsock(_) | DeviceType::Protection(_) => {
+                DeviceType::HybridVsock(_)
+                | DeviceType::Vsock(_)
+                | DeviceType::Protection(_)
+                | DeviceType::PortDevice(_) => {
                     continue;
                 }
             }
@@ -393,6 +397,9 @@ impl DeviceManager {
                     pconfig,
                 )))
             }
+            DeviceConfig::PortDeviceCfg(config) => {
+                Arc::new(Mutex::new(PCIePortDevice::new(&device_id, config)))
+            }
         };
 
         // register device to devices
@@ -460,6 +467,9 @@ impl DeviceManager {
             VIRTIO_PMEM => {
                 block_config.driver_option = KATA_NVDIMM_DEV_TYPE.to_string();
                 is_pmem = true;
+            }
+            VIRTIO_SCSI => {
+                block_config.driver_option = KATA_SCSI_DEV_TYPE.to_string();
             }
             _ => {
                 return Err(anyhow!(
@@ -609,15 +619,15 @@ pub async fn do_update_device(
     Ok(())
 }
 
-pub async fn get_block_driver(d: &RwLock<DeviceManager>) -> String {
-    d.read().await.get_block_driver().await
+pub async fn get_block_device_info(d: &RwLock<DeviceManager>) -> BlockDeviceInfo {
+    d.read().await.get_block_device_info().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::DeviceManager;
     use crate::{
-        device::{device_manager::get_block_driver, DeviceConfig, DeviceType},
+        device::{device_manager::get_block_device_info, DeviceConfig, DeviceType},
         qemu::Qemu,
         BlockConfig, KATA_BLK_DEV_TYPE,
     };
@@ -656,7 +666,7 @@ mod tests {
         assert!(dm.is_ok());
 
         let d = dm.unwrap();
-        let block_driver = get_block_driver(&d).await;
+        let block_driver = get_block_device_info(&d).await.block_device_driver;
         let dev_info = DeviceConfig::BlockCfg(BlockConfig {
             path_on_host: "/dev/dddzzz".to_string(),
             driver_option: block_driver,

@@ -38,6 +38,8 @@ type qemuAmd64 struct {
 	snpIdBlock string
 
 	snpIdAuth string
+
+	snpGuestPolicy *uint64
 }
 
 const (
@@ -70,10 +72,6 @@ var kernelParams = []Param{
 var supportedQemuMachines = []govmmQemu.Machine{
 	{
 		Type:    QemuQ35,
-		Options: defaultQemuMachineOptions,
-	},
-	{
-		Type:    QemuVirt,
 		Options: defaultQemuMachineOptions,
 	},
 	{
@@ -130,11 +128,12 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 			protection:           noneProtection,
 			legacySerial:         config.LegacySerial,
 		},
-		vmFactory:  factory,
-		snpGuest:   config.SevSnpGuest,
-		qgsPort:    config.QgsPort,
-		snpIdBlock: config.SnpIdBlock,
-		snpIdAuth:  config.SnpIdAuth,
+		vmFactory:      factory,
+		snpGuest:       config.SevSnpGuest,
+		qgsPort:        config.QgsPort,
+		snpIdBlock:     config.SnpIdBlock,
+		snpIdAuth:      config.SnpIdAuth,
+		snpGuestPolicy: config.SnpGuestPolicy,
 	}
 
 	if config.ConfidentialGuest {
@@ -169,8 +168,7 @@ func newQemuArch(config HypervisorConfig) (qemuArch, error) {
 func (q *qemuAmd64) capabilities(hConfig HypervisorConfig) types.Capabilities {
 	var caps types.Capabilities
 
-	if q.qemuMachine.Type == QemuQ35 ||
-		q.qemuMachine.Type == QemuVirt {
+	if q.qemuMachine.Type == QemuQ35 {
 		caps.SetBlockDeviceHotplugSupport()
 		caps.SetNetworkDeviceHotplugSupported()
 	}
@@ -274,7 +272,7 @@ func (q *qemuAmd64) enableProtection() error {
 }
 
 // append protection device
-func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	if q.sgxEPCSize != 0 {
 		devices = append(devices,
 			govmmQemu.Object{
@@ -299,6 +297,7 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 				Debug:          false,
 				File:           firmware,
 				FirmwareVolume: firmwareVolume,
+				InitdataDigest: initdataDigest,
 			}), "", nil
 	case sevProtection:
 		return append(devices,
@@ -318,6 +317,8 @@ func (q *qemuAmd64) appendProtectionDevice(devices []govmmQemu.Device, firmware,
 			File:            firmware,
 			CBitPos:         cpuid.AMDMemEncrypt.CBitPosition,
 			ReducedPhysBits: 1,
+			InitdataDigest:  initdataDigest,
+			SnpGuestPolicy:  q.snpGuestPolicy,
 		}
 		if q.snpIdBlock != "" && q.snpIdAuth != "" {
 			obj.SnpIdBlock = q.snpIdBlock

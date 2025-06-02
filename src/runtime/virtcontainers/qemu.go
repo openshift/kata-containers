@@ -32,7 +32,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/rootless"
 
 	govmmQemu "github.com/kata-containers/kata-containers/src/runtime/pkg/govmm/qemu"
-	"github.com/opencontainers/selinux/go-selinux/label"
+	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -136,6 +136,7 @@ const (
 	scsiControllerID         = "scsi0"
 	rngID                    = "rng0"
 	fallbackFileBackedMemDir = "/dev/shm"
+	balloonID                = "balloon0"
 
 	qemuStopSandboxTimeoutSecs = 15
 
@@ -322,10 +323,13 @@ func (q *qemu) cpuTopology() govmmQemu.SMP {
 }
 
 func (q *qemu) memoryTopology() (govmmQemu.Memory, error) {
-	hostMemMb := q.config.DefaultMaxMemorySize
 	memMb := uint64(q.config.MemorySize)
+	if !q.config.ConfidentialGuest {
+		hostMemMb := q.config.DefaultMaxMemorySize
+		return q.arch.memoryTopology(memMb, hostMemMb, uint8(q.config.MemSlots)), nil
+	}
 
-	return q.arch.memoryTopology(memMb, hostMemMb, uint8(q.config.MemSlots)), nil
+	return q.arch.memoryTopology(memMb, 0, 0), nil
 }
 
 func (q *qemu) qmpSocketPath(id string) (string, error) {
@@ -541,6 +545,9 @@ func (q *qemu) createVirtiofsDaemon(sharedPath string) (VirtiofsDaemon, error) {
 }
 
 // CreateVM is the Hypervisor VM creation implementation for govmmQemu.
+// This function is complex and there's not much to be done about it, unfortunately.
+//
+//nolint:gocyclo
 func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervisorConfig *HypervisorConfig) error {
 	// Save the tracing context
 	q.ctx = ctx
@@ -549,6 +556,10 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 	defer span.End()
 
 	if err := q.setup(ctx, id, hypervisorConfig); err != nil {
+		return err
+	}
+
+	if err := prepareInitdataMount(q.Logger(), q.id, hypervisorConfig); err != nil {
 		return err
 	}
 
@@ -650,6 +661,10 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		return err
 	}
 
+	if len(hypervisorConfig.Initdata) > 0 {
+		devices = q.arch.buildInitdataDevice(ctx, devices, hypervisorConfig.InitdataImage)
+	}
+
 	// some devices configuration may also change kernel params, make sure this is called afterwards
 	kernel.Params = q.kernelParameters()
 	q.checkBpfEnabled()
@@ -681,7 +696,7 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		Debug:          hypervisorConfig.Debug,
 	}
 
-	qemuConfig.Devices, qemuConfig.Bios, err = q.arch.appendProtectionDevice(qemuConfig.Devices, firmwarePath, firmwareVolumePath)
+	qemuConfig.Devices, qemuConfig.Bios, err = q.arch.appendProtectionDevice(qemuConfig.Devices, firmwarePath, firmwareVolumePath, hypervisorConfig.InitdataDigest)
 	if err != nil {
 		return err
 	}
@@ -690,13 +705,27 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		qemuConfig.IOThreads = []govmmQemu.IOThread{*ioThread}
 	}
 	// Add RNG device to hypervisor
-	// Skip for s390x as CPACF is used
-	if machine.Type != QemuCCWVirtio {
+	// Skip for s390x (as CPACF is used) or when Confidential Guest is enabled
+	if machine.Type != QemuCCWVirtio && !q.config.ConfidentialGuest {
 		rngDev := config.RNGDev{
 			ID:       rngID,
 			Filename: q.config.EntropySource,
 		}
 		qemuConfig.Devices, err = q.arch.appendRNGDevice(ctx, qemuConfig.Devices, rngDev)
+		if err != nil {
+			return err
+		}
+	}
+
+	if q.config.ReclaimGuestFreedMemory && !q.config.ConfidentialGuest {
+		balloonDev := config.BalloonDev{
+			ID:                balloonID,
+			DeflateOnOOM:      true,
+			DisableModern:     false,
+			FreePageReporting: true,
+		}
+
+		qemuConfig.Devices, err = q.arch.appendBalloonDevice(ctx, qemuConfig.Devices, balloonDev)
 		if err != nil {
 			return err
 		}
@@ -1093,10 +1122,10 @@ func (q *qemu) StartVM(ctx context.Context, timeout int) error {
 	// the SELinux label. If these processes require privileged, we do
 	// notwant to run them under confinement.
 	if !q.config.DisableSeLinux {
-		if err := label.SetProcessLabel(q.config.SELinuxProcessLabel); err != nil {
+		if err := selinux.SetExecLabel(q.config.SELinuxProcessLabel); err != nil {
 			return err
 		}
-		defer label.SetProcessLabel("")
+		defer selinux.SetExecLabel("")
 	}
 	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
 		err = q.setupVirtiofsDaemon(ctx)
@@ -1254,6 +1283,7 @@ func (q *qemu) StopVM(ctx context.Context, waitOnly bool) (err error) {
 			}
 		}
 	}
+
 	if q.config.SharedFS == config.VirtioFS || q.config.SharedFS == config.VirtioFSNydus {
 		if err := q.stopVirtiofsDaemon(ctx); err != nil {
 			return err
@@ -1316,6 +1346,15 @@ func (q *qemu) cleanupVM() error {
 				"user": q.config.User,
 				"uid":  q.config.Uid,
 			}).Debug("successfully removed the non root user")
+	}
+
+	// If we have initdata, we should drop initdata image path
+	hypervisorConfig := q.HypervisorConfig()
+	if len(hypervisorConfig.Initdata) > 0 {
+		initdataWorkdir := filepath.Join(string(filepath.Separator), "/run/kata-containers/shared/initdata", q.id)
+		if err := os.RemoveAll(initdataWorkdir); err != nil {
+			q.Logger().WithError(err).Warnf("failed to remove initdata work dir %s", initdataWorkdir)
+		}
 	}
 
 	return nil
@@ -2071,20 +2110,20 @@ func (q *qemu) hotplugAddCPUs(amount uint32) (uint32, error) {
 		// CPU type, i.e host-x86_64-cpu
 		driver := hc.Type
 		cpuID := fmt.Sprintf("cpu-%d", len(q.state.HotpluggedVCPUs))
-		socketID := fmt.Sprintf("%d", hc.Properties.Socket)
-		dieID := fmt.Sprintf("%d", hc.Properties.Die)
-		coreID := fmt.Sprintf("%d", hc.Properties.Core)
-		threadID := fmt.Sprintf("%d", hc.Properties.Thread)
+		socketID := hc.Properties.Socket
+		dieID := hc.Properties.Die
+		coreID := hc.Properties.Core
+		threadID := hc.Properties.Thread
 
 		// If CPU type is IBM pSeries, Z or arm virt, we do not set socketID and threadID
 		if machine.Type == "pseries" || machine.Type == QemuCCWVirtio || machine.Type == "virt" {
-			socketID = ""
-			threadID = ""
-			dieID = ""
+			socketID = -1
+			threadID = -1
+			dieID = -1
 		}
 
 		if err := q.qmpMonitorCh.qmp.ExecuteCPUDeviceAdd(q.qmpMonitorCh.ctx, driver, cpuID, socketID, dieID, coreID, threadID, romFile); err != nil {
-			q.Logger().WithField("hotplug", "cpu").Warnf("qmp hotplug cpu, cpuID=%s socketID=%s, error: %v", cpuID, socketID, err)
+			q.Logger().WithField("hotplug", "cpu").Warnf("qmp hotplug cpu, cpuID=%s socketID=%d, error: %v", cpuID, socketID, err)
 			// don't fail, let's try with other CPU
 			continue
 		}
@@ -2530,12 +2569,13 @@ func genericMemoryTopology(memoryMb, hostMemoryMb uint64, slots uint8, memoryOff
 	// See https://github.com/clearcontainers/runtime/issues/380
 	memoryOffset += 1024
 
-	memMax := fmt.Sprintf("%dM", hostMemoryMb+memoryOffset)
-
-	mem := fmt.Sprintf("%dM", memoryMb)
+	memMax := ""
+	if hostMemoryMb != 0 {
+		memMax = fmt.Sprintf("%dM", hostMemoryMb+memoryOffset)
+	}
 
 	memory := govmmQemu.Memory{
-		Size:   mem,
+		Size:   fmt.Sprintf("%dM", memoryMb),
 		Slots:  slots,
 		MaxMem: memMax,
 	}

@@ -116,6 +116,9 @@ type qemuArch interface {
 	// appendRNGDevice appends a RNG device to devices
 	appendRNGDevice(ctx context.Context, devices []govmmQemu.Device, rngDevice config.RNGDev) ([]govmmQemu.Device, error)
 
+	// appendBalloonDevice appends a Balloon device to devices
+	appendBalloonDevice(ctx context.Context, devices []govmmQemu.Device, BalloonDevice config.BalloonDev) ([]govmmQemu.Device, error)
+
 	// setEndpointDevicePath sets the appropriate PCI or CCW device path for an endpoint
 	setEndpointDevicePath(endpoint Endpoint, bridgeAddr int, devAddr string) error
 
@@ -165,7 +168,7 @@ type qemuArch interface {
 	// This implementation is architecture specific, some archs may need
 	// a firmware, returns a string containing the path to the firmware that should
 	// be used with the -bios option, ommit -bios option if the path is empty.
-	appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error)
+	appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error)
 
 	// scans the PCIe space and returns the biggest BAR sizes for 32-bit
 	// and 64-bit addressable memory
@@ -176,6 +179,9 @@ type qemuArch interface {
 
 	// Query QMP to find the PCI slot of a device, given its QOM path or ID
 	qomGetSlot(qomPath string, qmpCh *qmpChannel) (types.PciSlot, error)
+
+	// buildInitdataDevice creates an initdata device for the given architecture.
+	buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device
 }
 
 type qemuArchBase struct {
@@ -221,7 +227,7 @@ const (
 	// QemuMicrovm is the QEMU microvm machine type for amd64
 	QemuMicrovm = "microvm"
 
-	// QemuVirt is the QEMU virt machine type for aarch64 or amd64
+	// QemuVirt is the QEMU virt machine type for aarch64 or arm
 	QemuVirt = "virt"
 
 	// QemuPseries is a QEMU virt machine type for ppc64le
@@ -735,6 +741,19 @@ func (q *qemuArchBase) appendRNGDevice(_ context.Context, devices []govmmQemu.De
 	return devices, nil
 }
 
+func (q *qemuArchBase) appendBalloonDevice(_ context.Context, devices []govmmQemu.Device, balloonDev config.BalloonDev) ([]govmmQemu.Device, error) {
+	devices = append(devices,
+		govmmQemu.BalloonDevice{
+			ID:                balloonDev.ID,
+			DeflateOnOOM:      balloonDev.DeflateOnOOM,
+			DisableModern:     balloonDev.DisableModern,
+			FreePageReporting: balloonDev.FreePageReporting,
+		},
+	)
+
+	return devices, nil
+}
+
 func (q *qemuArchBase) setEndpointDevicePath(endpoint Endpoint, bridgeAddr int, devAddr string) error {
 	bridgeSlot, err := types.PciSlotFromInt(bridgeAddr)
 	if err != nil {
@@ -920,7 +939,7 @@ func (q *qemuArchBase) setPFlash(p []string) {
 }
 
 // append protection device
-func (q *qemuArchBase) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuArchBase) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	hvLogger.WithField("arch", runtime.GOARCH).Warnf("Confidential Computing has not been implemented for this architecture")
 	return devices, firmware, nil
 }
@@ -947,6 +966,24 @@ func (q *qemuArchBase) qomGetSlot(qomPath string, qmpCh *qmpChannel) (types.PciS
 	}
 
 	return types.PciSlotFromInt(slotNum)
+}
+
+// build initdata device
+func (q *qemuArchBase) buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device {
+	device := govmmQemu.BlockDevice{
+		Driver:    govmmQemu.VirtioBlock,
+		Transport: govmmQemu.TransportPCI,
+		ID:        "initdata",
+		File:      initdataImage,
+		SCSI:      false,
+		WCE:       false,
+		AIO:       govmmQemu.Threads,
+		Interface: "none",
+		Format:    "raw",
+	}
+
+	devices = append(devices, device)
+	return devices
 }
 
 // Query QMP to find a device's PCI path given its QOM path or ID

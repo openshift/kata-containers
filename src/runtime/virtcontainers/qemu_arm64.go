@@ -154,10 +154,19 @@ func (q *qemuArm64) enableProtection() error {
 	return nil
 }
 
-func (q *qemuArm64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string) ([]govmmQemu.Device, string, error) {
+func (q *qemuArm64) buildInitdataDevice(ctx context.Context, devices []govmmQemu.Device, initdataImage string) []govmmQemu.Device {
+	hvLogger.Warnf("buildInitdataDevice not implemented for arm64; ignoring initdata image: %s", initdataImage)
+	return devices
+}
+
+func (q *qemuArm64) appendProtectionDevice(devices []govmmQemu.Device, firmware, firmwareVolume string, initdataDigest []byte) ([]govmmQemu.Device, string, error) {
 	err := q.enableProtection()
 	if err != nil {
 		hvLogger.WithField("arch", runtime.GOARCH).Error(err)
 	}
 	return devices, firmware, err
+}
+
+func (q *qemuArm64) memoryTopology(memoryMb, hostMemoryMb uint64, slots uint8) govmmQemu.Memory {
+	return genericMemoryTopology(memoryMb, hostMemoryMb, slots, q.memoryOffset)
 }

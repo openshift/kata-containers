@@ -18,6 +18,7 @@ use dragonball::{
     vm::VmConfigInfo,
 };
 
+use crate::DEFAULT_HOTPLUG_TIMEOUT;
 use kata_sys_util::mount;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
@@ -28,7 +29,7 @@ use kata_types::{
 };
 use nix::mount::MsFlags;
 use persist::sandbox_persist::Persist;
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Duration};
 use std::{collections::HashSet, fs::create_dir_all};
 use tokio::sync::mpsc;
 
@@ -37,6 +38,7 @@ const DRAGONBALL_INITRD: &str = "initrd";
 const DRAGONBALL_ROOT_FS: &str = "rootfs";
 const BALLOON_DEVICE_ID: &str = "balloon0";
 const MEM_DEVICE_ID: &str = "memmr0";
+
 #[derive(Debug)]
 pub struct DragonballInner {
     /// sandbox id
@@ -214,10 +216,7 @@ impl DragonballInner {
         }
 
         std::fs::remove_dir_all(&self.vm_path)
-            .map_err(|err| {
-                error!(sl!(), "failed to remove dir all for {}", &self.vm_path);
-                err
-            })
+            .inspect_err(|_| error!(sl!(), "failed to remove dir all for {}", &self.vm_path))
             .ok();
     }
 
@@ -394,7 +393,10 @@ impl DragonballInner {
             vcpu_count: Some(new_vcpus as u8),
         };
         self.vmm_instance
-            .resize_vcpu(&cpu_resize_info)
+            .resize_vcpu(
+                &cpu_resize_info,
+                Some(Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT)),
+            )
             .context(format!(
                 "failed to do_resize_vcpus on new_vcpus={:?}",
                 new_vcpus

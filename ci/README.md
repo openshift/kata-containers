@@ -172,12 +172,28 @@ For new jobs, or jobs that haven't been marked as required recently,
 the criteria to be initially marked as required is ten days
 of passing tests, with no relevant PR failures reported in that time.
 Required jobs also need one or more nominated maintainers that are
-responsible for the stability of their jobs.
+responsible for the stability of their jobs. Maintainers can be registered
+in [`maintainers.yml`](https://github.com/kata-containers/kata-containers.github.io/blob/main/maintainers.yml)
+and will then show on the CI Dashboard.
 
-> [!NOTE]
-> We don't currently have a good place to record the job maintainers, but
-> once we have this, the intention is to show it on the CI Dashboard so
-> people can find the contact easily.
+To add transparency to making jobs required/non-required and to keep the
+GitHub UI in sync with the [Gatekeeper job](../tools/testing/gatekeeper),
+the process to update a job's required state is as follows:
+1. Create a PR to update `maintainers.yml`, if new maintainers are being
+declared on a CI job.
+1. Create a PR which updates
+[`required-tests.yaml`](../tools/testing/gatekeeper/required-tests.yaml)
+adding the new job and listing the evidence that the job meets the
+requirements above. Ensure that all maintainers and
+@kata-containers/architecture-committee are notified to give them the
+opportunity to review the PR. See
+[#11015](https://github.com/kata-containers/kata-containers/pull/11015)
+as an example.
+1. The maintainers and Architecture Committee get a chance to review the PR.
+It can be discussed in an AC meeting to get broader input.
+1. Once the PR has been merged, a Kata Containers admin should be notified
+to ensure that the GitHub UI is updated to reflect the change in
+`required-tests.yaml`.
 
 #### Expectation of required job maintainers
 
@@ -290,7 +306,7 @@ tarball to the newly created VM that will be used for debugging purposes.
 > [!NOTE]
 > Those artifacts are only available (for 15 days) when all jobs are finished.
 
-Once you have the `kata-static.tar.xz` in your VM, you can login to the VM with
+Once you have the `kata-static.tar.zst` in your VM, you can login to the VM with
 `kcli ssh debug-nerdctl-pr8070`, go ahead and then clone your development branch
 
 ```bash
@@ -307,15 +323,15 @@ $ git config --global user.name "Your Name"
 $ git rebase upstream/main
 ```
 
-Now copy the `kata-static.tar.xz` into your `kata-containers/kata-artifacts` directory
+Now copy the `kata-static.tar.zst` into your `kata-containers/kata-artifacts` directory
 
 ```bash
 $ mkdir kata-artifacts
-$ cp ../kata-static.tar.xz kata-artifacts/
+$ cp ../kata-static.tar.zst kata-artifacts/
 ```
 
 > [!NOTE]
-> If you downloaded the .zip from GitHub you need to uncompress first to see `kata-static.tar.xz`
+> If you downloaded the .zip from GitHub you need to uncompress first to see `kata-static.tar.zst`
 
 And finally run the tests following what's in the yaml file for the test you're
 debugging.
@@ -347,11 +363,11 @@ and have fun debugging and hacking!
 
 Steps for debugging the Kubernetes tests are very similar to the ones for
 debugging non-Kubernetes tests, with the caveat that what you'll need, this
-time, is not the `kata-static.tar.xz` tarball, but rather a payload to be used
+time, is not the `kata-static.tar.zst` tarball, but rather a payload to be used
 with kata-deploy.
 
 In order to generate your own kata-deploy image you can generate your own
-`kata-static.tar.xz` and then take advantage of the following script.  Be aware
+`kata-static.tar.zst` and then take advantage of the following script.  Be aware
 that the image generated and uploaded must be accessible by the VM where you'll
 be performing your tests.
 

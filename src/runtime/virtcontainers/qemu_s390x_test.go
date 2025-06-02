@@ -56,6 +56,12 @@ func TestQemuS390xMemoryTopology(t *testing.T) {
 
 	m := s390x.memoryTopology(mem, hostMem, slots)
 	assert.Equal(expectedMemory, m)
+
+	// test when hostMem is set to 0 (no hotplug memory)
+	hostMem = 0
+	expectedMemory.MaxMem = fmt.Sprintf("%dM", mem)
+	m = s390x.memoryTopology(mem, hostMem, slots)
+	assert.Equal(expectedMemory, m)
 }
 
 func TestQemuS390xAppendVhostUserDevice(t *testing.T) {
@@ -111,7 +117,7 @@ func TestQemuS390xAppendProtectionDevice(t *testing.T) {
 	var devices []govmmQemu.Device
 	var bios, firmware string
 	var err error
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(nil))
 	assert.NoError(err)
 
 	// no protection
@@ -119,39 +125,40 @@ func TestQemuS390xAppendProtectionDevice(t *testing.T) {
 
 	// PEF protection
 	s390x.(*qemuS390x).protection = pefProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(nil))
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// TDX protection
 	s390x.(*qemuS390x).protection = tdxProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(nil))
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// SEV protection
 	s390x.(*qemuS390x).protection = sevProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(nil))
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// SNP protection
 	s390x.(*qemuS390x).protection = snpProtection
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(nil))
 	assert.Error(err)
 	assert.Empty(bios)
 
 	// Secure Execution protection
 	s390x.(*qemuS390x).protection = seProtection
 
-	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "")
+	devices, bios, err = s390x.appendProtectionDevice(devices, firmware, "", []byte(""))
 	assert.NoError(err)
 	assert.Empty(bios)
 
 	expectedOut := []govmmQemu.Device{
 		govmmQemu.Object{
-			Type: govmmQemu.SecExecGuest,
-			ID:   secExecID,
+			Type:           govmmQemu.SecExecGuest,
+			ID:             secExecID,
+			InitdataDigest: []byte(""),
 		},
 	}
 	assert.Equal(expectedOut, devices)

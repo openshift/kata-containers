@@ -75,8 +75,8 @@ impl yaml::K8sResource for ReplicaSet {
         );
     }
 
-    fn generate_policy(&self, agent_policy: &policy::AgentPolicy) -> String {
-        agent_policy.generate_policy(self)
+    fn generate_initdata_anno(&self, agent_policy: &policy::AgentPolicy) -> String {
+        agent_policy.generate_initdata_anno(self)
     }
 
     fn serialize(&mut self, policy: &str) -> String {
@@ -109,8 +109,12 @@ impl yaml::K8sResource for ReplicaSet {
         false
     }
 
-    fn get_process_fields(&self, process: &mut policy::KataProcess) {
-        yaml::get_process_fields(process, &self.spec.template.spec.securityContext);
+    fn get_process_fields(&self, process: &mut policy::KataProcess, must_check_passwd: &mut bool) {
+        yaml::get_process_fields(
+            process,
+            &self.spec.template.spec.securityContext,
+            must_check_passwd,
+        );
     }
 
     fn get_sysctls(&self) -> Vec<pod::Sysctl> {

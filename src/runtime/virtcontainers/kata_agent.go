@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -37,7 +38,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 
 	ctrAnnotations "github.com/containerd/containerd/pkg/cri/annotations"
-	podmanAnnotations "github.com/containers/podman/v4/pkg/annotations"
+	crioAnnotations "github.com/cri-o/cri-o/pkg/annotations"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
@@ -876,10 +877,10 @@ func setupStorages(ctx context.Context, sandbox *Sandbox) []*grpc.Storage {
 		if sharedFS == config.VirtioFS || sharedFS == config.VirtioFSNydus {
 			// If virtio-fs uses either of the two cache options 'auto, always',
 			// the guest directory can be mounted with option 'dax' allowing it to
-			// directly map contents from the host. When set to 'never', the mount
+			// directly map contents from the host. Otherwise, the mount
 			// options should not contain 'dax' lest the virtio-fs daemon crashing
 			// with an invalid address reference.
-			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeNever {
+			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeNever && sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeMetadata {
 				// If virtio_fs_cache_size = 0, dax should not be used.
 				if sandbox.config.HypervisorConfig.VirtioFSCacheSize != 0 {
 					sharedDirVirtioFSOptions = append(sharedDirVirtioFSOptions, sharedDirVirtioFSDaxOptions)
@@ -1682,7 +1683,7 @@ func getContainerTypeforCRI(c *Container) (string, string) {
 
 	// CRIContainerTypeKeyList lists all the CRI keys that could define
 	// the container type from annotations in the config.json.
-	CRIContainerTypeKeyList := []string{ctrAnnotations.ContainerType, podmanAnnotations.ContainerType}
+	CRIContainerTypeKeyList := []string{ctrAnnotations.ContainerType, crioAnnotations.ContainerType}
 	containerType := c.config.Annotations[vcAnnotations.ContainerTypeKey]
 	for _, key := range CRIContainerTypeKeyList {
 		_, ok := c.config.CustomSpec.Annotations[key]
@@ -1707,7 +1708,7 @@ func handleImageGuestPullBlockVolume(c *Container, virtualVolumeInfo *types.Kata
 		switch criContainerType {
 		case ctrAnnotations.ContainerType:
 			image_ref = container_annotations[kubernetesCRIImageName]
-		case podmanAnnotations.ContainerType:
+		case crioAnnotations.ContainerType:
 			image_ref = container_annotations[kubernetesCRIOImageName]
 		default:
 			// There are cases, like when using nerdctl, where the criContainerType
@@ -1776,9 +1777,18 @@ func (k *kataAgent) handleDeviceBlockVolume(c *Container, m Mount, device api.De
 	if len(vol.Options) == 0 {
 		vol.Options = m.Options
 	}
+
 	if m.FSGroup != nil {
+		var safeFsgroup uint32
+		// Check conversions from int to uint32 is safe
+		if *m.FSGroup > 0 && *m.FSGroup <= math.MaxUint32 {
+			safeFsgroup = uint32(*m.FSGroup)
+		} else {
+			return nil, fmt.Errorf("m.FSGroup value was out of range: %d", m.FSGroup)
+
+		}
 		vol.FsGroup = &grpc.FSGroup{
-			GroupId:           uint32(*m.FSGroup),
+			GroupId:           safeFsgroup,
 			GroupChangePolicy: getFSGroupChangePolicy(m.FSGroupChangePolicy),
 		}
 	}
@@ -2691,4 +2701,31 @@ func IsNydusRootFSType(s string) bool {
 	}
 	s = strings.TrimPrefix(s, "fuse.")
 	return strings.HasPrefix(path.Base(s), "nydus-overlayfs")
+}
+
+// IsErofsRootFS checks if any of the options contain io.containerd.snapshotter.v1.erofs path
+func IsErofsRootFS(root RootFs) bool {
+	// TODO: support containerd mount manager: https://github.com/containerd/containerd/issues/11303
+	if root.Type != "overlay" {
+		return false
+	}
+	for _, opt := range root.Options {
+		if strings.Contains(opt, "io.containerd.snapshotter.v1.erofs") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseErofsRootFsOptions(options []string) []string {
+	lowerdirs := []string{}
+
+	for _, opt := range options {
+		if strings.HasPrefix(opt, "lowerdir=") {
+			lowerdirValue := strings.TrimPrefix(opt, "lowerdir=")
+
+			lowerdirs = append(lowerdirs, strings.Split(lowerdirValue, ":")...)
+		}
+	}
+	return lowerdirs
 }

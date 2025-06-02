@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::health_check::HealthCheck;
 use agent::kata::KataAgent;
 use agent::types::KernelModule;
 use agent::{
@@ -11,9 +12,12 @@ use agent::{
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use common::message::{Action, Message};
 use common::types::utils::option_system_time_into;
 use common::types::ContainerProcess;
+use common::{
+    message::{Action, Message},
+    types::DEFAULT_SHM_SIZE,
+};
 use common::{
     types::{SandboxConfig, SandboxExitInfo, SandboxStatus},
     ContainerManager, Sandbox, SandboxNetworkEnv,
@@ -28,26 +32,32 @@ use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{utils::get_hvsock_path, HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID};
 use hypervisor::{BlockConfig, Hypervisor};
-use hypervisor::{ProtectionDeviceConfig, SevSnpConfig};
+use hypervisor::{BlockDeviceAio, PortDeviceConfig};
+use hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 use kata_sys_util::hooks::HookStates;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
+use kata_sys_util::spec::load_oci_spec;
 use kata_types::capabilities::CapabilityBits;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use kata_types::config::TomlConfig;
+use kata_types::initdata::{calculate_initdata_digest, ProtectedPlatform};
 use oci_spec::runtime as oci;
 use persist::{self, sandbox_persist::Persist};
 use protobuf::SpecialFields;
+use resource::coco_data::initdata::{
+    InitDataConfig, KATA_INIT_DATA_IMAGE, KATA_SHARED_INIT_DATA_PATH,
+};
+use resource::coco_data::initdata_block;
 use resource::manager::ManagerArgs;
 use resource::network::{dan_config_path, DanNetworkConfig, NetworkConfig, NetworkWithNetNsConfig};
 use resource::{ResourceConfig, ResourceManager};
 use runtime_spec as spec;
+use std::path::Path;
 use std::sync::Arc;
 use strum::Display;
 use tokio::sync::{mpsc::Sender, Mutex, RwLock};
 use tracing::instrument;
-
-use crate::health_check::HealthCheck;
 
 pub(crate) const VIRTCONTAINER: &str = "virt_container";
 
@@ -86,6 +96,7 @@ pub struct VirtSandbox {
     hypervisor: Arc<dyn Hypervisor>,
     monitor: Arc<HealthCheck>,
     sandbox_config: Option<SandboxConfig>,
+    shm_size: u64,
 }
 
 impl std::fmt::Debug for VirtSandbox {
@@ -116,6 +127,7 @@ impl VirtSandbox {
             hypervisor,
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
+            shm_size: sandbox_config.shm_size,
             sandbox_config: Some(sandbox_config),
         })
     }
@@ -158,15 +170,61 @@ impl VirtSandbox {
         }
 
         // prepare protection device config
+        let init_data = if let Some(initdata) = self
+            .prepare_initdata_device_config(&self.hypervisor.hypervisor_config().await)
+            .await
+            .context("failed to prepare initdata device config")?
+        {
+            resource_configs.push(ResourceConfig::InitData(initdata.0));
+
+            Some(initdata.1)
+        } else {
+            None
+        };
+
+        // prepare protection device config
         if let Some(protection_dev_config) = self
-            .prepare_protection_device_config(&self.hypervisor.hypervisor_config().await)
+            .prepare_protection_device_config(&self.hypervisor.hypervisor_config().await, init_data)
             .await
             .context("failed to prepare protection device config")?
         {
             resource_configs.push(ResourceConfig::Protection(protection_dev_config));
         }
 
+        // prepare pcie port device config
+        if let Some(port_dev_config) = self.prepare_pcie_port_devices().await {
+            resource_configs.push(ResourceConfig::PortDevice(port_dev_config));
+        }
+
         Ok(resource_configs)
+    }
+
+    async fn prepare_pcie_port_devices(&self) -> Option<PortDeviceConfig> {
+        // Fetch the device manager and read the PCIe topology
+        let device_manager = self.resource_manager.get_device_manager().await;
+        let dm = device_manager.read().await;
+
+        // Get the PCIe topology and port information
+        match dm.get_pcie_topology().and_then(|t| t.get_pcie_port()) {
+            Some((port_type, total_ports)) if total_ports > 0 => {
+                info!(
+                    sl!(),
+                    "Preparing PCIe {:?} with {} devices for VM.", port_type, total_ports
+                );
+                Some(PortDeviceConfig::new(port_type, total_ports))
+            }
+            Some((_, 0)) => {
+                info!(sl!(), "No PCIe ports available for VM.");
+                None
+            }
+            _ => {
+                info!(
+                    sl!(),
+                    "Invalid PCIe configuration or no topology available."
+                );
+                None
+            }
+        }
     }
 
     async fn prepare_network_resource(
@@ -320,11 +378,8 @@ impl VirtSandbox {
     async fn prepare_protection_device_config(
         &self,
         hypervisor_config: &HypervisorConfig,
+        init_data: Option<String>,
     ) -> Result<Option<ProtectionDeviceConfig>> {
-        if !hypervisor_config.security_info.confidential_guest {
-            return Ok(None);
-        }
-
         let available_protection = available_guest_protection()?;
         info!(
             sl!(),
@@ -341,6 +396,7 @@ impl VirtSandbox {
                     is_snp: false,
                     cbitpos: details.cbitpos,
                     firmware: hypervisor_config.boot_info.firmware.clone(),
+                    host_data: None,
                 })))
             }
             GuestProtection::Snp(details) => {
@@ -360,13 +416,78 @@ impl VirtSandbox {
                     is_snp,
                     cbitpos: details.cbitpos,
                     firmware: hypervisor_config.boot_info.firmware.clone(),
+                    host_data: init_data,
                 })))
             }
             GuestProtection::Se => {
                 Ok(Some(ProtectionDeviceConfig::Se))
             }
+            GuestProtection::Tdx => {
+                Ok(Some(ProtectionDeviceConfig::Tdx(TdxConfig {
+                    id: "tdx".to_owned(),
+                    firmware: hypervisor_config.boot_info.firmware.clone(),
+                    qgs_port: hypervisor_config.security_info.qgs_port,
+                    mrconfigid: init_data,
+                    debug: false,
+                })))
+            },
+            GuestProtection::NoProtection => Ok(None),
             _ => Err(anyhow!("confidential_guest requested by configuration but no supported protection available"))
         }
+    }
+
+    async fn prepare_initdata_device_config(
+        &self,
+        hypervisor_config: &HypervisorConfig,
+    ) -> Result<Option<InitDataConfig>> {
+        let initdata = hypervisor_config.security_info.initdata.clone();
+        if initdata.is_empty() {
+            return Ok(None);
+        }
+        info!(sl!(), "Init Data Content String: {:?}", &initdata);
+        let available_protection = available_guest_protection()?;
+        info!(
+            sl!(),
+            "sandbox: available protection: {:?}", available_protection
+        );
+        let initdata_digest = match available_protection {
+            GuestProtection::Tdx => calculate_initdata_digest(&initdata, ProtectedPlatform::Tdx)?,
+            GuestProtection::Snp(_details) => {
+                calculate_initdata_digest(&initdata, ProtectedPlatform::Snp)?
+            }
+            GuestProtection::Se => calculate_initdata_digest(&initdata, ProtectedPlatform::Se)?,
+            GuestProtection::NoProtection => {
+                calculate_initdata_digest(&initdata, ProtectedPlatform::NoProtection)?
+            }
+            // TODO: there's more `GuestProtection` types to be supported.
+            _ => return Ok(None),
+        };
+        info!(
+            sl!(),
+            "calculate initdata: {:?} with initdata  digest {:?}", &initdata, &initdata_digest
+        );
+
+        // initdata within compressed rawblock
+        let image_path = Path::new(KATA_SHARED_INIT_DATA_PATH)
+            .join(&self.sid)
+            .join(KATA_INIT_DATA_IMAGE);
+        initdata_block::push_data(&image_path, &initdata)?;
+        info!(
+            sl!(),
+            "initdata push data into compressed block: {:?}", &image_path
+        );
+        let block_driver = &hypervisor_config.blockdev_info.block_device_driver;
+        let block_config = BlockConfig {
+            path_on_host: image_path.display().to_string(),
+            is_readonly: true,
+            driver_option: block_driver.clone(),
+            blkdev_aio: BlockDeviceAio::Native,
+            ..Default::default()
+        };
+        let initdata_config = InitDataConfig(block_config, initdata_digest);
+        info!(sl!(), "initdata config: {:?}", initdata_config.clone());
+
+        Ok(Some(initdata_config))
     }
 
     fn has_prestart_hooks(
@@ -397,12 +518,18 @@ impl Sandbox for VirtSandbox {
             warn!(sl!(), "sandbox is started");
             return Ok(());
         }
+        let selinux_label = load_oci_spec().ok().and_then(|spec| {
+            spec.process()
+                .as_ref()
+                .and_then(|process| process.selinux_label().clone())
+        });
 
         self.hypervisor
             .prepare_vm(
                 id,
                 sandbox_config.network_env.netns.clone(),
                 &sandbox_config.annotations,
+                selinux_label,
             )
             .await
             .context("prepare vm")?;
@@ -493,7 +620,7 @@ impl Sandbox for VirtSandbox {
             dns: sandbox_config.dns.clone(),
             storages: self
                 .resource_manager
-                .get_storage_for_sandbox()
+                .get_storage_for_sandbox(self.shm_size)
                 .await
                 .context("get storages for sandbox")?,
             sandbox_pidns: false,
@@ -809,6 +936,7 @@ impl Persist for VirtSandbox {
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
             sandbox_config: None,
+            shm_size: DEFAULT_SHM_SIZE,
         })
     }
 }
