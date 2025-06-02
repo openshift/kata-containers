@@ -17,8 +17,6 @@ RUST_VERSION="null"
 AGENT_BIN=${AGENT_BIN:-kata-agent}
 AGENT_INIT=${AGENT_INIT:-no}
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
-# The kata agent enables guest-pull feature.
-PULL_TYPE=${PULL_TYPE:-default}
 KERNEL_MODULES_DIR=${KERNEL_MODULES_DIR:-""}
 OSBUILDER_VERSION="unknown"
 DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
@@ -32,6 +30,7 @@ SELINUX=${SELINUX:-"no"}
 AGENT_POLICY=${AGENT_POLICY:-no}
 AGENT_SOURCE_BIN=${AGENT_SOURCE_BIN:-""}
 AGENT_TARBALL=${AGENT_TARBALL:-""}
+GUEST_HOOKS_TARBALL="${GUEST_HOOKS_TARBALL:-}"
 COCO_GUEST_COMPONENTS_TARBALL=${COCO_GUEST_COMPONENTS_TARBALL:-""}
 CONFIDENTIAL_GUEST="${CONFIDENTIAL_GUEST:-no}"
 PAUSE_IMAGE_TARBALL=${PAUSE_IMAGE_TARBALL:-""}
@@ -55,6 +54,9 @@ GRACEFUL_EXIT=${GRACEFUL_EXIT:-""}
 USE_DOCKER=${USE_DOCKER:-""}
 USE_PODMAN=${USE_PODMAN:-""}
 EXTRA_PKGS=${EXTRA_PKGS:-""}
+REPO_URL=${REPO_URL:-""}
+REPO_URL_X86_64=${REPO_URL_X86_64:-""}
+REPO_COMPONENTS=${REPO_COMPONENTS:-""}
 
 KBUILD_SIGN_PIN=${KBUILD_SIGN_PIN:-""}
 NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:-""}
@@ -104,6 +106,8 @@ readonly -a systemd_files=(
 	"systemd-gpt-auto-generator"
 	"systemd-tmpfiles-cleanup.timer"
 )
+
+typeset should_delete_unnecessary_files="no"
 
 handle_error() {
 	local exit_code="${?}"
@@ -157,6 +161,7 @@ $(get_distros | tr "\n" " ")
 Options:
   -a <version>      Specify the agent version. Overrides the AGENT_VERSION
                     environment variable.
+  -d                Delete unnecessary systemd units and files
   -h                Show this help message.
   -l                List the supported Linux distributions and exit immediately.
   -o <version>      Specify the version of osbuilder to embed in the rootfs
@@ -520,6 +525,11 @@ build_rootfs_distro()
 			engine_run_args+=" -v $(dirname ${PAUSE_IMAGE_TARBALL}):$(dirname ${PAUSE_IMAGE_TARBALL})"
 		fi
 
+		if [[ -n "${GUEST_HOOKS_TARBALL}" ]]; then
+			engine_run_args+=" --env GUEST_HOOKS_TARBALL=${GUEST_HOOKS_TARBALL}"
+			engine_run_args+=" -v $(dirname ${GUEST_HOOKS_TARBALL}):$(dirname ${GUEST_HOOKS_TARBALL})"
+		fi
+
 		engine_run_args+=" -v ${GOPATH_LOCAL}:${GOPATH_LOCAL} --env GOPATH=${GOPATH_LOCAL}"
 
 		engine_run_args+=" $(docker_extra_args $distro)"
@@ -556,6 +566,9 @@ build_rootfs_distro()
 			--env KERNEL_MODULES_DIR="${KERNEL_MODULES_DIR}" \
 			--env LIBC="${LIBC}" \
 			--env EXTRA_PKGS="${EXTRA_PKGS}" \
+			--env REPO_URL="${REPO_URL}" \
+			--env REPO_URL_X86_64="${REPO_URL_X86_64}" \
+			--env REPO_COMPONENTS="${REPO_COMPONENTS}" \
 			--env OSBUILDER_VERSION="${OSBUILDER_VERSION}" \
 			--env OS_VERSION="${OS_VERSION}" \
 			--env VARIANT="${VARIANT}" \
@@ -691,6 +704,10 @@ EOF
 		       -e '/^\[Unit\]/a ConditionPathExists=\/dev\/ptp0' \
 		       -e 's/^ReadWritePaths=\(.\+\) \/var\/lib\/chrony \(.\+\)$/ReadWritePaths=\1 -\/var\/lib\/chrony \2/m' \
 		       ${chrony_systemd_service}
+		# Disable automatic directory creation
+		sed -i -e 's/^\(StateDirectory=\)/#\1/g' \
+		       -e 's/^\(LogsDirectory=\)/#\1/g' \
+		       ${chrony_systemd_service}
 	fi
 
 	AGENT_DIR="${ROOTFS_DIR}/usr/bin"
@@ -728,7 +745,7 @@ EOF
 			git checkout "${AGENT_VERSION}" && OK "git checkout successful" || die "checkout agent ${AGENT_VERSION} failed!"
 		fi
 		make clean
-		make LIBC=${LIBC} INIT=${AGENT_INIT} SECCOMP=${SECCOMP} AGENT_POLICY=${AGENT_POLICY} PULL_TYPE=${PULL_TYPE}
+		make LIBC=${LIBC} INIT=${AGENT_INIT} SECCOMP=${SECCOMP} AGENT_POLICY=${AGENT_POLICY}
 		make install DESTDIR="${ROOTFS_DIR}" LIBC=${LIBC} INIT=${AGENT_INIT}
 		if [ "${SECCOMP}" == "yes" ]; then
 			rm -rf "${libseccomp_install_dir}" "${gperf_install_dir}"
@@ -784,6 +801,11 @@ EOF
 		ln -sf "${policy_file_name}" "${policy_dir}/default-policy.rego"
 	fi
 
+	if [[ -n "${GUEST_HOOKS_TARBALL}" ]]; then
+		info "Install the ${GUEST_HOOKS_TARBALL} guest hooks"
+		tar xvJpf "${GUEST_HOOKS_TARBALL}" -C "${ROOTFS_DIR}"
+	fi
+
 	info "Check init is installed"
 	[ -x "${init}" ] || [ -L "${init}" ] || die "/sbin/init is not installed in ${ROOTFS_DIR}"
 	OK "init is installed"
@@ -807,7 +829,9 @@ EOF
 	info "Create /etc/resolv.conf file in rootfs if not exist"
 	touch "$dns_file"
 
-	delete_unnecessary_files
+	if [[ "${should_delete_unnecessary_files}" == "yes" ]]; then
+	    delete_unnecessary_files
+	fi
 
 	info "Creating summary file"
 	create_summary_file "${ROOTFS_DIR}"
@@ -817,10 +841,11 @@ parse_arguments()
 {
 	[ "$#" -eq 0 ] && usage && return 0
 
-	while getopts a:hlo:r:t: opt
+	while getopts a:dhlo:r:t: opt
 	do
 		case $opt in
 			a)	AGENT_VERSION="${OPTARG}" ;;
+			d)	should_delete_unnecessary_files="yes" ;;
 			h)	usage ;;
 			l)	get_distros | sort && exit 0;;
 			o)	OSBUILDER_VERSION="${OPTARG}" ;;

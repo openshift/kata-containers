@@ -3,6 +3,10 @@ on:
     - cron: '0 5 * * *'
 
 name: Nightly CI for s390x
+
+permissions:
+  contents: read
+
 jobs:
   check-internal-test-result:
     runs-on: s390x
@@ -11,6 +15,7 @@ jobs:
       matrix:
         test_title:
           - kata-vfio-ap-e2e-tests
+          - cc-vfio-ap-e2e-tests
           - cc-se-e2e-tests
     steps:
     - name: Fetch a test result for {{ matrix.test_title }}

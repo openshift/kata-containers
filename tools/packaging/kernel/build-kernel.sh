@@ -33,6 +33,7 @@ readonly default_initramfs="${script_dir}/initramfs.cpio.gz"
 readonly VENDOR_INTEL="intel"
 readonly VENDOR_NVIDIA="nvidia"
 readonly KBUILD_SIGN_PIN=${KBUILD_SIGN_PIN:-""}
+readonly KERNEL_DEBUG_ENABLED=${KERNEL_DEBUG_ENABLED:-"no"}
 
 #Path to kernel directory
 kernel_path=""
@@ -226,8 +227,15 @@ get_kernel_frag_path() {
 	local config_path="${arch_path}/.config"
 
 	local arch_configs="$(ls ${arch_path}/*.conf)"
-	# Exclude configs if they have !$arch tag in the header
-	local common_configs="$(grep "\!${arch}" ${common_path}/*.conf -L)"
+	# By default, exclude configs if they have !$arch tag in the header
+	local exclude_tags="-e "\!${arch}""
+
+	# Also, let confidential guest opt-out some insecure configs
+	if [[ "${conf_guest}" != "" ]];then
+		exclude_tags="${exclude_tags} -e "\!${conf_guest}""
+	fi
+
+	local common_configs="$(grep ${exclude_tags} ${common_path}/*.conf -L)"
 
 	local extra_configs=""
 	if [ "${build_type}" != "" ];then
@@ -299,6 +307,19 @@ get_kernel_frag_path() {
 
 		local tmpfs_configs="$(ls ${common_path}/confidential_containers/tmpfs.conf)"
 		all_configs="${all_configs} ${tmpfs_configs}"
+	fi
+
+	if [[ "${KBUILD_SIGN_PIN}" != "" ]]; then
+		info "Enabling config for module signing"
+		local sign_configs
+		sign_configs="$(ls ${common_path}/signing/module_signing.conf)"
+		all_configs="${all_configs} ${sign_configs}"
+	fi
+
+	if [[ ${KERNEL_DEBUG_ENABLED} == "yes" ]]; then
+		info "Enable kernel debug"
+		local debug_configs="$(ls ${common_path}/common/debug.conf)"
+		all_configs="${all_configs} ${debug_configs}"
 	fi
 
 	if [[ "$force_setup_generate_config" == "true" ]]; then

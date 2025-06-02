@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::device::pci_path::PciPath;
 use crate::qemu::cmdline_generator::{DeviceVirtioNet, Netdev};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
 use std::io::BufReader;
 use std::os::fd::{AsRawFd, RawFd};
@@ -14,8 +16,11 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use qapi::qmp;
-use qapi_qmp;
+use qapi_qmp::{self, PciDeviceInfo};
 use qapi_spec::Dictionary;
+
+/// default qmp connection read timeout
+const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
 
 pub struct Qmp {
     qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
@@ -53,7 +58,7 @@ impl Qmp {
         // (containerd's task creation timeout is 2 s by default).  OTOH
         // setting it too short would risk interfering with a normal launch,
         // perhaps just seeing some delay due to a heavily loaded host.
-        stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+        stream.set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
 
         let mut qmp = Qmp {
             qmp: qapi::Qmp::new(qapi::Stream::new(
@@ -467,8 +472,223 @@ impl Qmp {
 
         Ok(())
     }
+
+    pub fn get_device_by_qdev_id(&mut self, qdev_id: &str) -> Result<PciPath> {
+        let format_str = |vec: &Vec<i64>| -> String {
+            vec.iter()
+                .map(|num| format!("{:02x}", num))
+                .collect::<Vec<String>>()
+                .join("/")
+        };
+
+        let mut path = vec![];
+        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
+        for pci_info in pci.iter() {
+            if let Some(_device) = get_pci_path_by_qdev_id(&pci_info.devices, qdev_id, &mut path) {
+                let pci_path = format_str(&path);
+                return PciPath::try_from(pci_path.as_str());
+            }
+        }
+
+        Err(anyhow!("no target device found"))
+    }
+
+    /// hotplug block device:
+    /// {
+    ///     "execute": "blockdev-add",
+    ///     "arguments": {
+    ///         "node-name": "drive-0",
+    ///         "file": {"driver": "file", "filename": "/path/to/block"},
+    ///         "cache": {"direct": true},
+    ///         "read-only": false
+    ///     }
+    /// }
+    ///
+    /// {
+    ///     "execute": "device_add",
+    ///     "arguments": {
+    ///         "id": "drive-0",
+    ///         "driver": "virtio-blk-pci",
+    ///         "drive": "drive-0",
+    ///         "addr":"0x0",
+    ///         "bus": "pcie.1"
+    ///     }
+    /// }
+    pub fn hotplug_block_device(
+        &mut self,
+        block_driver: &str,
+        device_id: &str,
+        path_on_host: &str,
+        is_direct: Option<bool>,
+        is_readonly: bool,
+        no_drop: bool,
+    ) -> Result<Option<PciPath>> {
+        let (bus, slot) = self.find_free_slot()?;
+
+        // `blockdev-add`
+        let node_name = format!("drive-{}", device_id);
+        self.qmp
+            .execute(&qmp::blockdev_add(qmp::BlockdevOptions::raw {
+                base: qmp::BlockdevOptionsBase {
+                    detect_zeroes: None,
+                    cache: None,
+                    discard: None,
+                    force_share: None,
+                    auto_read_only: None,
+                    node_name: Some(node_name.clone()),
+                    read_only: None,
+                },
+                raw: qmp::BlockdevOptionsRaw {
+                    base: qmp::BlockdevOptionsGenericFormat {
+                        file: qmp::BlockdevRef::definition(Box::new(qmp::BlockdevOptions::file {
+                            base: qapi_qmp::BlockdevOptionsBase {
+                                auto_read_only: None,
+                                cache: if is_direct.is_none() {
+                                    None
+                                } else {
+                                    Some(qapi_qmp::BlockdevCacheOptions {
+                                        direct: is_direct,
+                                        no_flush: None,
+                                    })
+                                },
+                                detect_zeroes: None,
+                                discard: None,
+                                force_share: None,
+                                node_name: None,
+                                read_only: Some(is_readonly),
+                            },
+                            file: qapi_qmp::BlockdevOptionsFile {
+                                aio: None,
+                                aio_max_batch: None,
+                                drop_cache: if !no_drop { None } else { Some(no_drop) },
+                                locking: None,
+                                pr_manager: None,
+                                x_check_cache_dropped: None,
+                                filename: path_on_host.to_owned(),
+                            },
+                        })),
+                    },
+                    offset: None,
+                    size: None,
+                },
+            }))
+            .map_err(|e| anyhow!("blockdev_add {:?}", e))
+            .map(|_| ())?;
+
+        // `device_add`
+        let mut blkdev_add_args = Dictionary::new();
+        blkdev_add_args.insert("addr".to_owned(), format!("{:02}", slot).into());
+        blkdev_add_args.insert("drive".to_owned(), node_name.clone().into());
+        self.qmp
+            .execute(&qmp::device_add {
+                bus: Some(bus),
+                id: Some(node_name.clone()),
+                driver: block_driver.to_string(),
+                arguments: blkdev_add_args,
+            })
+            .map_err(|e| anyhow!("device_add {:?}", e))
+            .map(|_| ())?;
+
+        let pci_path = self
+            .get_device_by_qdev_id(&node_name)
+            .context("get device by qdev_id failed")?;
+        info!(
+            sl!(),
+            "hotplug_block_device return pci path: {:?}", &pci_path
+        );
+
+        Ok(Some(pci_path))
+    }
+
+    pub fn hotplug_vfio_device(
+        &mut self,
+        hostdev_id: &str,
+        bus_slot_func: &str,
+        driver: &str,
+        bus: &str,
+    ) -> Result<Option<PciPath>> {
+        let mut vfio_args = Dictionary::new();
+        let bdf = if !bus_slot_func.starts_with("0000") {
+            format!("0000:{}", bus_slot_func)
+        } else {
+            bus_slot_func.to_owned()
+        };
+        vfio_args.insert("addr".to_owned(), "0x0".into());
+        vfio_args.insert("host".to_owned(), bdf.into());
+        vfio_args.insert("multifunction".to_owned(), "off".into());
+
+        let vfio_device_add = qmp::device_add {
+            driver: driver.to_string(),
+            bus: Some(bus.to_string()),
+            id: Some(hostdev_id.to_string()),
+            arguments: vfio_args,
+        };
+        info!(sl!(), "vfio_device_add: {:?}", vfio_device_add.clone());
+
+        // We've chosen to set a 5-second read timeout on Unix sockets for QMP operations. We consider set_read_timeout()
+        // a lightweight operation that shouldn't significantly impact performance, even with multiple VFIO devices.
+        // However, we also need to ensure its debuggability.
+        // As it could obscure the root cause of connection failures as set an excessively long QMP timeout.
+        // For example, if QEMU fails to launch, a 5-second QMP timeout will immediately provide a "QMP connection failed" log message,
+        // clearly pinpointing the issue. Conversely, a prolonged timeout might only result in vague error messages, making debugging
+        // difficult as it won't explicitly indicate where the problem lies.
+
+        // Given our current inability to comprehensively test across a wide range of hardware and configurations, we've made a pragmatic
+        // decision: we'll maintain the 5-second timeout for now. A configurable timeout option will be introduced if future use cases
+        // clearly demonstrate a justified need.
+        {
+            // set read timeout with 5000
+            self.qmp
+                .inner_mut()
+                .get_mut_write()
+                .set_read_timeout(Some(Duration::from_millis(5000)))?;
+            // send the VFIO hotplug request
+            self.qmp
+                .execute(&vfio_device_add)
+                .map_err(|e| anyhow!("device_add vfio device failed {:?}", e))?;
+            // reset read timeout with 250
+            self.qmp
+                .inner_mut()
+                .get_mut_write()
+                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
+        }
+
+        let pci_path = self
+            .get_device_by_qdev_id(hostdev_id)
+            .context("get device by qdev_id failed")?;
+
+        Ok(Some(pci_path))
+    }
 }
 
 fn vcpu_id_from_core_id(core_id: i64) -> String {
     format!("cpu-{}", core_id)
+}
+
+// The get_pci_path_by_qdev_id function searches a device list for a device matching a given qdev_id,
+// tracking the device's path. It recursively explores bridge devices and returns the found device along
+// with its updated path.
+pub fn get_pci_path_by_qdev_id(
+    devices: &[PciDeviceInfo],
+    qdev_id: &str,
+    path: &mut Vec<i64>,
+) -> Option<PciDeviceInfo> {
+    for device in devices {
+        path.push(device.slot);
+        if device.qdev_id == qdev_id {
+            return Some(device.clone());
+        }
+
+        if let Some(ref bridge) = device.pci_bridge {
+            if let Some(ref bridge_devices) = bridge.devices {
+                if let Some(found_device) = get_pci_path_by_qdev_id(bridge_devices, qdev_id, path) {
+                    return Some(found_device);
+                }
+            }
+        }
+
+        // If the device not found, pop the current slot before moving to next device
+        path.pop();
+    }
+    None
 }

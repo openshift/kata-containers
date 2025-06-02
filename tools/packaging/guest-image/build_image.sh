@@ -21,6 +21,7 @@ readonly osbuilder_dir="$(cd "${repo_root_dir}/tools/osbuilder" && pwd)"
 
 export GOPATH=${GOPATH:-${HOME}/go}
 export AGENT_TARBALL=${AGENT_TARBALL:-}
+export GUEST_HOOKS_TARBALL="${GUEST_HOOKS_TARBALL:-}"
 
 ARCH=${ARCH:-$(uname -m)}
 if [ $(uname -m) == "${ARCH}" ]; then
@@ -46,9 +47,9 @@ build_initrd() {
 		AGENT_TARBALL="${AGENT_TARBALL}" \
 		AGENT_INIT="${AGENT_INIT:-no}" \
 		AGENT_POLICY="${AGENT_POLICY:-}" \
-		PULL_TYPE="${PULL_TYPE:-default}" \
 		COCO_GUEST_COMPONENTS_TARBALL="${COCO_GUEST_COMPONENTS_TARBALL:-}" \
-		PAUSE_IMAGE_TARBALL="${PAUSE_IMAGE_TARBALL:-}"
+		PAUSE_IMAGE_TARBALL="${PAUSE_IMAGE_TARBALL:-}" \
+		GUEST_HOOKS_TARBALL="${GUEST_HOOKS_TARBALL}"
 
 	if [[ "${image_initrd_suffix}" == "nvidia-gpu"* ]]; then
 		nvidia_driver_version=$(cat "${builddir}"/initrd-image/*/nvidia_driver_version)
@@ -75,9 +76,9 @@ build_image() {
 		ROOTFS_BUILD_DEST="${builddir}/rootfs-image" \
 		AGENT_TARBALL="${AGENT_TARBALL}" \
 		AGENT_POLICY="${AGENT_POLICY:-}" \
-		PULL_TYPE="${PULL_TYPE:-default}" \
 		COCO_GUEST_COMPONENTS_TARBALL="${COCO_GUEST_COMPONENTS_TARBALL:-}" \
-		PAUSE_IMAGE_TARBALL="${PAUSE_IMAGE_TARBALL:-}"
+		PAUSE_IMAGE_TARBALL="${PAUSE_IMAGE_TARBALL:-}" \
+		GUEST_HOOKS_TARBALL="${GUEST_HOOKS_TARBALL}"
 
 	if [[ "${image_initrd_suffix}" == "nvidia-gpu"* ]]; then
 		nvidia_driver_version=$(cat "${builddir}"/rootfs-image/*/nvidia_driver_version)

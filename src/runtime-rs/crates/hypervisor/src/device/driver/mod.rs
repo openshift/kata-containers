@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+mod port_device;
 mod protection_device;
 mod vfio;
 mod vhost_user;
@@ -14,7 +15,8 @@ mod virtio_fs;
 mod virtio_net;
 mod virtio_vsock;
 
-pub use protection_device::{ProtectionDevice, ProtectionDeviceConfig, SevSnpConfig};
+pub use port_device::{PCIePortDevice, PortDeviceConfig};
+pub use protection_device::{ProtectionDevice, ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 pub use vfio::{
     bind_device_to_host, bind_device_to_vfio, get_vfio_device, HostDevice, VfioBusMode, VfioConfig,
     VfioDevice,

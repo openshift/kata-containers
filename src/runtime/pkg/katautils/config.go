@@ -147,6 +147,7 @@ type hypervisor struct {
 	VhostUserDeviceReconnect       uint32                    `toml:"vhost_user_reconnect_timeout_sec"`
 	DisableBlockDeviceUse          bool                      `toml:"disable_block_device_use"`
 	MemPrealloc                    bool                      `toml:"enable_mem_prealloc"`
+	ReclaimGuestFreedMemory        bool                      `toml:"reclaim_guest_freed_memory"`
 	HugePages                      bool                      `toml:"enable_hugepages"`
 	VirtioMem                      bool                      `toml:"enable_virtio_mem"`
 	IOMMU                          bool                      `toml:"enable_iommu"`
@@ -192,6 +193,7 @@ type runtime struct {
 	DisableGuestEmptyDir      bool     `toml:"disable_guest_empty_dir"`
 	CreateContainerTimeout    uint64   `toml:"create_container_timeout"`
 	DanConf                   string   `toml:"dan_conf"`
+	ForceGuestPull            bool     `toml:"experimental_force_guest_pull"`
 }
 
 type agent struct {
@@ -1082,6 +1084,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSCacheSize:              h.VirtioFSCacheSize,
 		VirtioFSCache:                  h.VirtioFSCache,
 		MemPrealloc:                    h.MemPrealloc,
+		ReclaimGuestFreedMemory:        h.ReclaimGuestFreedMemory,
 		HugePages:                      h.HugePages,
 		FileBackedMemRootDir:           h.FileBackedMemRootDir,
 		FileBackedMemRootList:          h.FileBackedMemRootList,
@@ -1092,6 +1095,7 @@ func newClhHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		BlockDeviceCacheDirect:         h.BlockDeviceCacheDirect,
 		EnableIOThreads:                h.EnableIOThreads,
 		Msize9p:                        h.msize9p(),
+		DisableImageNvdimm:             h.DisableImageNvdimm,
 		ColdPlugVFIO:                   h.coldPlugVFIO(),
 		HotPlugVFIO:                    h.hotPlugVFIO(),
 		PCIeRootPort:                   h.pcieRootPort(),
@@ -1434,6 +1438,7 @@ func GetDefaultHypervisorConfig() vc.HypervisorConfig {
 		DisableBlockDeviceUse:    defaultDisableBlockDeviceUse,
 		DefaultBridges:           defaultBridgesCount,
 		MemPrealloc:              defaultEnableMemPrealloc,
+		ReclaimGuestFreedMemory:  defaultEnableReclaimGuestFreedMemory,
 		HugePages:                defaultEnableHugePages,
 		IOMMU:                    defaultEnableIOMMU,
 		IOMMUPlatform:            defaultEnableIOMMUPlatform,
@@ -1583,6 +1588,8 @@ func LoadConfiguration(configPath string, ignoreLogging bool) (resolvedConfigPat
 	if err := checkConfig(config); err != nil {
 		return "", config, err
 	}
+
+	config.ForceGuestPull = tomlConf.Runtime.ForceGuestPull
 
 	return resolved, config, nil
 }

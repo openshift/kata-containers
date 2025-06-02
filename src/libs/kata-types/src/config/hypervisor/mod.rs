@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::io::{self, Result};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use sysinfo::System;
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 mod dragonball;
 pub use self::dragonball::{DragonballConfig, HYPERVISOR_NAME_DRAGONBALL};
@@ -65,6 +65,7 @@ pub const VIRTIO_PMEM: &str = "virtio-pmem";
 mod firecracker;
 pub use self::firecracker::{FirecrackerConfig, HYPERVISOR_NAME_FIRECRACKER};
 
+const NO_VIRTIO_FS: &str = "none";
 const VIRTIO_9P: &str = "virtio-9p";
 const VIRTIO_FS: &str = "virtio-fs";
 const VIRTIO_FS_INLINE: &str = "inline-virtio-fs";
@@ -474,13 +475,17 @@ pub struct DeviceInfo {
     #[serde(default)]
     pub hotplug_vfio_on_root_bus: bool,
 
-    /// Before hot plugging a PCIe device, you need to add a pcie_root_port device.
-    ///
-    /// Use this parameter when using some large PCI bar devices, such as Nvidia GPU.
-    /// The value means the number of pcie_root_port.
-    /// This value is valid when hotplug_vfio_on_root_bus is true and machine_type is "q35"
+    /// This value of pcie_root_port device indicates that how many root ports to
+    /// be created when VM creation.
+    /// It's valid when hotplug_vfio_on_root_bus is true and machine_type is "q35".
     #[serde(default)]
     pub pcie_root_port: u32,
+
+    /// This value of pcie_switch_port device indicates that how many switch ports to
+    /// be created when VM creation.
+    /// It's valid when hotplug_vfio_on_root_bus is true, and machine_type is "q35".
+    #[serde(default)]
+    pub pcie_switch_port: u32,
 
     /// Enable vIOMMU, default false
     ///
@@ -520,6 +525,13 @@ impl DeviceInfo {
                 self.default_bridges
             ));
         }
+        // It's not allowed to set PCIe RootPort and SwitchPort at the same time.
+        if self.pcie_root_port > 0 && self.pcie_switch_port > 0 {
+            return Err(eother!(
+                "Root Port and Switch Port set at the same time is forbidden."
+            ));
+        }
+
         Ok(())
     }
 }
@@ -751,7 +763,9 @@ impl MemoryInfo {
             "Memory backend file {} is invalid: {}"
         )?;
         if self.default_maxmemory == 0 {
-            let s = System::new_all();
+            let s = System::new_with_specifics(
+                RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+            );
             self.default_maxmemory = Byte::from_u64(s.total_memory())
                 .get_adjusted_unit(Unit::MiB)
                 .get_value() as u32;
@@ -871,12 +885,29 @@ pub struct SecurityInfo {
     #[serde(default)]
     pub guest_hook_path: String,
 
+    /// Initdata is dynamic configuration (like policies, configs, and identity files) with encoded format that users inject
+    /// into the TEE Guest upon CVM launch. And it's implemented based on the `InitData Specification`:
+    /// https://github.com/confidential-containers/trustee/blob/61c1dc60ee1f926c2eb95d69666c2430c3fea808/kbs/docs/initdata.md
+    #[serde(default)]
+    pub initdata: String,
+
     /// List of valid annotation names for the hypervisor.
     ///
     /// Each member of the list is a regular expression, which is the base name of the annotation,
     /// e.g. "path" for io.katacontainers.config.hypervisor.path"
     #[serde(default)]
     pub enable_annotations: Vec<String>,
+
+    /// qgs_port defines Intel Quote Generation Service port exposed from the host
+    #[serde(
+        default = "default_qgs_port",
+        rename = "tdx_quote_generation_service_socket_port"
+    )]
+    pub qgs_port: u32,
+}
+
+fn default_qgs_port() -> u32 {
+    4050
 }
 
 impl SecurityInfo {
@@ -919,6 +950,7 @@ pub struct SharedFsInfo {
     /// Shared file system type:
     /// - virtio-fs (default)
     /// - virtio-9p`
+    /// - none
     pub shared_fs: Option<String>,
 
     /// Path to vhost-user-fs daemon.
@@ -968,6 +1000,11 @@ pub struct SharedFsInfo {
 impl SharedFsInfo {
     /// Adjust the configuration information after loading from configuration file.
     pub fn adjust_config(&mut self) -> Result<()> {
+        if self.shared_fs.as_deref() == Some(NO_VIRTIO_FS) {
+            self.shared_fs = None;
+            return Ok(());
+        }
+
         if self.shared_fs.as_deref() == Some("") {
             self.shared_fs = Some(default::DEFAULT_SHARED_FS_TYPE.to_string());
         }
@@ -1073,6 +1110,14 @@ pub struct RemoteInfo {
     /// Remote hyperisor timeout of creating (in seconds)
     #[serde(default)]
     pub hypervisor_timeout: i32,
+
+    /// GPU specific annotations (currently only applicable for Remote Hypervisor)
+    /// default_gpus specifies the number of GPUs required for the Kata VM
+    #[serde(default)]
+    pub default_gpus: u32,
+    /// default_gpu_model specifies GPU model like tesla, h100, a100, readeon etc.
+    #[serde(default)]
+    pub default_gpu_model: String,
 }
 
 /// Common configuration information for hypervisors.
