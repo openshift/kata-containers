@@ -71,7 +71,7 @@ CreateContainerRequest:= {"ops": ops, "allowed": true} {
     ops_builder1 := concat_op_if_not_null(ops_builder, add_sandbox_name_to_state)
 
     # Check if any element from the policy_data.containers array allows the input request.
-    some p_container in policy_data.containers
+    some idx, p_container in policy_data.containers
     print("======== CreateContainerRequest: trying next policy container")
 
     p_pidns := p_container.sandbox_pidns
@@ -105,7 +105,13 @@ CreateContainerRequest:= {"ops": ops, "allowed": true} {
     ret := allow_linux(ops_builder2, p_oci, i_oci)
     ret.allowed
 
-    ops := ret.ops
+    # save to policy state
+    # key: input.container_id
+    # val: index of p_container in the policy_data.containers array
+    print("CreateContainerRequest: addding container_id=", input.container_id, " to state")
+    add_p_container_to_state := state_allows(input.container_id, idx)
+
+    ops := concat_op_if_not_null(ret.ops, add_p_container_to_state)
 
     print("CreateContainerRequest: true")
 }
@@ -176,9 +182,26 @@ state_allows(key, value) = action {
   action := null
 }
 
+# delete key=value from state
+state_del_key(key) = action {
+  print("state_del_key: ", key)
+  state := get_state()
+  print("state_del_key: deleting from state key =", key)
+  path := get_state_path(key)
+  action := {
+    "op": "remove",
+    "path": path,
+  }
+}
+
 # helper functions to interact with the state
 get_state() = state {
   state := data["pstate"]
+}
+
+get_state_val(key) = value {
+    state := get_state()
+    value := state[key]
 }
 
 get_state_path(key) = path {
@@ -245,7 +268,10 @@ allow_by_anno(p_oci, i_oci, p_storages, i_storages) {
     i_s_name := i_oci.Annotations[S_NAME_KEY]
     print("allow_by_anno 1: i_s_name =", i_s_name)
 
-    allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, i_s_name)
+    i_s_namespace := i_oci.Annotations[S_NAMESPACE_KEY]
+    print("allow_by_anno 1: i_s_namespace =", i_s_namespace)
+
+    allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, i_s_name, i_s_namespace)
 
     print("allow_by_anno 1: true")
 }
@@ -257,19 +283,23 @@ allow_by_anno(p_oci, i_oci, p_storages, i_storages) {
     print("allow_by_anno 2: i_s_name =", i_s_name, "p_s_name =", p_s_name)
 
     allow_sandbox_name(p_s_name, i_s_name)
-    allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, i_s_name)
+
+    i_s_namespace := i_oci.Annotations[S_NAMESPACE_KEY]
+    print("allow_by_anno 2: i_s_namespace =", i_s_namespace)
+
+    allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, i_s_name, i_s_namespace)
 
     print("allow_by_anno 2: true")
 }
 
-allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, s_name) {
+allow_by_sandbox_name(p_oci, i_oci, p_storages, i_storages, s_name, s_namespace) {
     print("allow_by_sandbox_name: start")
 
     i_namespace := i_oci.Annotations[S_NAMESPACE_KEY]
 
     allow_by_container_types(p_oci, i_oci, s_name, i_namespace)
     allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages)
-    allow_process(p_oci, i_oci, s_name)
+    allow_process(p_oci.Process, i_oci.Process, s_name, s_namespace)
 
     print("allow_by_sandbox_name: true")
 }
@@ -633,9 +663,11 @@ allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) {
 
     allow_root_path(p_oci, i_oci, bundle_id)
 
-    every i_mount in input.OCI.Mounts {
-        allow_mount(p_oci, i_mount, bundle_id, sandbox_id)
-    }
+    # Match each input mount with a Policy mount.
+    # Reject possible attempts to match multiple input mounts with a single Policy mount.
+    p_matches := { p_index | some i_index; p_index = allow_mount(p_oci, input.OCI.Mounts[i_index], bundle_id, sandbox_id) }
+
+    count(p_matches) == count(input.OCI.Mounts)
 
     # TODO: enable allow_storages() after fixing https://github.com/kata-containers/kata-containers/issues/8833
     # allow_storages(p_storages, i_storages, bundle_id, sandbox_id)
@@ -643,25 +675,54 @@ allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) {
     print("allow_by_bundle_or_sandbox_id: true")
 }
 
-allow_process(p_oci, i_oci, s_name) {
-    p_process := p_oci.Process
-    i_process := i_oci.Process
+allow_process_common(p_process, i_process, s_name, s_namespace) {
+    print("allow_process_common: p_process =", p_process)
+    print("allow_process_common: i_process = ", i_process)
+    print("allow_process_common: s_name =", s_name)
 
-    print("allow_process: i terminal =", i_process.Terminal, "p terminal =", p_process.Terminal)
-    p_process.Terminal == i_process.Terminal
-
-    print("allow_process: i cwd =", i_process.Cwd, "i cwd =", p_process.Cwd)
     p_process.Cwd == i_process.Cwd
-
-    print("allow_process: i noNewPrivileges =", i_process.NoNewPrivileges, "p noNewPrivileges =", p_process.NoNewPrivileges)
     p_process.NoNewPrivileges == i_process.NoNewPrivileges
 
-    allow_caps(p_process.Capabilities, i_process.Capabilities)
     allow_user(p_process, i_process)
+    allow_env(p_process, i_process, s_name, s_namespace)
+
+    print("allow_process_common: true")
+}
+
+# Compare the OCI Process field of a policy container with the input OCI Process from a CreateContainerRequest
+allow_process(p_process, i_process, s_name, s_namespace) {
+    print("allow_process: start")
+
     allow_args(p_process, i_process, s_name)
-    allow_env(p_process, i_process, s_name)
+    allow_process_common(p_process, i_process, s_name, s_namespace)
+    allow_caps(p_process.Capabilities, i_process.Capabilities)
+    p_process.Terminal == i_process.Terminal
 
     print("allow_process: true")
+}
+
+# Compare the OCI Process field of a policy container with the input process field from ExecProcessRequest
+allow_interactive_process(p_process, i_process, s_name, s_namespace) {
+    print("allow_interactive_process: start")
+
+    allow_process_common(p_process, i_process, s_name, s_namespace)
+    allow_exec_caps(i_process.Capabilities)
+
+    # These are commands enabled using ExecProcessRequest commands and/or regex from the settings file.
+    # They can be executed interactively so allow them to use any value for i_process.Terminal.
+
+    print("allow_interactive_process: true")
+}
+
+# Compare the OCI Process field of a policy container with the input process field from ExecProcessRequest
+allow_probe_process(p_process, i_process, s_name, s_namespace) {
+    print("allow_probe_process: start")
+
+    allow_process_common(p_process, i_process, s_name, s_namespace)
+    allow_exec_caps(i_process.Capabilities)
+    p_process.Terminal == i_process.Terminal
+
+    print("allow_probe_process: true")
 }
 
 allow_user(p_process, i_process) {
@@ -671,14 +732,11 @@ allow_user(p_process, i_process) {
     print("allow_user: input uid =", i_user.UID, "policy uid =", p_user.UID)
     p_user.UID == i_user.UID
 
-    # TODO: track down the reason for registry.k8s.io/pause:3.9 being
-    #       executed with gid = 0 despite having "65535:65535" in its container image
-    #       config.
-    #print("allow_user: input gid =", i_user.GID, "policy gid =", p_user.GID)
-    #p_user.GID == i_user.GID
+    print("allow_user: input gid =", i_user.GID, "policy gid =", p_user.GID)
+    p_user.GID == i_user.GID
 
-    # TODO: compare the additionalGids field too after computing its value
-    # based on /etc/passwd and /etc/group from the container image.
+    print("allow_user: input additionalGids =", i_user.AdditionalGids, "policy additionalGids =", p_user.AdditionalGids)
+    p_user.AdditionalGids == i_user.AdditionalGids
 }
 
 allow_args(p_process, i_process, s_name) {
@@ -732,38 +790,48 @@ allow_arg(i, i_arg, p_process, s_name) {
 }
 
 # OCI process.Env field
-allow_env(p_process, i_process, s_name) {
+allow_env(p_process, i_process, s_name, s_namespace) {
     print("allow_env: p env =", p_process.Env)
     print("allow_env: i env =", i_process.Env)
 
     every i_var in i_process.Env {
         print("allow_env: i_var =", i_var)
-        allow_var(p_process, i_process, i_var, s_name)
+        allow_var(p_process, i_process, i_var, s_name, s_namespace)
     }
 
     print("allow_env: true")
 }
 
 # Allow input env variables that are present in the policy data too.
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     some p_var in p_process.Env
     p_var == i_var
     print("allow_var 1: true")
 }
 
 # Match input with one of the policy variables, after substituting $(sandbox-name).
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     some p_var in p_process.Env
     p_var2 := replace(p_var, "$(sandbox-name)", s_name)
 
-    print("allow_var 2: p_var2 =", p_var2)
-    p_var2 == i_var
+    print("allow_var 2: p_var =", p_var)
+
+    p_var_split := split(p_var, "=")
+    count(p_var_split) == 2
+
+    p_var_split[1] == "$(sandbox-name)"
+
+    i_var_split := split(i_var, "=")
+    count(i_var_split) == 2
+
+    i_var_split[0] == p_var_split[0]
+    regex.match(s_name, i_var_split[1])
 
     print("allow_var 2: true")
 }
 
 # Allow input env variables that match with a request_defaults regex.
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     some p_regex1 in policy_data.request_defaults.CreateContainerRequest.allow_env_regex
     p_regex2 := replace(p_regex1, "$(ipv4_a)", policy_data.common.ipv4_a)
     p_regex3 := replace(p_regex2, "$(ip_p)", policy_data.common.ip_p)
@@ -777,7 +845,7 @@ allow_var(p_process, i_process, i_var, s_name) {
 }
 
 # Allow fieldRef "fieldPath: status.podIP" values.
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     name_value := split(i_var, "=")
     count(name_value) == 2
     is_ip(name_value[1])
@@ -789,7 +857,7 @@ allow_var(p_process, i_process, i_var, s_name) {
 }
 
 # Allow common fieldRef variables.
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     name_value := split(i_var, "=")
     count(name_value) == 2
 
@@ -808,7 +876,7 @@ allow_var(p_process, i_process, i_var, s_name) {
 }
 
 # Allow fieldRef "fieldPath: status.hostIP" values.
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     name_value := split(i_var, "=")
     count(name_value) == 2
     is_ip(name_value[1])
@@ -820,7 +888,7 @@ allow_var(p_process, i_process, i_var, s_name) {
 }
 
 # Allow resourceFieldRef values (e.g., "limits.cpu").
-allow_var(p_process, i_process, i_var, s_name) {
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
     name_value := split(i_var, "=")
     count(name_value) == 2
 
@@ -836,6 +904,16 @@ allow_var(p_process, i_process, i_var, s_name) {
     contains(p_name_value[1], allowed)
 
     print("allow_var 7: true")
+}
+
+allow_var(p_process, i_process, i_var, s_name, s_namespace) {
+    some p_var in p_process.Env
+    p_var2 := replace(p_var, "$(sandbox-namespace)", s_namespace)
+
+    print("allow_var 8: p_var2 =", p_var2)
+    p_var2 == i_var
+
+    print("allow_var 8: true")
 }
 
 allow_pod_ip_var(var_name, p_var) {
@@ -900,17 +978,15 @@ allow_root_path(p_oci, i_oci, bundle_id) {
 }
 
 # device mounts
-allow_mount(p_oci, i_mount, bundle_id, sandbox_id) {
+# allow_mount returns the policy index (p_index) if a given input mount matches a policy mount.
+allow_mount(p_oci, i_mount, bundle_id, sandbox_id):= p_index {
     print("allow_mount: i_mount =", i_mount)
 
-    some p_mount in p_oci.Mounts
+    p_mount := p_oci.Mounts[p_index]
     print("allow_mount: p_mount =", p_mount)
     check_mount(p_mount, i_mount, bundle_id, sandbox_id)
 
-    # TODO: are there any other required policy checks for mounts - e.g.,
-    #       multiple mounts with same source or destination?
-
-    print("allow_mount: true")
+    print("allow_mount: true, p_index =", p_index)
 }
 
 check_mount(p_mount, i_mount, bundle_id, sandbox_id) {
@@ -1165,7 +1241,16 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) {
     print("allow_mount_point 5: true")
 }
 
-# process.Capabilities
+# ExecProcessRequest.process.Capabilities
+allow_exec_caps(i_caps) {
+    not i_caps.Ambient
+    not i_caps.Bounding
+    not i_caps.Effective
+    not i_caps.Inheritable
+    not i_caps.Permitted
+}
+
+# OCI.Process.Capabilities
 allow_caps(p_caps, i_caps) {
     print("allow_caps: policy Ambient =", p_caps.Ambient)
     print("allow_caps: input Ambient =", i_caps.Ambient)
@@ -1274,30 +1359,65 @@ CreateSandboxRequest {
     allow_sandbox_storages(input.storages)
 }
 
+allow_exec(p_container, i_process) {
+    print("allow_exec: start")
+
+    p_oci = p_container.OCI
+    p_s_name = p_oci.Annotations[S_NAME_KEY]
+    s_namespace = get_state_val("namespace")
+    allow_probe_process(p_oci.Process, i_process, p_s_name, s_namespace)
+
+    print("allow_exec: true")
+}
+
+allow_interactive_exec(p_container, i_process) {
+    print("allow_interactive_exec: start")
+
+    p_oci = p_container.OCI
+    p_s_name = p_oci.Annotations[S_NAME_KEY]
+    s_namespace = get_state_val("namespace")
+    allow_interactive_process(p_oci.Process, i_process, p_s_name, s_namespace)
+
+    print("allow_interactive_exec: true")
+}
+
+# get p_container from state
+get_state_container(container_id):= p_container {
+    idx := get_state_val(container_id)
+    p_container := policy_data.containers[idx]
+}
+
 ExecProcessRequest {
     print("ExecProcessRequest 1: input =", input)
+    allow_exec_process_input
 
     some p_command in policy_data.request_defaults.ExecProcessRequest.allowed_commands
     print("ExecProcessRequest 1: p_command =", p_command)
     p_command == input.process.Args
 
+    p_container := get_state_container(input.container_id)
+    allow_interactive_exec(p_container, input.process)
+
     print("ExecProcessRequest 1: true")
 }
 ExecProcessRequest {
     print("ExecProcessRequest 2: input =", input)
+    allow_exec_process_input
 
-    # TODO: match input container ID with its corresponding container.exec_commands.
-    some container in policy_data.containers
-    some p_command in container.exec_commands
+    p_container := get_state_container(input.container_id)
+
+    some p_command in p_container.exec_commands
     print("ExecProcessRequest 2: p_command =", p_command)
 
-    # TODO: should other input data fields be validated as well?
     p_command == input.process.Args
+
+    allow_exec(p_container, input.process)
 
     print("ExecProcessRequest 2: true")
 }
 ExecProcessRequest {
     print("ExecProcessRequest 3: input =", input)
+    allow_exec_process_input
 
     i_command = concat(" ", input.process.Args)
     print("ExecProcessRequest 3: i_command =", i_command)
@@ -1307,7 +1427,21 @@ ExecProcessRequest {
 
     regex.match(p_regex, i_command)
 
+    p_container := get_state_container(input.container_id)
+
+    allow_interactive_exec(p_container, input.process)
+
     print("ExecProcessRequest 3: true")
+}
+
+allow_exec_process_input {
+    is_null(input.string_user)
+
+    i_process := input.process
+    count(i_process.SelinuxLabel) == 0
+    count(i_process.ApparmorProfile) == 0
+
+    print("allow_exec_process_input: true")
 }
 
 UpdateRoutesRequest {
@@ -1367,4 +1501,15 @@ UpdateEphemeralMountsRequest {
 
 WriteStreamRequest {
     policy_data.request_defaults.WriteStreamRequest == true
+}
+
+RemoveContainerRequest:= {"ops": ops, "allowed": true} {
+    print("RemoveContainerRequest: input =", input)
+
+    # Delete input.container_id from p_state
+    ops_builder1 := []
+    del_container := state_del_key(input.container_id)
+    ops := concat_op_if_not_null(ops_builder1, del_container)
+
+    print("RemoveContainerRequest: true")
 }

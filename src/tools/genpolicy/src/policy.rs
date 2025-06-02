@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use std::boxed;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
 use std::io::Write;
 
@@ -150,7 +150,7 @@ pub struct KataUser {
     pub GID: u32,
 
     /// AdditionalGids are additional group ids set for the container's process.
-    pub AdditionalGids: Vec<u32>,
+    pub AdditionalGids: BTreeSet<u32>,
 
     /// Username is the user name.
     pub Username: String,
@@ -425,6 +425,10 @@ pub struct CommonData {
 pub struct ClusterConfig {
     /// Pause container image reference.
     pub pause_container_image: String,
+    /// Whether or not the cluster uses the guest pull mechanism
+    /// In guest pull, host can't look into layers to determine GID.
+    /// See issue https://github.com/kata-containers/kata-containers/issues/11162
+    pub guest_pull: bool,
 }
 
 /// Struct used to read data from the settings file and copy that data into the policy.
@@ -432,6 +436,11 @@ pub struct ClusterConfig {
 pub struct SandboxData {
     /// Expected value of the CreateSandboxRequest storages field.
     pub storages: Vec<agent::Storage>,
+}
+
+enum K8sEnvFromSource {
+    ConfigMap(config_map::ConfigMap),
+    Secret(secret::Secret),
 }
 
 impl AgentPolicy {
@@ -484,9 +493,18 @@ impl AgentPolicy {
             }
         }
 
-        if let Some(config_map_files) = &config.config_map_files {
-            for file in config_map_files {
-                config_maps.push(config_map::ConfigMap::new(file)?);
+        if let Some(config_files) = &config.config_files {
+            for resource_file in config_files {
+                for config_resource in parse_config_file(resource_file.to_string(), config).await? {
+                    match config_resource {
+                        K8sEnvFromSource::ConfigMap(config_map) => {
+                            config_maps.push(config_map);
+                        }
+                        K8sEnvFromSource::Secret(secret) => {
+                            secrets.push(secret);
+                        }
+                    }
+                }
             }
         }
 
@@ -713,8 +731,25 @@ impl AgentPolicy {
         substitute_args_env_variables(&mut process.Args, &process.Env);
 
         c_settings.get_process_fields(&mut process);
-        resource.get_process_fields(&mut process);
+        let mut must_check_passwd = false;
+        resource.get_process_fields(&mut process, &mut must_check_passwd);
+
+        // The actual GID of the process run by the CRI
+        // Depends on the contents of /etc/passwd in the container
+        if must_check_passwd {
+            process.User.GID = yaml_container
+                .registry
+                .get_gid_from_passwd_uid(process.User.UID)
+                .unwrap_or(0);
+        }
         yaml_container.get_process_fields(&mut process);
+
+        // The last step containerd always does is add the User.GID to AdditionalGids
+        // The sandbox path does not respect the securityContext fsGroup/supplementalGroups
+        if is_pause_container {
+            process.User.AdditionalGids.clear();
+        }
+        process.User.AdditionalGids.insert(process.User.GID);
 
         process
     }
@@ -735,7 +770,7 @@ impl KataSpec {
             process.User.GID = self.Process.User.GID;
         }
 
-        process.User.AdditionalGids = self.Process.User.AdditionalGids.to_vec();
+        process.User.AdditionalGids = self.Process.User.AdditionalGids.clone();
         process.User.Username = String::from(&self.Process.User.Username);
         add_missing_strings(&self.Process.Args, &mut process.Args);
 
@@ -806,6 +841,37 @@ fn get_image_layer_storages(
     };
 
     storages.push(overlay_storage);
+}
+
+async fn parse_config_file(
+    yaml_file: String,
+    config: &utils::Config,
+) -> Result<Vec<K8sEnvFromSource>> {
+    let mut k8sRes = Vec::new();
+    let yaml_contents = yaml::get_input_yaml(&Some(yaml_file))?;
+    for document in serde_yaml::Deserializer::from_str(&yaml_contents) {
+        let doc_mapping = Value::deserialize(document)?;
+        if doc_mapping != Value::Null {
+            let yaml_string = serde_yaml::to_string(&doc_mapping)?;
+            let silent = config.silent_unsupported_fields;
+            let (mut resource, kind) = yaml::new_k8s_resource(&yaml_string, silent)?;
+
+            resource.init(config, &doc_mapping, silent).await;
+
+            // ConfigMap and Secret documents contain additional input for policy generation.
+            if kind.eq("ConfigMap") {
+                let config_map: config_map::ConfigMap = serde_yaml::from_str(&yaml_string)?;
+                debug!("{:#?}", &config_map);
+                k8sRes.push(K8sEnvFromSource::ConfigMap(config_map));
+            } else if kind.eq("Secret") {
+                let secret: secret::Secret = serde_yaml::from_str(&yaml_string)?;
+                debug!("{:#?}", &secret);
+                k8sRes.push(K8sEnvFromSource::Secret(secret));
+            }
+        }
+    }
+
+    Ok(k8sRes)
 }
 
 /// Converts the given name to a string representation of its sha256 hash.

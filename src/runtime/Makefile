@@ -20,6 +20,9 @@ endif
 ifeq ($(ARCH),aarch64)
     override ARCH = arm64
 endif
+ifeq ($(ARCH),riscv64gc)
+    override ARCH = riscv64
+endif
 
 ARCH_DIR = arch
 ARCH_FILE_SUFFIX = -options.mk
@@ -414,6 +417,8 @@ ifneq (,$(QEMUCMD))
     SYSCONFIG_QEMU_SE = $(abspath $(SYSCONFDIR)/$(CONFIG_FILE_QEMU_SE))
     SYSCONFIG_PATHS += $(SYSCONFIG_QEMU_SE)
 
+    DEFVFIOMODE_SE = vfio
+
     CONFIGS += $(CONFIG_QEMU_SE)
 
     # qemu-specific options (all should be suffixed by "_QEMU")
@@ -459,6 +464,13 @@ ifneq (,$(QEMUCMD))
     DEFSANDBOXCGROUPONLY_NV = true
     # The latest OVMF build should be good for both TDX and SNP
     FIRMWAREPATH_NV := $(PREFIXDEPS)/share/ovmf/OVMF.fd
+
+    ifneq (,$(QEMUFW))
+        FIRMWAREPATH := $(PREFIXDEPS)/share/ovmf/$(QEMUFW)
+    endif
+    ifneq (,$(QEMUFWVOL))
+        FIRMWAREVOLUMEPATH := $(PREFIXDEPS)/share/ovmf/$(QEMUFWVOL)
+    endif
 endif
 
 ifneq (,$(CLHCMD))
@@ -742,6 +754,7 @@ USER_VARS += DEFBINDMOUNTS
 USER_VARS += DEFCREATECONTAINERTIMEOUT
 USER_VARS += DEFDANCONF
 USER_VARS += DEFVFIOMODE
+USER_VARS += DEFVFIOMODE_SE
 USER_VARS += BUILDFLAGS
 
 
