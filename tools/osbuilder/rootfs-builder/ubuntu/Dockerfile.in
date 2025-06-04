@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG IMAGE_REGISTRY=docker.io
-FROM ${IMAGE_REGISTRY}/ubuntu:@OS_VERSION@
+FROM ${IMAGE_REGISTRY}/ubuntu:@sha256:b59d21599a2b151e23eea5f6602f4af4d7d31c4e236d22bf0b62b86d2e386b8f@
 @SET_PROXY@
 
 ENV GO_HOME="/opt"
