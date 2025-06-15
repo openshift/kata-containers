@@ -7,7 +7,7 @@ go 1.23.0
 // https://github.com/kata-containers/kata-containers/issues/11020
 
 require (
-	github.com/container-storage-interface/spec v1.9.0
+	github.com/container-storage-interface/spec v1.11.0
 	github.com/diskfs/go-diskfs v1.4.0
 	github.com/golang/glog v1.2.4
 	github.com/golang/protobuf v1.5.4
