@@ -19,7 +19,7 @@ require (
 	k8s.io/apimachinery v0.28.2
 	k8s.io/klog/v2 v2.110.1
 	k8s.io/mount-utils v0.28.2
-	k8s.io/utils v0.0.0-20231127182322-b307cd553661
+	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397
 )
 
 require (
