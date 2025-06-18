@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-FROM quay.io/centos/centos:@OS_VERSION@
+FROM quay.io/centos/centos@sha256:6fc587a47e7d92c4ece5c735cb34bdbdce54907c71fea2f0cc55eddb35bb374d
 @SET_PROXY@
 
 RUN dnf -y update && \
