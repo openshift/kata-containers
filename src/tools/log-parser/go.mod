@@ -8,7 +8,7 @@ require (
 	github.com/go-logfmt/logfmt v0.5.1
 	github.com/sirupsen/logrus v1.8.1
 	github.com/stretchr/testify v1.7.1
-	github.com/urfave/cli v1.22.7
+	github.com/urfave/cli/v3 v3.3.8
 	gopkg.in/yaml.v2 v2.4.0
 )
 
