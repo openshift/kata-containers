@@ -126,7 +126,7 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.45.0 // indirect
 	go.opentelemetry.io/otel/metric v1.23.1 // indirect
 	golang.org/x/exp v0.0.0-20231214170342-aacd6d4b4611 // indirect
-	golang.org/x/mod v0.17.0 // indirect
+	golang.org/x/mod v0.19.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sync v0.12.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
@@ -137,7 +137,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 	tags.cncf.io/container-device-interface v0.8.1 // indirect
-	tags.cncf.io/container-device-interface/specs-go v0.8.0 // indirect
+	tags.cncf.io/container-device-interface/specs-go v1.0.0 // indirect
 )
 
 // WARNING: Do NOT use `replace` directives as those break dependabot:
