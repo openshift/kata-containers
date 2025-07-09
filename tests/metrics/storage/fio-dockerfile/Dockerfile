@@ -4,7 +4,7 @@
 
 # Set up an Ubuntu image with 'fio io tester' installed
 
-FROM docker.io/library/ubuntu:22.04
+FROM docker.io/library/ubuntu:24.04
 
 # Version of the Dockerfile
 LABEL DOCKERFILE_VERSION="1.0"
