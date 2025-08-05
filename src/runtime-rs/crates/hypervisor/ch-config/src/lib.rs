@@ -491,6 +491,7 @@ pub struct NamedHypervisorConfig {
 
     pub shared_fs_devices: Option<Vec<FsConfig>>,
     pub network_devices: Option<Vec<NetConfig>>,
+    pub host_devices: Option<Vec<DeviceConfig>>,
 
     // Set to the available guest protection *iff* BOTH of the following
     // conditions are true:
@@ -498,6 +499,32 @@ pub struct NamedHypervisorConfig {
     // - The hardware supports guest protection.
     // - The user has requested that guest protection be used.
     pub guest_protection_to_use: GuestProtection,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct VmResize {
+    pub desired_vcpus: Option<u8>,
+    pub desired_ram: Option<u64>,
+    pub desired_balloon: Option<u64>,
+}
+
+/// VmInfo : Virtual Machine information
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+pub struct VmInfo {
+    pub config: VmConfig,
+    pub state: State,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_actual_size: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum State {
+    #[default]
+    Created,
+    Running,
+    Shutdown,
+    Paused,
 }
 
 // Returns true if the enabled guest protection is Intel TDX.

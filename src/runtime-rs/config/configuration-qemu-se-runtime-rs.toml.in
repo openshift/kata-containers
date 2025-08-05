@@ -170,7 +170,7 @@ disable_block_device_use = @DEFDISABLEBLOCK@
 #   - virtio-9p
 #   - virtio-fs-nydus
 #   - none
-shared_fs = "@DEFSHAREDFS_QEMU_VIRTIOFS@"
+shared_fs = "@DEFSHAREDFS_QEMU_SEL_VIRTIOFS@"
 
 # Path to vhost-user-fs daemon.
 virtio_fs_daemon = "@DEFVIRTIOFSDAEMON@"
@@ -211,9 +211,15 @@ virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
 #    Metadata, data, and pathname lookup are cached in guest and never expire.
 virtio_fs_cache = "@DEFVIRTIOFSCACHE@"
 
-# Block storage driver to be used for the hypervisor in case the container
-# rootfs is backed by a block device. This is virtio-scsi, virtio-blk
-# or nvdimm.
+# Block device driver to be used by the hypervisor when a container's storage
+# is backed by a block device or a file. This driver facilitates attaching the
+# storage directly to the guest VM.
+#
+# Examples include:
+# - virtio-blk-pci
+# - virtio-blk-ccw
+# - virtio-scsi
+# - nvidmm
 block_device_driver = "@DEFBLOCKSTORAGEDRIVER_QEMU@"
 
 # aio is the I/O mechanism used by qemu
@@ -545,6 +551,19 @@ dial_timeout_ms = 30
 # idea of what you are doing.
 # (default: 3000)
 #reconnect_timeout_ms = 3000
+
+# Create Container Request Timeout
+# This timeout value is used to set the maximum duration for the agent to process a CreateContainerRequest.
+# It's also used to ensure that workloads, especially those involving large image pulls within the guest,
+# have sufficient time to complete.
+#
+# Effective Timeout Determination:
+# The effective timeout for a CreateContainerRequest is determined by taking the minimum of the following two values:
+# - create_container_timeout: The timeout value configured for creating containers (default: 30,000 milliseconds).
+# - runtime-request-timeout: The timeout value specified in the Kubelet configuration described as the link below:
+# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout)
+# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)
+# create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
 
 [runtime]
 # If enabled, the runtime will log additional debug messages to the

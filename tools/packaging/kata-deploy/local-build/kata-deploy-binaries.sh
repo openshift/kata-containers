@@ -60,6 +60,7 @@ KERNEL_HEADERS_PKG_TYPE="${KERNEL_HEADERS_PKG_TYPE:-deb}"
 RELEASE="${RELEASE:-"no"}"
 KBUILD_SIGN_PIN="${KBUILD_SIGN_PIN:-}"
 RUNTIME_CHOICE="${RUNTIME_CHOICE:-both}"
+KERNEL_DEBUG_ENABLED=${KERNEL_DEBUG_ENABLED:-"no"}
 
 workdir="${WORKDIR:-$PWD}"
 
@@ -1116,6 +1117,7 @@ install_tools_helper() {
 	fi
 
 	if [[ "${tool}" == "agent-ctl" ]]; then
+		artefact_tag="$(git log -1 --pretty=format:"%H" ${repo_root_dir})"
 		defaults_path="${destdir}/opt/kata/share/defaults/kata-containers/agent-ctl"
 		mkdir -p "${defaults_path}"
 		install -D --mode 0644 ${repo_root_dir}/src/tools/${tool}/template/oci_config.json "${defaults_path}/oci_config.json"
@@ -1265,13 +1267,13 @@ handle_build() {
 
 	rootfs-initrd-confidential) install_initrd_confidential ;;
 
-	rootfs-nvidia-gpu-image) install_image_nvidia_gpu ;;
+	rootfs-image-nvidia-gpu) install_image_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-initrd) install_initrd_nvidia_gpu ;;
+	rootfs-initrd-nvidia-gpu) install_initrd_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-confidential-image) install_image_nvidia_gpu_confidential ;;
+	rootfs-image-nvidia-gpu-confidential) install_image_nvidia_gpu_confidential ;;
 
-	rootfs-nvidia-gpu-confidential-initrd) install_initrd_nvidia_gpu_confidential ;;
+	rootfs-initrd-nvidia-gpu-confidential) install_initrd_nvidia_gpu_confidential ;;
 
 	runk) install_runk ;;
 

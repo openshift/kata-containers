@@ -49,38 +49,10 @@ setup_nvidia-nvrc() {
 
 	pushd "${PROJECT}" > /dev/null || exit 1
 
-	cargo build --release --target="${machine_arch}"-unknown-linux-gnu
-	cp target/"${machine_arch}"-unknown-linux-gnu/release/NVRC ../../destdir/bin/.
+	cargo build --release --target="${machine_arch}"-unknown-linux-musl
+	cp target/"${machine_arch}"-unknown-linux-musl/release/NVRC ../../destdir/bin/.
 
 	popd > /dev/null || exit 1
-
-	tar cvfa "${TARBALL}" -C ../destdir .
-	tar tvf  "${TARBALL}"
-
-	popd > /dev/null || exit 1
-}
-
-setup_nvidia-gpu-admin-tools() {
-	local TARGET="nvidia-gpu-admin-tools"
-	local TARGET_VERSION="v2024.12.06"
-	local TARGET_GIT="https://github.com/NVIDIA/gpu-admin-tools"
-	local TARGET_BUILD_DIR="${BUILD_DIR}/${TARGET}/builddir"
-	local TARGET_DEST_DIR="${BUILD_DIR}/${TARGET}/destdir"
-	local TARBALL="${BUILD_DIR}/kata-static-${TARGET}.tar.zst"
-
-	mkdir -p "${TARGET_BUILD_DIR}"
-	mkdir -p "${TARGET_DEST_DIR}/sbin"
-
-	pushd "${TARGET_BUILD_DIR}" > /dev/null || exit 1
-
-	rm -rf "$(basename "${TARGET_GIT}")"
-	git clone "${TARGET_GIT}"
-
-	rm -rf dist
-	# Installed via pipx local python environment
-	/usr/local/bin/pyinstaller -s -F gpu-admin-tools/nvidia_gpu_tools.py
-
-	cp dist/nvidia_gpu_tools ../destdir/sbin/.
 
 	tar cvfa "${TARBALL}" -C ../destdir .
 	tar tvf  "${TARBALL}"
@@ -131,7 +103,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 
 	info "nvidia: Setup GPU rootfs type=${rootfs_type}"
 
-	for component in "nvidia-gpu-admin-tools" "nvidia-dcgm-exporter" "nvidia-nvrc"; do
+	for component in "nvidia-dcgm-exporter" "nvidia-nvrc"; do
 		if [[ ! -e "${BUILD_DIR}/kata-static-${component}.tar.zst" ]]; then
 			setup_"${component}"
 		fi
@@ -228,9 +200,6 @@ chisseled_compute() {
 	echo "nvidia: chisseling GPU"
 
 	cp -a "${stage_one}"/nvidia_driver_version .
-
-	tar xvf "${BUILD_DIR}"/kata-static-nvidia-gpu-admin-tools.tar.zst -C .
-
 	cp -a "${stage_one}"/lib/modules/* lib/modules/.
 
 	libdir="lib/${machine_arch}-linux-gnu"
@@ -321,6 +290,27 @@ compress_rootfs() {
 
 }
 
+coco_guest_components() {
+	if [[ ${type} != "confidential" ]]; then
+		return
+	fi
+
+	readonly source="usr/local/bin"
+	readonly dest="${source}"
+
+	info "nvidia: installing the confidential containers guest components tarball"
+
+	mkdir -p "${dest}"
+
+	cp -a "${stage_one}/${source}"/attestation-agent     "${dest}/."
+	cp -a "${stage_one}/${source}"/api-server-rest       "${dest}/."
+	cp -a "${stage_one}/${source}"/confidential-data-hub "${dest}/."
+
+	cp -a "${stage_one}"/etc/ocicrypt_config.json etc/.
+
+	info "TODO: nvidia: luks-encrypt-storage is a bash script, we do not have a shell!"
+}
+
 toggle_debug() {
 	if echo "${NVIDIA_GPU_STACK}" | grep -q '\<debug\>'; then
 		export DEBUG="true"
@@ -331,6 +321,8 @@ setup_nvidia_gpu_rootfs_stage_two() {
 	readonly stage_one="${BUILD_DIR:?}/rootfs-${VARIANT}-stage-one"
 	readonly stage_two="${ROOTFS_DIR:?}"
 	readonly stack="${NVIDIA_GPU_STACK:?}"
+
+	readonly type=${1:-""}
 
 	echo "nvidia: chisseling the following stack components: ${stack}"
 
@@ -364,6 +356,8 @@ setup_nvidia_gpu_rootfs_stage_two() {
 			chisseled_gpudirect
 		fi
 	done
+
+	coco_guest_components
 
 	compress_rootfs
 

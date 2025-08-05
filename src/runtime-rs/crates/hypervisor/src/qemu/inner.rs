@@ -7,10 +7,12 @@ use super::cmdline_generator::{get_network_device, QemuCmdLine, QMP_SOCKET_FILE}
 use super::qmp::Qmp;
 use crate::device::topology::PCIePort;
 use crate::{
-    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState,
-    utils::enter_netns, HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice,
-    HYPERVISOR_QEMU,
+    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, HypervisorConfig,
+    MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
 };
+
+use crate::utils::{bytes_to_megs, enter_netns, megs_to_bytes};
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::netns::NetnsGuard;
@@ -20,7 +22,6 @@ use kata_types::{
 };
 use persist::sandbox_persist::Persist;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
@@ -136,6 +137,7 @@ impl QemuInner {
                             cmdline.add_sev_snp_protection_device(
                                 sev_snp_cfg.cbitpos,
                                 &sev_snp_cfg.firmware,
+                                &sev_snp_cfg.host_data,
                             )
                         } else {
                             cmdline.add_sev_protection_device(
@@ -285,13 +287,14 @@ impl QemuInner {
         todo!()
     }
 
-    pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
+    pub(crate) async fn get_thread_ids(&mut self) -> Result<VcpuThreadIds> {
         info!(sl!(), "QemuInner::get_thread_ids()");
-        //todo!()
-        let vcpu_thread_ids: VcpuThreadIds = VcpuThreadIds {
-            vcpus: HashMap::new(),
-        };
-        Ok(vcpu_thread_ids)
+
+        Ok(self
+            .qmp
+            .as_mut()
+            .and_then(|qmp| qmp.get_vcpu_thread_ids().ok())
+            .unwrap_or_default())
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {
@@ -388,7 +391,9 @@ impl QemuInner {
         let mut caps = Capabilities::default();
 
         // Confidential Guest doesn't permit virtio-fs.
-        let flags = if self.hypervisor_config().security_info.confidential_guest {
+        let flags = if self.hypervisor_config().security_info.confidential_guest
+            || self.hypervisor_config().shared_fs.shared_fs.is_none()
+        {
             CapabilityBits::BlockDeviceSupport | CapabilityBits::BlockDeviceHotplugSupport
         } else {
             CapabilityBits::BlockDeviceSupport
@@ -452,15 +457,6 @@ impl QemuInner {
             sl!(),
             "QemuInner::resize_memory(): asked to resize memory to {} MB", new_total_mem_mb
         );
-
-        // stick to the apparent de facto convention and represent megabytes
-        // as u32 and bytes as u64
-        fn bytes_to_megs(bytes: u64) -> u32 {
-            (bytes / (1 << 20)) as u32
-        }
-        fn megs_to_bytes(bytes: u32) -> u64 {
-            bytes as u64 * (1 << 20)
-        }
 
         let qmp = match self.qmp {
             Some(ref mut qmp) => qmp,
@@ -636,16 +632,24 @@ impl QemuInner {
                 qmp.hotplug_network_device(&netdev, &virtio_net_device)?
             }
             DeviceType::Block(mut block_device) => {
-                block_device.config.pci_path = qmp
+                let (pci_path, scsi_addr) = qmp
                     .hotplug_block_device(
                         &self.config.blockdev_info.block_device_driver,
-                        &block_device.device_id,
+                        block_device.config.index,
                         &block_device.config.path_on_host,
+                        &block_device.config.blkdev_aio.to_string(),
                         block_device.config.is_direct,
                         block_device.config.is_readonly,
                         block_device.config.no_drop,
                     )
                     .context("hotplug block device")?;
+
+                if pci_path.is_some() {
+                    block_device.config.pci_path = pci_path;
+                }
+                if scsi_addr.is_some() {
+                    block_device.config.scsi_addr = scsi_addr;
+                }
 
                 return Ok(DeviceType::Block(block_device));
             }

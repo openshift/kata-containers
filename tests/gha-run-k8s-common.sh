@@ -31,6 +31,7 @@ KATA_HOST_OS="${KATA_HOST_OS:-}"
 KUBERNETES="${KUBERNETES:-}"
 K8S_TEST_HOST_TYPE="${K8S_TEST_HOST_TYPE:-small}"
 TEST_CLUSTER_NAMESPACE="${TEST_CLUSTER_NAMESPACE:-}"
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 
 function _print_instance_type() {
 	case "${K8S_TEST_HOST_TYPE}" in
@@ -85,11 +86,6 @@ function enable_cluster_approuting() {
 	az aks approuting enable -g "${rg}" -n "${cluster_name}"
 }
 
-function install_azure_cli() {
-	curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-	az extension add --name aks-preview
-}
-
 function create_cluster() {
 	test_type="${1:-k8s}"
 	local short_sha
@@ -113,6 +109,9 @@ function create_cluster() {
 		-l eastus \
 		-n "${rg}"
 
+	# Required by e.g. AKS App Routing for KBS installation.
+	az extension add --name aks-preview
+
 	# Adding a double quote on the last line ends up causing issues
 	# ine the cbl-mariner installation.  Because of that, let's just
 	# disable the warning for this specific case.
@@ -133,10 +132,6 @@ function install_bats() {
 	sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
 	sudo apt install -y bats
 	sudo add-apt-repository --remove 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
-}
-
-function install_kubectl() {
-	sudo az aks install-cli
 }
 
 # Install the kustomize tool in /usr/local/bin if it doesn't exist on
@@ -196,15 +191,19 @@ function get_nodes_and_pods_info() {
 }
 
 function deploy_k0s() {
-	url=$(get_from_kata_deps ".externals.k0s.url")
-
-	k0s_version_param=""
-	version=$(get_from_kata_deps ".externals.k0s.version")
-	if [[ -n "${version}" ]]; then
-		k0s_version_param="K0S_VERSION=${version}"
+	if [[ "${CONTAINER_RUNTIME}" == "crio" ]]; then
+		url=$(get_from_kata_deps ".externals.k0s.url")
+	
+		k0s_version_param=""
+		version=$(get_from_kata_deps ".externals.k0s.version")
+		if [[ -n "${version}" ]]; then
+			k0s_version_param="K0S_VERSION=${version}"
+		fi
+	
+		curl -sSLf "${url}" | sudo "${k0s_version_param}" sh
+	else
+		curl -sSLf -sSLf https://get.k0s.sh | sudo sh
 	fi
-
-	curl -sSLf "${url}" | sudo "${k0s_version_param}" sh
 
 	# In this case we explicitly want word splitting when calling k0s
 	# with extra parameters.

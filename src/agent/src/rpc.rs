@@ -554,7 +554,7 @@ impl AgentService {
         req: protocols::agent::WaitProcessRequest,
     ) -> Result<protocols::agent::WaitProcessResponse> {
         let cid = req.container_id;
-        let eid = req.exec_id;
+        let mut eid = req.exec_id;
         let mut resp = WaitProcessResponse::new();
 
         info!(
@@ -587,7 +587,7 @@ impl AgentService {
             .get_container(&cid)
             .ok_or_else(|| anyhow!("Invalid container id"))?;
 
-        let p = match ctr.processes.get_mut(&pid) {
+        let p = match ctr.processes.values_mut().find(|p| p.pid == pid) {
             Some(p) => p,
             None => {
                 // Lost race, pick up exit code from channel
@@ -600,6 +600,8 @@ impl AgentService {
             }
         };
 
+        eid = p.exec_id.clone();
+
         // need to close all fd
         // ignore errors for some fd might be closed by stream
         p.cleanup_process_stream();
@@ -611,7 +613,7 @@ impl AgentService {
             let _ = s.send(p.exit_code).await;
         }
 
-        ctr.processes.remove(&pid);
+        ctr.processes.remove(&eid);
 
         Ok(resp)
     }
@@ -708,13 +710,15 @@ fn mem_agent_memcgconfig_to_memcg_optionconfig(
     mc: &protocols::agent::MemAgentMemcgConfig,
 ) -> mem_agent::memcg::OptionConfig {
     mem_agent::memcg::OptionConfig {
-        disabled: mc.disabled,
-        swap: mc.swap,
-        swappiness_max: mc.swappiness_max.map(|x| x as u8),
-        period_secs: mc.period_secs,
-        period_psi_percent_limit: mc.period_psi_percent_limit.map(|x| x as u8),
-        eviction_psi_percent_limit: mc.eviction_psi_percent_limit.map(|x| x as u8),
-        eviction_run_aging_count_min: mc.eviction_run_aging_count_min,
+        default: mem_agent::memcg::SingleOptionConfig {
+            disabled: mc.disabled,
+            swap: mc.swap,
+            swappiness_max: mc.swappiness_max.map(|x| x as u8),
+            period_secs: mc.period_secs,
+            period_psi_percent_limit: mc.period_psi_percent_limit.map(|x| x as u8),
+            eviction_psi_percent_limit: mc.eviction_psi_percent_limit.map(|x| x as u8),
+            eviction_run_aging_count_min: mc.eviction_run_aging_count_min,
+        },
         ..Default::default()
     }
 }
@@ -2621,11 +2625,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            TestData {
-                has_fd: false,
-                result: Err(anyhow!(ERR_CANNOT_GET_WRITER)),
-                ..Default::default()
-            },
         ];
 
         for (i, d) in tests.iter().enumerate() {
@@ -2673,7 +2672,7 @@ mod tests {
                 }
                 linux_container
                     .processes
-                    .insert(exec_process_id, exec_process);
+                    .insert(exec_process.exec_id.clone(), exec_process);
 
                 sandbox.add_container(linux_container);
             }

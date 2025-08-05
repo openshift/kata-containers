@@ -6,7 +6,7 @@ required_tests:
   - Shellcheck required / shellcheck-required
   # TODO: cargo-deny-runner.yaml not yet treated as conditional
   - Cargo Crates Check Runner / cargo-deny-runner
-
+  - GHA security analysis / zizmor
 
 required_regexps:
   # Always required regexps
@@ -93,7 +93,9 @@ mapping:
       - Kata Containers CI / kata-containers-ci-on-push / run-k8s-tests-on-aks / run-k8s-tests (ubuntu, qemu, normal)
       - Kata Containers CI / kata-containers-ci-on-push / run-k8s-tests-on-aks / run-k8s-tests (ubuntu, qemu, small)
       - Kata Containers CI / kata-containers-ci-on-push / run-k8s-tests-on-zvsi / run-k8s-tests (devmapper, qemu, kubeadm)
+      - Kata Containers CI / kata-containers-ci-on-push / run-k8s-tests-on-zvsi / run-k8s-tests (nydus, qemu-coco-dev, kubeadm)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-coco-tests / run-k8s-tests-sev-snp (qemu-snp, nydus, guest-pull)
+      - Kata Containers CI / kata-containers-ci-on-push / run-kata-coco-tests / run-k8s-tests-coco-nontee (qemu-coco-dev, nydus, guest-pull)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-deploy-tests / run-kata-deploy-tests (qemu, k0s)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-deploy-tests / run-kata-deploy-tests (qemu, k3s)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-deploy-tests / run-kata-deploy-tests (qemu, microk8s)

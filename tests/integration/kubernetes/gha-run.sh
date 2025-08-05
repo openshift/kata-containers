@@ -289,7 +289,7 @@ function run_tests() {
 	if [[ "${KATA_HYPERVISOR}" = "dragonball" ]] && [[ "${SNAPSHOTTER}" = "devmapper" ]]; then
 		echo "Skipping tests for ${KATA_HYPERVISOR} using devmapper"
 	else
-		bash run_kubernetes_tests.sh
+		bash "${K8STESTS}"
 	fi
 	popd
 }
@@ -443,7 +443,7 @@ function cleanup() {
 }
 
 function deploy_snapshotter() {
-	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" || "${KATA_HYPERVISOR}" == "qemu-sev" ]]; then
+	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" ]]; then
 	       echo "[Skip] ${SNAPSHOTTER} is pre-installed in the TEE machine"
 	       return
 	fi
@@ -457,7 +457,7 @@ function deploy_snapshotter() {
 }
 
 function cleanup_snapshotter() {
-	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" || "${KATA_HYPERVISOR}" == "qemu-sev" ]]; then
+	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" ]]; then
 	       echo "[Skip] ${SNAPSHOTTER} is pre-installed in the TEE machine"
 	       return
 	fi
@@ -566,7 +566,6 @@ function main() {
 	action="${1:-}"
 
 	case "${action}" in
-		install-azure-cli) install_azure_cli ;;
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
@@ -576,7 +575,6 @@ function main() {
 		install-bats) install_bats ;;
 		install-kata-tools) install_kata_tools ;;
 		install-kbs-client) install_kbs_client ;;
-		install-kubectl) install_kubectl ;;
 		get-cluster-credentials) get_cluster_credentials "" ;;
 		deploy-csi-driver) return 0 ;;
 		deploy-kata) deploy_kata ;;
@@ -590,7 +588,14 @@ function main() {
 		deploy-kata-zvsi) deploy_kata "zvsi" ;;
 		deploy-snapshotter) deploy_snapshotter ;;
 		report-tests) report_tests ;;
-		run-tests) run_tests ;;
+		run-tests)
+			K8STESTS=run_kubernetes_tests.sh
+			run_tests
+			;;
+		run-nv-tests)
+			K8STESTS=run_kubernetes_nv_tests.sh
+			run_tests
+			;;
 		run-tests-kcli) run_tests "kcli" ;;
 		collect-artifacts) collect_artifacts ;;
 		cleanup) cleanup ;;

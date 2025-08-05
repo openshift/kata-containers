@@ -204,6 +204,11 @@ impl ResourceManagerInner {
                     .await
                     .context("do handle port device failed.")?;
                 }
+                ResourceConfig::InitData(id) => {
+                    do_handle_device(&self.device_manager, &DeviceConfig::BlockCfg(id))
+                        .await
+                        .context("do handle initdata block device failed.")?;
+                }
             };
         }
 
@@ -283,6 +288,11 @@ impl ResourceManagerInner {
     }
 
     pub async fn setup_after_start_vm(&mut self) -> Result<()> {
+        self.cgroups_resource
+            .setup_after_start_vm(self.hypervisor.as_ref())
+            .await
+            .context("setup cgroups after start vm")?;
+
         if let Some(share_fs) = self.share_fs.as_ref() {
             share_fs
                 .setup_device_after_start_vm(self.hypervisor.as_ref(), &self.device_manager)
@@ -558,7 +568,7 @@ impl ResourceManagerInner {
 
         // we should firstly update the vcpus and mems, and then update the host cgroups
         self.cgroups_resource
-            .update_cgroups(cid, linux_resources, op, self.hypervisor.as_ref())
+            .update(cid, linux_resources, op, self.hypervisor.as_ref())
             .await?;
 
         if let Some(swap) = self.swap_resource.as_ref() {
