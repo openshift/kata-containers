@@ -57,7 +57,7 @@ use rustjail::process::ProcessOperations;
 
 #[cfg(target_arch = "s390x")]
 use crate::ccw;
-use crate::cdh;
+use crate::confidential_data_hub::image::KATA_IMAGE_WORK_DIR;
 use crate::device::block_device_handler::get_virtio_blk_pci_device_name;
 #[cfg(target_arch = "s390x")]
 use crate::device::network_device_handler::wait_for_ccw_net_interface;
@@ -65,9 +65,6 @@ use crate::device::network_device_handler::wait_for_ccw_net_interface;
 use crate::device::network_device_handler::wait_for_pci_net_interface;
 use crate::device::{add_devices, handle_cdi_devices, update_env_pci};
 use crate::features::get_build_features;
-#[cfg(feature = "guest-pull")]
-use crate::image::KATA_IMAGE_WORK_DIR;
-use crate::linux_abi::*;
 use crate::metrics::get_metrics;
 use crate::mount::baremount;
 use crate::namespace::{NSTYPEIPC, NSTYPEPID, NSTYPEUTS};
@@ -80,15 +77,13 @@ use crate::storage::{add_storages, update_ephemeral_mounts, STORAGE_HANDLERS};
 use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
 use crate::AGENT_CONFIG;
+use crate::{confidential_data_hub, linux_abi::*};
 
 use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
 #[cfg(feature = "agent-policy")]
 use crate::policy::{do_set_policy, is_allowed};
-
-#[cfg(feature = "guest-pull")]
-use crate::image;
 
 use opentelemetry::global;
 use tracing::span;
@@ -112,7 +107,6 @@ use kata_types::k8s;
 
 pub const CONTAINER_BASE: &str = "/run/kata-containers";
 const MODPROBE_PATH: &str = "/sbin/modprobe";
-#[cfg(feature = "guest-pull")]
 const TRUSTED_IMAGE_STORAGE_DEVICE: &str = "/dev/trusted_store";
 /// the iptables seriers binaries could appear either in /sbin
 /// or /usr/sbin, we need to check both of them
@@ -242,7 +236,6 @@ impl AgentService {
         handle_cdi_devices(&sl(), &mut oci, "/var/run/cdi", AGENT_CONFIG.cdi_timeout).await?;
 
         // Handle trusted storage configuration before mounting any storage
-        #[cfg(feature = "guest-pull")]
         cdh_handler_trusted_storage(&mut oci)
             .await
             .map_err(|e| anyhow!("failed to handle trusted storage: {}", e))?;
@@ -319,19 +312,13 @@ impl AgentService {
 
         let pipe_size = AGENT_CONFIG.container_pipe_size;
 
-        let p = if let Some(p) = oci.process() {
-            #[cfg(feature = "guest-pull")]
-            {
-                let new_p = image::get_process(p, &oci, req.storages.clone())?;
-                Process::new(&sl(), &new_p, cid.as_str(), true, pipe_size, proc_io)?
-            }
-
-            #[cfg(not(feature = "guest-pull"))]
-            Process::new(&sl(), p, cid.as_str(), true, pipe_size, proc_io)?
-        } else {
+        let Some(p) = oci.process() else {
             info!(sl(), "no process configurations!");
             return Err(anyhow!(nix::Error::EINVAL));
         };
+
+        let new_p = confidential_data_hub::image::get_process(p, &oci, req.storages.clone())?;
+        let p = Process::new(&sl(), &new_p, cid.as_str(), true, pipe_size, proc_io)?;
 
         // if starting container failed, we will do some rollback work
         // to ensure no resources are leaked.
@@ -567,7 +554,7 @@ impl AgentService {
         req: protocols::agent::WaitProcessRequest,
     ) -> Result<protocols::agent::WaitProcessResponse> {
         let cid = req.container_id;
-        let eid = req.exec_id;
+        let mut eid = req.exec_id;
         let mut resp = WaitProcessResponse::new();
 
         info!(
@@ -600,7 +587,7 @@ impl AgentService {
             .get_container(&cid)
             .ok_or_else(|| anyhow!("Invalid container id"))?;
 
-        let p = match ctr.processes.get_mut(&pid) {
+        let p = match ctr.processes.values_mut().find(|p| p.pid == pid) {
             Some(p) => p,
             None => {
                 // Lost race, pick up exit code from channel
@@ -613,6 +600,8 @@ impl AgentService {
             }
         };
 
+        eid = p.exec_id.clone();
+
         // need to close all fd
         // ignore errors for some fd might be closed by stream
         p.cleanup_process_stream();
@@ -624,7 +613,7 @@ impl AgentService {
             let _ = s.send(p.exit_code).await;
         }
 
-        ctr.processes.remove(&pid);
+        ctr.processes.remove(&eid);
 
         Ok(resp)
     }
@@ -721,13 +710,15 @@ fn mem_agent_memcgconfig_to_memcg_optionconfig(
     mc: &protocols::agent::MemAgentMemcgConfig,
 ) -> mem_agent::memcg::OptionConfig {
     mem_agent::memcg::OptionConfig {
-        disabled: mc.disabled,
-        swap: mc.swap,
-        swappiness_max: mc.swappiness_max.map(|x| x as u8),
-        period_secs: mc.period_secs,
-        period_psi_percent_limit: mc.period_psi_percent_limit.map(|x| x as u8),
-        eviction_psi_percent_limit: mc.eviction_psi_percent_limit.map(|x| x as u8),
-        eviction_run_aging_count_min: mc.eviction_run_aging_count_min,
+        default: mem_agent::memcg::SingleOptionConfig {
+            disabled: mc.disabled,
+            swap: mc.swap,
+            swappiness_max: mc.swappiness_max.map(|x| x as u8),
+            period_secs: mc.period_secs,
+            period_psi_percent_limit: mc.period_psi_percent_limit.map(|x| x as u8),
+            eviction_psi_percent_limit: mc.eviction_psi_percent_limit.map(|x| x as u8),
+            eviction_run_aging_count_min: mc.eviction_run_aging_count_min,
+        },
         ..Default::default()
     }
 }
@@ -1332,9 +1323,6 @@ impl agent_ttrpc::AgentService for AgentService {
             }
         }
 
-        #[cfg(feature = "guest-pull")]
-        image::init_image_service().await.map_ttrpc_err(same)?;
-
         Ok(Empty::new())
     }
 
@@ -1796,11 +1784,11 @@ pub async fn start(
         sandbox: s,
         init_mode,
         oma,
-    }) as Box<dyn agent_ttrpc::AgentService + Send + Sync>;
-    let aservice = agent_ttrpc::create_agent_service(Arc::new(agent_service));
+    });
+    let aservice = agent_ttrpc::create_agent_service(Arc::new(*agent_service));
 
-    let health_service = Box::new(HealthService {}) as Box<dyn health_ttrpc::Health + Send + Sync>;
-    let hservice = health_ttrpc::create_health(Arc::new(health_service));
+    let health_service = Box::new(HealthService {});
+    let hservice = health_ttrpc::create_health(Arc::new(*health_service));
 
     let server = TtrpcServer::new()
         .bind(server_address)?
@@ -2013,22 +2001,35 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         ));
     }
 
+    // Create parent directories if missing
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             let dir = parent.to_path_buf();
+            // Attempt to create directory, ignore AlreadyExists errors
             if let Err(e) = fs::create_dir_all(&dir) {
                 if e.kind() != std::io::ErrorKind::AlreadyExists {
                     return Err(e.into());
                 }
-            } else {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(req.dir_mode))?;
             }
+
+            // Set directory permissions and ownership
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(req.dir_mode))?;
+            unistd::chown(
+                &dir,
+                Some(Uid::from_raw(req.uid as u32)),
+                Some(Gid::from_raw(req.gid as u32)),
+            )?;
         }
     }
 
     let sflag = stat::SFlag::from_bits_truncate(req.file_mode);
 
     if sflag.contains(stat::SFlag::S_IFDIR) {
+        // Remove existing non-directory file if present
+        if path.exists() && !path.is_dir() {
+            fs::remove_file(&path)?;
+        }
+
         fs::create_dir(&path).or_else(|e| {
             if e.kind() != std::io::ErrorKind::AlreadyExists {
                 return Err(e);
@@ -2047,16 +2048,25 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         return Ok(());
     }
 
+    // Handle symlink creation
     if sflag.contains(stat::SFlag::S_IFLNK) {
-        // After kubernetes secret's volume update, the '..data' symlink should point to
-        // the new timestamped directory.
-        // TODO:The old and deleted timestamped dir still exists due to missing DELETE api in agent.
-        // Hence, Unlink the existing symlink.
-        if path.is_symlink() && path.exists() {
-            unistd::unlink(&path)?;
+        // Clean up existing path (whether symlink, dir, or file)
+        if path.exists() || path.is_symlink() {
+            // Use appropriate removal method based on path type
+            if path.is_symlink() {
+                unistd::unlink(&path)?;
+            } else if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
         }
+
+        // Create new symbolic link
         let src = PathBuf::from(OsStr::from_bytes(&req.data));
         unistd::symlinkat(&src, None, &path)?;
+
+        // Set symlink ownership (permissions not supported for symlinks)
         let path_str = CString::new(path.as_os_str().as_bytes())?;
 
         let ret = unsafe { libc::lchown(path_str.as_ptr(), req.uid as u32, req.gid as u32) };
@@ -2071,7 +2081,7 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(req.offset == 0) // Only truncate when offset is 0
         .open(&tmpfile)?;
 
     file.write_all_at(req.data.as_slice(), req.offset as u64)?;
@@ -2088,6 +2098,15 @@ fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
         Some(Uid::from_raw(req.uid as u32)),
         Some(Gid::from_raw(req.gid as u32)),
     )?;
+
+    // Remove existing target path before rename
+    if path.exists() || path.is_symlink() {
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
 
     fs::rename(tmpfile, path)?;
 
@@ -2243,9 +2262,8 @@ fn is_sealed_secret_path(source_path: &str) -> bool {
             .any(|suffix| source_path.ends_with(suffix))
 }
 
-#[cfg(feature = "guest-pull")]
 async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
-    if !cdh::is_cdh_client_initialized().await {
+    if !confidential_data_hub::is_cdh_client_initialized() {
         return Ok(());
     }
     let linux = oci
@@ -2270,7 +2288,13 @@ async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
                     ("encryptType".to_string(), "LUKS".to_string()),
                     ("dataIntegrity".to_string(), secure_storage_integrity),
                 ]);
-                cdh::secure_mount("BlockDevice", &options, vec![], KATA_IMAGE_WORK_DIR).await?;
+                confidential_data_hub::secure_mount(
+                    "BlockDevice",
+                    &options,
+                    vec![],
+                    KATA_IMAGE_WORK_DIR,
+                )
+                .await?;
                 break;
             }
         }
@@ -2279,7 +2303,7 @@ async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
 }
 
 async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
-    if !cdh::is_cdh_client_initialized().await {
+    if !confidential_data_hub::is_cdh_client_initialized() {
         return Ok(());
     }
     let process = oci
@@ -2288,7 +2312,7 @@ async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
         .ok_or_else(|| anyhow!("Spec didn't contain process field"))?;
     if let Some(envs) = process.env_mut().as_mut() {
         for env in envs.iter_mut() {
-            match cdh::unseal_env(env).await {
+            match confidential_data_hub::unseal_env(env).await {
                 Ok(unsealed_env) => *env = unsealed_env.to_string(),
                 Err(e) => {
                     warn!(sl(), "Failed to unseal secret: {}", e)
@@ -2326,7 +2350,7 @@ async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
             // But currently there is no quick way to determine which volume-mount is referring
             // to a sealed secret without reading the file.
             // And relying on file naming heuristic is inflexible. So we are going with this approach.
-            if let Err(e) = cdh::unseal_file(source_path).await {
+            if let Err(e) = confidential_data_hub::unseal_file(source_path).await {
                 warn!(
                     sl(),
                     "Failed to unseal file: {:?}, Error: {:?}", source_path, e
@@ -2601,11 +2625,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            TestData {
-                has_fd: false,
-                result: Err(anyhow!(ERR_CANNOT_GET_WRITER)),
-                ..Default::default()
-            },
         ];
 
         for (i, d) in tests.iter().enumerate() {
@@ -2653,7 +2672,7 @@ mod tests {
                 }
                 linux_container
                     .processes
-                    .insert(exec_process_id, exec_process);
+                    .insert(exec_process.exec_id.clone(), exec_process);
 
                 sandbox.add_container(linux_container);
             }

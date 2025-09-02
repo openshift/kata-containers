@@ -43,7 +43,6 @@ readonly se_image_builder="${repo_root_dir}/tools/packaging/guest-image/build_se
 ARCH=${ARCH:-$(uname -m)}
 BUSYBOX_CONF_FILE="${BUSYBOX_CONF_FILE:-}"
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
-PULL_TYPE=${PULL_TYPE:-guest-pull}
 USE_CACHE="${USE_CACHE:-"yes"}"
 ARTEFACT_REGISTRY="${ARTEFACT_REGISTRY:-ghcr.io}"
 ARTEFACT_REPOSITORY="${ARTEFACT_REPOSITORY:-kata-containers}"
@@ -61,6 +60,7 @@ KERNEL_HEADERS_PKG_TYPE="${KERNEL_HEADERS_PKG_TYPE:-deb}"
 RELEASE="${RELEASE:-"no"}"
 KBUILD_SIGN_PIN="${KBUILD_SIGN_PIN:-}"
 RUNTIME_CHOICE="${RUNTIME_CHOICE:-both}"
+KERNEL_DEBUG_ENABLED=${KERNEL_DEBUG_ENABLED:-"no"}
 
 workdir="${WORKDIR:-$PWD}"
 
@@ -430,12 +430,12 @@ install_image_confidential() {
 	else
 		export MEASURED_ROOTFS=yes
 	fi
-	export PULL_TYPE=default
 	install_image "confidential"
 }
 
 #Install cbl-mariner guest image
 install_image_mariner() {
+	export IMAGE_SIZE_ALIGNMENT_MB=2
 	install_image "mariner"
 }
 
@@ -528,7 +528,6 @@ install_initrd() {
 #Install guest initrd for confidential guests
 install_initrd_confidential() {
 	export MEASURED_ROOTFS=no
-	export PULL_TYPE=default
 	install_initrd "confidential"
 }
 
@@ -996,7 +995,7 @@ install_agent() {
 	export GPERF_URL="$(get_from_kata_deps ".externals.gperf.url")"
 
 	info "build static agent"
-	DESTDIR="${destdir}" AGENT_POLICY="${AGENT_POLICY}" PULL_TYPE=${PULL_TYPE} "${agent_builder}"
+	DESTDIR="${destdir}" AGENT_POLICY="${AGENT_POLICY}" "${agent_builder}"
 }
 
 install_coco_guest_components() {
@@ -1118,6 +1117,7 @@ install_tools_helper() {
 	fi
 
 	if [[ "${tool}" == "agent-ctl" ]]; then
+		artefact_tag="$(git log -1 --pretty=format:"%H" ${repo_root_dir})"
 		defaults_path="${destdir}/opt/kata/share/defaults/kata-containers/agent-ctl"
 		mkdir -p "${defaults_path}"
 		install -D --mode 0644 ${repo_root_dir}/src/tools/${tool}/template/oci_config.json "${defaults_path}/oci_config.json"
@@ -1267,13 +1267,13 @@ handle_build() {
 
 	rootfs-initrd-confidential) install_initrd_confidential ;;
 
-	rootfs-nvidia-gpu-image) install_image_nvidia_gpu ;;
+	rootfs-image-nvidia-gpu) install_image_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-initrd) install_initrd_nvidia_gpu ;;
+	rootfs-initrd-nvidia-gpu) install_initrd_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-confidential-image) install_image_nvidia_gpu_confidential ;;
+	rootfs-image-nvidia-gpu-confidential) install_image_nvidia_gpu_confidential ;;
 
-	rootfs-nvidia-gpu-confidential-initrd) install_initrd_nvidia_gpu_confidential ;;
+	rootfs-initrd-nvidia-gpu-confidential) install_initrd_nvidia_gpu_confidential ;;
 
 	runk) install_runk ;;
 
