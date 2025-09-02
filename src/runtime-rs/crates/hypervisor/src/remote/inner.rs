@@ -12,8 +12,10 @@ use async_trait::async_trait;
 use kata_types::{
     annotations::{
         cri_containerd::{SANDBOX_NAMESPACE_LABEL_KEY, SANDBOX_NAME_LABEL_KEY},
+        KATA_ANNO_CFG_HYPERVISOR_DEFAULT_GPUS, KATA_ANNO_CFG_HYPERVISOR_DEFAULT_GPU_MODEL,
         KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MEMORY, KATA_ANNO_CFG_HYPERVISOR_DEFAULT_VCPUS,
-        KATA_ANNO_CFG_HYPERVISOR_IMAGE_PATH, KATA_ANNO_CFG_HYPERVISOR_MACHINE_TYPE,
+        KATA_ANNO_CFG_HYPERVISOR_IMAGE_PATH, KATA_ANNO_CFG_HYPERVISOR_INIT_DATA,
+        KATA_ANNO_CFG_HYPERVISOR_MACHINE_TYPE,
     },
     capabilities::{Capabilities, CapabilityBits},
 };
@@ -124,6 +126,18 @@ impl RemoteInner {
             KATA_ANNO_CFG_HYPERVISOR_IMAGE_PATH.to_string(),
             config.boot_info.image.to_string(),
         );
+        annotations.insert(
+            KATA_ANNO_CFG_HYPERVISOR_INIT_DATA.to_string(),
+            config.security_info.initdata.to_string(),
+        );
+        annotations.insert(
+            KATA_ANNO_CFG_HYPERVISOR_DEFAULT_GPUS.to_string(),
+            config.remote_info.default_gpus.to_string(),
+        );
+        annotations.insert(
+            KATA_ANNO_CFG_HYPERVISOR_DEFAULT_GPU_MODEL.to_string(),
+            config.remote_info.default_gpu_model.to_string(),
+        );
         annotations
     }
 
@@ -132,8 +146,16 @@ impl RemoteInner {
         id: &str,
         netns: Option<String>,
         annotations: &HashMap<String, String>,
+        selinux_label: Option<String>,
     ) -> Result<()> {
         info!(sl!(), "Preparing REMOTE VM");
+        // Remote does not support SELinux; any provided selinux_label will be ignored.
+        if selinux_label.is_some() {
+            warn!(sl!(),
+                    "SELinux label is provided for Remote VM, but Remote does not support SELinux; the label will be ignored",
+            );
+        }
+
         self.id = id.to_string();
 
         if let Some(netns_path) = &netns {

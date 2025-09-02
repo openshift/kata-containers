@@ -25,6 +25,7 @@ use ch_config::ch_api::{
 use ch_config::convert::{DEFAULT_DISK_QUEUES, DEFAULT_DISK_QUEUE_SIZE, DEFAULT_NUM_PCI_SEGMENTS};
 use ch_config::DiskConfig;
 use ch_config::{net_util::MacAddr, DeviceConfig, FsConfig, NetConfig, VsockConfig};
+use kata_types::config::hypervisor::RateLimiterConfig;
 use safe_path::scoped_join;
 use std::convert::TryFrom;
 use std::path::PathBuf;
@@ -61,6 +62,7 @@ impl CloudHypervisorInner {
             match device {
                 DeviceType::ShareFs(_) => self.pending_devices.insert(0, device.clone()),
                 DeviceType::Network(_) => self.pending_devices.insert(0, device.clone()),
+                DeviceType::Vfio(_) => self.pending_devices.insert(0, device.clone()),
                 _ => {
                     debug!(
                         sl!(),
@@ -321,6 +323,18 @@ impl CloudHypervisorInner {
             .is_direct
             .unwrap_or(self.config.blockdev_info.block_device_cache_direct);
 
+        let block_rate_limit = RateLimiterConfig::new(
+            self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst,
+            self.config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst,
+        );
+        disk_config.rate_limiter_config = block_rate_limit;
+
         let response = cloud_hypervisor_vm_blockdev_add(
             socket.try_clone().context("failed to clone socket")?,
             disk_config,
@@ -365,9 +379,14 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn get_shared_devices(
         &mut self,
-    ) -> Result<(Option<Vec<FsConfig>>, Option<Vec<NetConfig>>)> {
+    ) -> Result<(
+        Option<Vec<FsConfig>>,
+        Option<Vec<NetConfig>>,
+        Option<Vec<DeviceConfig>>,
+    )> {
         let mut shared_fs_devices = Vec::<FsConfig>::new();
         let mut network_devices = Vec::<NetConfig>::new();
+        let mut host_devices = Vec::<DeviceConfig>::new();
 
         while let Some(dev) = self.pending_devices.pop() {
             match dev {
@@ -382,11 +401,38 @@ impl CloudHypervisorInner {
                     let net_config = NetConfig::try_from(net_device.config)?;
                     network_devices.push(net_config);
                 }
+                DeviceType::Vfio(vfio_device) => {
+                    // A device with multi-funtions, or a IOMMU group with one more
+                    // devices, the Primary device is selected to be passed to VM.
+                    // And the the first one is Primary device.
+                    // safe here, devices is not empty.
+                    let primary_device = vfio_device.devices.first().ok_or(anyhow!(
+                        "Primary device list empty for vfio device {:?}",
+                        vfio_device
+                    ))?;
+
+                    let primary_device = primary_device.clone();
+                    let sysfsdev = primary_device.sysfs_path.clone();
+                    let device_config = DeviceConfig {
+                        path: PathBuf::from(sysfsdev),
+                        iommu: false,
+                        ..Default::default()
+                    };
+                    info!(
+                        sl!(),
+                        "get host_devices primary device {:?}", primary_device
+                    );
+                    host_devices.push(device_config);
+                }
                 _ => continue,
             }
         }
 
-        Ok((Some(shared_fs_devices), Some(network_devices)))
+        Ok((
+            Some(shared_fs_devices),
+            Some(network_devices),
+            Some(host_devices),
+        ))
     }
 }
 

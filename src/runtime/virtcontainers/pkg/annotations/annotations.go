@@ -245,7 +245,7 @@ const (
 	EnableRootlessHypervisor = kataAnnotHypervisorPrefix + "rootless"
 
 	// Initdata is the initdata passed in when CreateVM
-	Initdata = kataConfAnnotationsPrefix + "runtime.cc_init_data"
+	Initdata = kataConfAnnotationsPrefix + "hypervisor.cc_init_data"
 )
 
 // Runtime related annotations
@@ -283,6 +283,9 @@ const (
 
 	// CreateContainerTimeout is a sandbox annotaion that sets the create container timeout.
 	CreateContainerTimeout = kataAnnotRuntimePrefix + "create_container_timeout"
+
+	// ForceGuestPull is a sandbox annotation that sets experimental_force_guest_pull.
+	ForceGuestPull = kataAnnotRuntimePrefix + "experimental_force_guest_pull"
 )
 
 // Agent related annotations

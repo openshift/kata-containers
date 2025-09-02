@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent::{Agent, Storage};
@@ -89,9 +90,9 @@ impl ResourceManager {
         inner.setup_after_start_vm().await
     }
 
-    pub async fn get_storage_for_sandbox(&self) -> Result<Vec<Storage>> {
+    pub async fn get_storage_for_sandbox(&self, shm_size: u64) -> Result<Vec<Storage>> {
         let inner = self.inner.read().await;
-        inner.get_storage_for_sandbox().await
+        inner.get_storage_for_sandbox(shm_size).await
     }
 
     pub async fn handler_rootfs(
@@ -100,10 +101,11 @@ impl ResourceManager {
         root: &oci::Root,
         bundle_path: &str,
         rootfs_mounts: &[Mount],
+        annotations: &HashMap<String, String>,
     ) -> Result<Arc<dyn Rootfs>> {
         let inner = self.inner.read().await;
         inner
-            .handler_rootfs(cid, root, bundle_path, rootfs_mounts)
+            .handler_rootfs(cid, root, bundle_path, rootfs_mounts, annotations)
             .await
     }
 

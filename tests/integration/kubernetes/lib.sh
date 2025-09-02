@@ -302,7 +302,7 @@ set_metadata_annotation() {
 	# dots.
 	yq -i ".${annotation_key} = \"${value}\"" "${yaml}"
 
-	if [[ "${key}" =~ kernel_params ]] && [[ "${KATA_HYPERVISOR}" == "qemu-se" ]]; then
+	if [[ "${key}" =~ kernel_params ]] && [[ "${KATA_HYPERVISOR}" == qemu-se* ]]; then
 		# A secure boot image for IBM SE should be rebuilt according to the KBS configuration.
 		if [ -z "${IBM_SE_CREDS_DIR:-}" ]; then
 			>&2 echo "ERROR: IBM_SE_CREDS_DIR is empty"
@@ -340,10 +340,19 @@ set_container_command() {
 set_node() {
 	local yaml="$1"
 	local node="$2"
+	local kind
+	local spec
 	[ -n "$node" ] || return 1
 
+	kind="$(yq -r '.kind' "${yaml}")"
+	if [[ "${kind}" = "Job" ]]; then
+		spec=".spec.template.spec.nodeName"
+	else
+		spec=".spec.nodeName"
+	fi
+
   yq -i \
-    ".spec.nodeName = \"$node\"" \
+    "${spec} = \"$node\"" \
     "${yaml}"
 }
 

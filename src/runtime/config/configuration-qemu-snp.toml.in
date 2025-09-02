@@ -52,7 +52,7 @@ sev_snp_guest = true
 # List of valid annotation names for the hypervisor
 # Each member of the list is a regular expression, which is the base name
 # of the annotation, e.g. "path" for io.katacontainers.config.hypervisor.path"
-enable_annotations = @DEFENABLEANNOTATIONS@
+enable_annotations = @DEFENABLEANNOTATIONS_COCO@
 
 # List of valid annotations values for the hypervisor
 # Each member of the list is a path pattern as described by glob(3).
@@ -62,8 +62,9 @@ valid_hypervisor_paths = @QEMUVALIDHYPERVISORPATHS@
 
 # SNP 'ID Block' and 'ID Authentication Information Structure'.
 # If one of snp_id_block or snp_id_auth is specified, the other must be specified, too.
-# Notice that the default SNP policy of QEMU (0x30000) is used by Kata, and the IDBlock
-# must be generated with exactly this policy.
+# Notice that the default SNP policy of QEMU (0x30000) is used by Kata, if not explicitly
+# set via 'snp_guest_policy' option. The IDBlock contains the guest policy as field, and
+# it must match the value from 'snp_guest_policy' or, if unset, the QEMU default policy.
 #
 # 96-byte, base64-encoded blob to provide the ‘ID Block’ structure for the
 # SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (QEMU default: all-zero)
@@ -71,6 +72,13 @@ valid_hypervisor_paths = @QEMUVALIDHYPERVISORPATHS@
 # 4096-byte, base64-encoded blob to provide the ‘ID Authentication Information Structure’
 # for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (QEMU default: all-zero)
 #snp_id_auth = ""
+
+# SNP Guest Policy, the ‘POLICY’ parameter to the SNP_LAUNCH_START command.
+# If unset, the QEMU default policy (0x30000) will be used.
+# Notice that the guest policy is enforced at VM launch, and your pod VMs 
+# won't start at all if the policy denys it. This will be indicated by a
+# 'SNP_LAUNCH_START' error.
+#snp_guest_policy = 196608
 
 # Optional space-separated list of options to pass to the guest kernel.
 # For example, use `kernel_params = "vsyscall=emulate"` if you are having
@@ -221,6 +229,10 @@ virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
 #    Metadata, data, and pathname lookup are not cached in guest. They are
 #    always fetched from host and any changes are immediately pushed to host.
 #
+#  - metadata
+#    Metadata and pathname lookup are cached in guest and never expire.
+#    Data is never cached in guest.
+#
 #  - auto
 #    Metadata and pathname lookup cache expires after a configured amount of
 #    time (default is 1 second). Data is cached while the file is open (close
@@ -277,6 +289,16 @@ enable_iothreads = @DEFENABLEIOTHREADS@
 # to be very predictable
 # Default false
 #enable_mem_prealloc = true
+
+# Reclaim guest freed memory.
+# Enabling this will result in the VM balloon device having f_reporting=on set.
+# Then the hypervisor will use it to reclaim guest freed memory.
+# This is useful for reducing the amount of memory used by a VM.
+# Enabling this feature may sometimes reduce the speed of memory access in
+# the VM.
+#
+# Default false
+#reclaim_guest_freed_memory = true
 
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory
@@ -352,21 +374,11 @@ disable_nesting_checks = true
 # Otherwise virtio-block device is used.
 #
 # nvdimm is not supported when `confidential_guest = true`.
-#
-# Default is false
-disable_image_nvdimm = true
-
-# VFIO devices are hotplugged on a bridge by default.
-# Enable hotplugging on root bus. This may be required for devices with
-# a large PCI bar, as this is a current limitation with hotplugging on
-# a bridge.
-# Default false
-#hotplug_vfio_on_root_bus = true
+disable_image_nvdimm = @DEFDISABLEIMAGENVDIMM@
 
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means the number of pcie_root_port
-# This value is valid when hotplug_vfio_on_root_bus is true and machine_type is "q35"
 # Default 0
 #pcie_root_port = 2
 
@@ -691,3 +703,8 @@ create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
 # to the hypervisor.
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
+
+# Enforce guest pull. This instructs the runtime to communicate to the agent via annotations that
+# the container image should be pulled in the guest, without using an external snapshotter.
+# This is an experimental feature and might be removed in the future.
+experimental_force_guest_pull = @DEFFORCEGUESTPULL@

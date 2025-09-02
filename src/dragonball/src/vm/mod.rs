@@ -35,7 +35,7 @@ use crate::address_space_manager::{
 use crate::api::v1::{InstanceInfo, InstanceState};
 use crate::device_manager::console_manager::DmesgWriter;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
-use crate::error::{LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
+use crate::error::{Error, LoadInitrdError, Result, StartMicroVmError, StopMicrovmError};
 use crate::event_manager::EventManager;
 use crate::kvm_context::KvmContext;
 use crate::resource_manager::ResourceManager;
@@ -228,7 +228,8 @@ impl Vm {
             epoll_manager.clone(),
             &logger,
             api_shared_info.clone(),
-        );
+        )
+        .map_err(Error::DeviceMgrError)?;
 
         Ok(Vm {
             epoll_manager,
@@ -832,7 +833,7 @@ impl Vm {
     pub fn resize_vcpu(
         &mut self,
         config: VcpuResizeInfo,
-        sync_tx: Option<Sender<bool>>,
+        sync_tx: Option<Sender<Option<i32>>>,
     ) -> std::result::Result<(), VcpuResizeError> {
         if self.upcall_client().is_none() {
             Err(VcpuResizeError::UpcallClientMissing)
@@ -874,6 +875,8 @@ impl Vm {
     }
 }
 
+/// Unit test module for methods of struct Vm, and helper functions to shorten
+/// test code.
 #[cfg(test)]
 pub mod tests {
     #[cfg(target_arch = "aarch64")]
@@ -889,6 +892,7 @@ pub mod tests {
     use crate::test_utils::tests::create_vm_for_test;
 
     impl Vm {
+        /// Helper function to forch change `mstate` of Vms
         pub fn set_instance_state(&mut self, mstate: InstanceState) {
             self.shared_info
             .write()
@@ -897,6 +901,7 @@ pub mod tests {
         }
     }
 
+    /// Helper function to create dummy Vm instance for testing purpose
     pub fn create_vm_instance() -> Vm {
         let instance_info = Arc::new(RwLock::new(InstanceInfo::default()));
         let epoll_manager = EpollManager::default();

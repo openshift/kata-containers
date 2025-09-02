@@ -43,7 +43,6 @@ readonly se_image_builder="${repo_root_dir}/tools/packaging/guest-image/build_se
 ARCH=${ARCH:-$(uname -m)}
 BUSYBOX_CONF_FILE="${BUSYBOX_CONF_FILE:-}"
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
-PULL_TYPE=${PULL_TYPE:-guest-pull}
 USE_CACHE="${USE_CACHE:-"yes"}"
 ARTEFACT_REGISTRY="${ARTEFACT_REGISTRY:-ghcr.io}"
 ARTEFACT_REPOSITORY="${ARTEFACT_REPOSITORY:-kata-containers}"
@@ -61,6 +60,7 @@ KERNEL_HEADERS_PKG_TYPE="${KERNEL_HEADERS_PKG_TYPE:-deb}"
 RELEASE="${RELEASE:-"no"}"
 KBUILD_SIGN_PIN="${KBUILD_SIGN_PIN:-}"
 RUNTIME_CHOICE="${RUNTIME_CHOICE:-both}"
+KERNEL_DEBUG_ENABLED=${KERNEL_DEBUG_ENABLED:-"no"}
 
 workdir="${WORKDIR:-$PWD}"
 
@@ -215,11 +215,11 @@ install_cached_shim_v2_tarball_get_root_hash() {
 	fi
 
 	local tarball_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
-	local image_conf_tarball="kata-static-rootfs-image-confidential.tar.xz"
+	local image_conf_tarball="kata-static-rootfs-image-confidential.tar.zst"
 
 	local root_hash_basedir="./opt/kata/share/kata-containers/"
 
-	tar xvf "${tarball_dir}/${image_conf_tarball}" ${root_hash_basedir}root_hash.txt --transform s,${root_hash_basedir},,
+	tar --zstd -xvf "${tarball_dir}/${image_conf_tarball}" ${root_hash_basedir}root_hash.txt --transform s,${root_hash_basedir},,
 	mv root_hash.txt "${tarball_dir}/root_hash.txt"
 
 	return 0
@@ -290,14 +290,14 @@ install_cached_tarball_component() {
 
 get_agent_tarball_path() {
 	agent_local_build_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
-	agent_tarball_name="kata-static-agent.tar.xz"
+	agent_tarball_name="kata-static-agent.tar.zst"
 
 	echo "${agent_local_build_dir}/${agent_tarball_name}"
 }
 
 get_coco_guest_components_tarball_path() {
 	coco_guest_components_local_build_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
-	coco_guest_components_tarball_name="kata-static-coco-guest-components.tar.xz"
+	coco_guest_components_tarball_name="kata-static-coco-guest-components.tar.zst"
 
 	echo "${coco_guest_components_local_build_dir}/${coco_guest_components_tarball_name}"
 }
@@ -313,7 +313,7 @@ get_latest_coco_guest_components_artefact_and_builder_image_version() {
 
 get_pause_image_tarball_path() {
 	pause_image_local_build_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
-	pause_image_tarball_name="kata-static-pause-image.tar.xz"
+	pause_image_tarball_name="kata-static-pause-image.tar.zst"
 
 	echo "${pause_image_local_build_dir}/${pause_image_tarball_name}"
 }
@@ -343,6 +343,20 @@ get_latest_kernel_confidential_artefact_and_builder_image_version() {
 		echo "${latest_kernel_artefact}-${latest_kernel_builder_image}"
 }
 
+get_latest_kernel_artefact_and_builder_image_version() {
+	local kernel_version
+	local kernel_kata_config_version
+	local latest_kernel_artefact
+	local latest_kernel_builder_image
+
+	kernel_version=$(get_from_kata_deps ".assets.kernel.version")
+	kernel_kata_config_version="$(cat "${repo_root_dir}"/tools/packaging/kernel/kata_config_version)"
+	latest_kernel_artefact="${kernel_version}-${kernel_kata_config_version}-$(get_last_modification "$(dirname "${kernel_builder}")")"
+	latest_kernel_builder_image="$(get_kernel_image_name)"
+
+	echo "${latest_kernel_artefact}-${latest_kernel_builder_image}"
+}
+
 #Install guest image
 install_image() {
 	local variant="${1:-}"
@@ -370,12 +384,17 @@ install_image() {
 
 
 	latest_artefact="$(get_kata_version)-${os_name}-${os_version}-${osbuilder_last_commit}-${guest_image_last_commit}-${agent_last_commit}-${libs_last_commit}-${gperf_version}-${libseccomp_version}-${rust_version}-${image_type}"
-	if [ "${variant}" == "confidential" ]; then
+	if [[ "${variant}" == *confidential ]]; then
 		# For the confidential image we depend on the kernel built in order to ensure that
 		# measured boot is used
 		latest_artefact+="-$(get_latest_kernel_confidential_artefact_and_builder_image_version)"
 		latest_artefact+="-$(get_latest_coco_guest_components_artefact_and_builder_image_version)"
 		latest_artefact+="-$(get_latest_pause_image_artefact_and_builder_image_version)"
+	fi
+
+	if [[ "${variant}" == "nvidia-gpu" ]]; then
+		# If we bump the kernel we need to rebuild the image
+		latest_artefact+="-$(get_latest_kernel_artefact_and_builder_image_version "${variant}")"
 	fi
 
 	latest_builder_image=""
@@ -430,12 +449,12 @@ install_image_confidential() {
 	else
 		export MEASURED_ROOTFS=yes
 	fi
-	export PULL_TYPE=default
 	install_image "confidential"
 }
 
 #Install cbl-mariner guest image
 install_image_mariner() {
+	export IMAGE_SIZE_ALIGNMENT_MB=2
 	install_image "mariner"
 }
 
@@ -465,12 +484,17 @@ install_initrd() {
 		"$(get_last_modification "${repo_root_dir}/tools/packaging/static-build/agent")")
 
 	latest_artefact="$(get_kata_version)-${os_name}-${os_version}-${osbuilder_last_commit}-${guest_image_last_commit}-${agent_last_commit}-${libs_last_commit}-${gperf_version}-${libseccomp_version}-${rust_version}-${initrd_type}"
-	if [ "${variant}" == "confidential" ]; then
+	if [[ "${variant}" == *confidential ]]; then
 		# For the confidential initrd we depend on the kernel built in order to ensure that
 		# measured boot is used
 		latest_artefact+="-$(get_latest_kernel_confidential_artefact_and_builder_image_version)"
 		latest_artefact+="-$(get_latest_coco_guest_components_artefact_and_builder_image_version)"
 		latest_artefact+="-$(get_latest_pause_image_artefact_and_builder_image_version)"
+	fi
+
+	if [[ "${variant}" == "nvidia-gpu" ]]; then
+		# If we bump the kernel we need to rebuild the initrd as well
+		latest_artefact+="-$(get_latest_kernel_artefact_and_builder_image_version "${variant}")"
 	fi
 
 	latest_builder_image=""
@@ -528,7 +552,6 @@ install_initrd() {
 #Install guest initrd for confidential guests
 install_initrd_confidential() {
 	export MEASURED_ROOTFS=no
-	export PULL_TYPE=default
 	install_initrd "confidential"
 }
 
@@ -612,12 +635,12 @@ install_cached_kernel_tarball_component() {
 		"kernel-nvidia-gpu"*"")
 			local kernel_headers_dir=$(get_kernel_headers_dir "${kernel_name}")
 			mkdir -p ${kernel_headers_dir} || true
-			tar xvf ${workdir}/${kernel_name}/builddir/kata-static-${kernel_name}-headers.tar.xz -C "${kernel_headers_dir}" || return 1
-			;;& # fallthrough in the confidential case we need the modules.tar.xz and for every kernel-nvidia-gpu we need the headers
+			tar --zstd -xvf ${workdir}/${kernel_name}/builddir/kata-static-${kernel_name}-headers.tar.zst -C "${kernel_headers_dir}" || return 1
+			;;& # fallthrough in the confidential case we need the modules.tar.zst and for every kernel-nvidia-gpu we need the headers
 		"kernel"*"-confidential")
 			local modules_dir=$(get_kernel_modules_dir ${kernel_version} ${kernel_kata_config_version} ${build_target})
 			mkdir -p "${modules_dir}" || true
-			tar xvf "${workdir}/kata-static-${kernel_name}-modules.tar.xz" -C "${modules_dir}" || return 1
+			tar --zstd -xvf "${workdir}/kata-static-${kernel_name}-modules.tar.zst" -C "${modules_dir}" || return 1
 			;;
 	esac
 
@@ -641,13 +664,13 @@ install_kernel_helper() {
 	fi
 
 	if [[ "${kernel_name}" == "kernel"*"-confidential" ]]; then
-		local kernel_modules_tarball_name="kata-static-${kernel_name}-modules.tar.xz"
+		local kernel_modules_tarball_name="kata-static-${kernel_name}-modules.tar.zst"
 		local kernel_modules_tarball_path="${workdir}/${kernel_modules_tarball_name}"
 		extra_tarballs="${kernel_modules_tarball_name}:${kernel_modules_tarball_path}"
 	fi
 
 	if [[ "${kernel_name}" == "kernel-nvidia-gpu*" ]]; then
-		local kernel_headers_tarball_name="kata-static-${kernel_name}-headers.tar.xz"
+		local kernel_headers_tarball_name="kata-static-${kernel_name}-headers.tar.zst"
 		local kernel_headers_tarball_path="${workdir}/${kernel_headers_tarball_name}"
 		extra_tarballs+=" ${kernel_headers_tarball_name}:${kernel_headers_tarball_path}"
 	fi
@@ -735,7 +758,7 @@ install_qemu_helper() {
 
 	info "build static ${qemu_name}"
 	"${builder}"
-	tar xvf "${qemu_tarball_name}" -C "${destdir}"
+	tar --zstd -xvf "${qemu_tarball_name}" -C "${destdir}"
 }
 
 # Install static qemu asset
@@ -927,6 +950,20 @@ install_shimv2() {
 	export MEASURED_ROOTFS
 	export RUNTIME_CHOICE
 
+	if [ "${MEASURED_ROOTFS}" = "yes" ]; then
+		local image_conf_tarball="${workdir}/kata-static-rootfs-image-confidential.tar.zst"
+		if [ ! -f "${image_conf_tarball}" ]; then
+			die "Building the shim-v2 with MEASURED_ROOTFS support requires a rootfs confidential image tarball"
+		fi
+
+		local root_hash_basedir="./opt/kata/share/kata-containers/"
+		if ! tar --zstd -xvf ${image_conf_tarball} --transform s,${root_hash_basedir},, ${root_hash_basedir}root_hash.txt; then
+			die "Building the shim-v2 with MEASURED_ROOTFS support requires a rootfs confidential image tarball built with MEASURED_ROOTFS support"
+		fi
+
+		mv root_hash.txt ${workdir}/root_hash.txt
+	fi
+
 	DESTDIR="${destdir}" PREFIX="${prefix}" "${shimv2_builder}"
 }
 
@@ -953,7 +990,7 @@ install_ovmf() {
 		&& return 0
 
 	DESTDIR="${destdir}" PREFIX="${prefix}" ovmf_build="${ovmf_type}" "${ovmf_builder}"
-	tar xvf "${builddir}/${tarball_name}" -C "${destdir}"
+	tar --zstd -xvf "${builddir}/${tarball_name}" -C "${destdir}"
 }
 
 # Install OVMF SEV
@@ -996,7 +1033,7 @@ install_agent() {
 	export GPERF_URL="$(get_from_kata_deps ".externals.gperf.url")"
 
 	info "build static agent"
-	DESTDIR="${destdir}" AGENT_POLICY="${AGENT_POLICY}" PULL_TYPE=${PULL_TYPE} "${agent_builder}"
+	DESTDIR="${destdir}" AGENT_POLICY="${AGENT_POLICY}" "${agent_builder}"
 }
 
 install_coco_guest_components() {
@@ -1118,6 +1155,7 @@ install_tools_helper() {
 	fi
 
 	if [[ "${tool}" == "agent-ctl" ]]; then
+		artefact_tag="$(git log -1 --pretty=format:"%H" ${repo_root_dir})"
 		defaults_path="${destdir}/opt/kata/share/defaults/kata-containers/agent-ctl"
 		mkdir -p "${defaults_path}"
 		install -D --mode 0644 ${repo_root_dir}/src/tools/${tool}/template/oci_config.json "${defaults_path}/oci_config.json"
@@ -1172,7 +1210,7 @@ handle_build() {
 	local build_target
 	build_target="$1"
 
-	export final_tarball_path="${workdir}/kata-static-${build_target}.tar.xz"
+	export final_tarball_path="${workdir}/kata-static-${build_target}.tar.zst"
 	export final_tarball_name="$(basename ${final_tarball_path})"
 	rm -f ${final_tarball_name}
 
@@ -1267,13 +1305,13 @@ handle_build() {
 
 	rootfs-initrd-confidential) install_initrd_confidential ;;
 
-	rootfs-nvidia-gpu-image) install_image_nvidia_gpu ;;
+	rootfs-image-nvidia-gpu) install_image_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-initrd) install_initrd_nvidia_gpu ;;
+	rootfs-initrd-nvidia-gpu) install_initrd_nvidia_gpu ;;
 
-	rootfs-nvidia-gpu-confidential-image) install_image_nvidia_gpu_confidential ;;
+	rootfs-image-nvidia-gpu-confidential) install_image_nvidia_gpu_confidential ;;
 
-	rootfs-nvidia-gpu-confidential-initrd) install_initrd_nvidia_gpu_confidential ;;
+	rootfs-initrd-nvidia-gpu-confidential) install_initrd_nvidia_gpu_confidential ;;
 
 	runk) install_runk ;;
 
@@ -1284,7 +1322,7 @@ handle_build() {
 	virtiofsd) install_virtiofsd ;;
 
 	dummy)
-		tar cvfJ ${final_tarball_path} --files-from /dev/null
+		tar --zstd -cvf ${final_tarball_path} --files-from /dev/null
 	       	;;
 
 	*)
@@ -1294,57 +1332,47 @@ handle_build() {
 
 	if [ ! -f "${final_tarball_path}" ]; then
 		cd "${destdir}"
-		tar cvfJ "${final_tarball_path}" "."
+		tar --zstd -cvf "${final_tarball_path}" "."
 	fi
-	tar tvf "${final_tarball_path}"
+	tar --zstd -tvf "${final_tarball_path}"
 
 	case ${build_target} in
 		kernel-nvidia-gpu*)
-			local kernel_headers_final_tarball_path="${workdir}/kata-static-${build_target}-headers.tar.xz"
+			local kernel_headers_final_tarball_path="${workdir}/kata-static-${build_target}-headers.tar.zst"
 			if [ ! -f "${kernel_headers_final_tarball_path}" ]; then
 				local kernel_headers_dir
 				kernel_headers_dir=$(get_kernel_headers_dir "${build_target}")
 
 				pushd "${kernel_headers_dir}"
-				find . -type f -name "*.${KERNEL_HEADERS_PKG_TYPE}" -exec tar rvf kernel-headers.tar {} +
+				find . -type f -name "*.${KERNEL_HEADERS_PKG_TYPE}" -exec tar -rvf kernel-headers.tar {} +
 				if [ -n "${KBUILD_SIGN_PIN}" ]; then
 					head -n1 kata-linux-*/certs/signing_key.pem | grep -q "ENCRYPTED PRIVATE KEY" || die "signing_key.pem is not encrypted"
 					mv kata-linux-*/certs/signing_key.pem .
 					mv kata-linux-*/certs/signing_key.x509 .
 					tar -rvf kernel-headers.tar signing_key.pem signing_key.x509 --remove-files
 				fi
-				xz -T0 kernel-headers.tar
-				mv kernel-headers.tar.xz "${kernel_headers_final_tarball_path}"
+				zstd -T0 kernel-headers.tar -o kernel-headers.tar.zst
+				mv kernel-headers.tar.zst "${kernel_headers_final_tarball_path}"
 				popd
 			fi
-			tar tvf "${kernel_headers_final_tarball_path}"
-			;;& # fallthrough in the confidential case we need the modules.tar.xz and for every kernel-nvidia-gpu we need the headers
+			tar --zstd -tvf "${kernel_headers_final_tarball_path}"
+			;;& # fallthrough in the confidential case we need the modules.tar.zst and for every kernel-nvidia-gpu we need the headers
 
 		kernel*-confidential)
-			local modules_final_tarball_path="${workdir}/kata-static-${build_target}-modules.tar.xz"
+			local modules_final_tarball_path="${workdir}/kata-static-${build_target}-modules.tar.zst"
 			if [ ! -f "${modules_final_tarball_path}" ]; then
 				local modules_dir=$(get_kernel_modules_dir ${kernel_version} ${kernel_kata_config_version} ${build_target})
 
 				pushd "${modules_dir}"
 				rm -f build
-				tar cvfJ "${modules_final_tarball_path}" "."
+				tar --zstd -cvf "${modules_final_tarball_path}" "."
 				popd
 			fi
-			tar tvf "${modules_final_tarball_path}"
+			tar --zstd -tvf "${modules_final_tarball_path}"
 			;;
 		shim-v2)
 			if [ "${MEASURED_ROOTFS}" = "yes" ]; then
-				local image_conf_tarball="${workdir}/kata-static-rootfs-image-confidential.tar.xz"
-				if [ ! -f "${image_conf_tarball}" ]; then
-					die "Building the shim-v2 with MEASURED_ROOTFS support requires a rootfs confidential image tarball"
-				fi
-
-				local root_hash_basedir="./opt/kata/share/kata-containers/"
-				if ! tar xvf ${image_conf_tarball} ${root_hash_basedir}root_hash.txt --transform s,${root_hash_basedir},,; then
-					die "Building the shim-v2 with MEASURED_ROOTFS support requres a rootfs confidential image tarball built with MEASURED_ROOTFS support"
-				fi
-
-				mv root_hash.txt ${workdir}/shim-v2-root_hash.txt
+				mv ${workdir}/root_hash.txt ${workdir}/shim-v2-root_hash.txt
 			fi
 			;;
 	esac
@@ -1398,18 +1426,18 @@ handle_build() {
 		case ${build_target} in
 			kernel-nvidia-gpu)
 				files_to_push+=(
-					"kata-static-${build_target}-headers.tar.xz"
+					"kata-static-${build_target}-headers.tar.zst"
 				)
 				;;
 			kernel-nvidia-gpu-confidential)
 				files_to_push+=(
-					"kata-static-${build_target}-modules.tar.xz"
-					"kata-static-${build_target}-headers.tar.xz"
+					"kata-static-${build_target}-modules.tar.zst"
+					"kata-static-${build_target}-headers.tar.zst"
 				)
 				;;
 			kernel*-confidential)
 				files_to_push+=(
-					"kata-static-${build_target}-modules.tar.xz"
+					"kata-static-${build_target}-modules.tar.zst"
 				)
 				;;
 			shim-v2)

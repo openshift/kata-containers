@@ -5,21 +5,22 @@ members = ["rustjail", "policy", "vsock-exporter"]
 authors = ["The Kata Containers community <kata-dev@lists.katacontainers.io>"]
 edition = "2018"
 license = "Apache-2.0"
-rust-version = "1.80.0"
+rust-version = "1.85.1"
 
 [workspace.dependencies]
-oci-spec = { version = "0.6.8", features = ["runtime"] }
+oci-spec = { version = "0.8.1", features = ["runtime"] }
 lazy_static = "1.3.0"
 ttrpc = { version = "0.8.4", features = ["async"], default-features = false }
-protobuf = "=3.7.1"
+protobuf = "3.7.2"
 libc = "0.2.94"
-nix = "0.24.2"
+# Notes: nix needs to stay in sync with libs
+nix = "0.26.4"
 capctl = "0.2.0"
 scan_fmt = "0.2.6"
 scopeguard = "1.0.0"
 thiserror = "1.0.26"
 regex = "1.10.5"
-serial_test = "0.5.1"
+serial_test = "0.10.0"
 url = "2.5.0"
 derivative = "2.2.0"
 const_format = "0.2.30"
@@ -30,7 +31,7 @@ async-recursion = "0.3.2"
 futures = "0.3.30"
 
 # Async runtime
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.46.1", features = ["full"] }
 tokio-vsock = "0.3.4"
 
 netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
@@ -49,15 +50,15 @@ slog-stdlog = "4.0.0"
 log = "0.4.11"
 
 cfg-if = "1.0.0"
-prometheus = { version = "0.13.0", features = ["process"] }
+prometheus = { version = "0.14.0", features = ["process"] }
 procfs = "0.12.0"
 
 anyhow = "1"
 
-cgroups = { package = "cgroups-rs", version = "0.3.3" }
+cgroups = { package = "cgroups-rs", git = "https://github.com/kata-containers/cgroups-rs", rev = "v0.3.5" }
 
 # Tracing
-tracing = "0.1.26"
+tracing = "0.1.41"
 tracing-subscriber = "0.2.18"
 tracing-opentelemetry = "0.13.0"
 opentelemetry = { version = "0.14.0", features = ["rt-tokio-current-thread"] }
@@ -66,7 +67,7 @@ opentelemetry = { version = "0.14.0", features = ["rt-tokio-current-thread"] }
 serde = { version = "1.0.129", features = ["derive"] }
 serde_json = "1.0.39"
 toml = "0.5.8"
-clap = { version = "3.0.1", features = ["derive"] }
+clap = { version = "4.5.40", features = ["derive"] }
 strum = "0.26.2"
 strum_macros = "0.26.2"
 
@@ -80,7 +81,7 @@ kata-agent-policy = { path = "policy" }
 rustjail = { path = "rustjail" }
 vsock-exporter = { path = "vsock-exporter" }
 
-mem-agent = { path = "../mem-agent" }
+mem-agent = { path = "../mem-agent", package = "mem-agent-lib" }
 
 kata-sys-util = { path = "../libs/kata-sys-util" }
 kata-types = { path = "../libs/kata-types" }
@@ -162,11 +163,8 @@ clap.workspace = true
 strum.workspace = true
 strum_macros.workspace = true
 
-# Image pull/decrypt
-image-rs = { git = "https://github.com/confidential-containers/guest-components", rev = "0a06ef241190780840fbb0542e51b198f1f72b0b", default-features = false, optional = true }
-
 # Agent Policy
-cdi = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "fba5677a8e7cc962fc6e495fcec98d7d765e332a" }
+cdi = { git = "https://github.com/cncf-tags/container-device-interface-rs", rev = "3b1e83dda5efcc83c7a4f134466ec006b37109c9" }
 
 # Local dependencies
 kata-agent-policy = { workspace = true, optional = true }
@@ -202,12 +200,9 @@ test-utils.workspace = true
 lto = true
 
 [features]
-# The default-pull feature supports all sharing images by virtio-fs, for guest-pull build with the guest-pull feature
-default-pull = []
 seccomp = ["rustjail/seccomp"]
 standard-oci-runtime = ["rustjail/standard-oci-runtime"]
 agent-policy = ["kata-agent-policy"]
-guest-pull = ["image-rs/kata-cc-rustls-tls"]
 
 [[bin]]
 name = "kata-agent"

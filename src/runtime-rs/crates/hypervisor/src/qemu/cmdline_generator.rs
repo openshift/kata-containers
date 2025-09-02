@@ -4,12 +4,15 @@
 //
 
 use crate::device::topology::{PCIePortBusPrefix, TopologyPortDevice, DEFAULT_PCIE_ROOT_BUS};
-use crate::utils::{clear_cloexec, create_vhost_net_fds, open_named_tuntap};
+use crate::utils::{clear_cloexec, create_vhost_net_fds, open_named_tuntap, SocketAddress};
+
 use crate::{kernel_param::KernelParams, Address, HypervisorConfig};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_types::config::hypervisor::VIRTIO_SCSI;
+use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs::{read_to_string, File};
@@ -622,6 +625,7 @@ struct MemoryBackendFile {
     size: u64,
     share: bool,
     readonly: bool,
+    prealloc: bool,
 }
 
 impl MemoryBackendFile {
@@ -632,6 +636,7 @@ impl MemoryBackendFile {
             size,
             share: false,
             readonly: false,
+            prealloc: false,
         }
     }
 
@@ -642,6 +647,11 @@ impl MemoryBackendFile {
 
     fn set_readonly(&mut self, readonly: bool) -> &mut Self {
         self.readonly = readonly;
+        self
+    }
+
+    fn set_prealloc(&mut self, prealloc: bool) -> &mut Self {
+        self.prealloc = prealloc;
         self
     }
 }
@@ -655,6 +665,10 @@ impl ToQemuParams for MemoryBackendFile {
         params.push(format!("mem-path={}", self.mem_path));
         params.push(format!("size={}", format_memory(self.size)));
         params.push(format!("share={}", if self.share { "on" } else { "off" }));
+        params.push(format!(
+            "prealloc={}",
+            if self.prealloc { "on" } else { "off" }
+        ));
         params.push(format!(
             "readonly={}",
             if self.readonly { "on" } else { "off" }
@@ -1784,17 +1798,18 @@ struct ObjectSevSnpGuest {
     cbitpos: u32,
     reduced_phys_bits: u32,
     kernel_hashes: bool,
-
+    host_data: Option<String>,
     is_snp: bool,
 }
 
 impl ObjectSevSnpGuest {
-    fn new(is_snp: bool, cbitpos: u32) -> Self {
+    fn new(is_snp: bool, cbitpos: u32, host_data: Option<String>) -> Self {
         ObjectSevSnpGuest {
             id: (if is_snp { "snp" } else { "sev" }).to_owned(),
             cbitpos,
             reduced_phys_bits: 1,
             kernel_hashes: true,
+            host_data,
             is_snp,
         }
     }
@@ -1820,8 +1835,92 @@ impl ToQemuParams for ObjectSevSnpGuest {
                 "kernel-hashes={}",
                 if self.kernel_hashes { "on" } else { "off" }
             ));
+            if let Some(host_data) = &self.host_data {
+                params.push(format!("host-data={}", host_data))
+            }
         }
         Ok(vec!["-object".to_owned(), params.join(",")])
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ObjectTdxGuest {
+    // QOM Object type
+    qom_type: String,
+
+    // unique ID
+    id: String,
+
+    // The sept-ve-disable option prevents EPT violation conversions to #VE on guest TD
+    // accesses of PENDING pages, which is essential for certain guest OS compatibility,
+    // like Linux TD guests.
+    sept_ve_disable: bool,
+
+    // Base64 encoded 48 bytes of data (e.g., a sha384 digest).
+    // ID for non-owner-defined configuration of the guest TD, which identifies the guest TD's run-time/OS configuration via a SHA384 digest.
+    // Defaults to zero if unspecified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mrconfigid: Option<String>,
+
+    // Base64 encoded 48 bytes of data (e.g., a sha384 digest). ID for the guest TD's owner.
+    // Defaults to all zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mrowner: Option<String>,
+
+    // Base64 encoded 48 bytes of data (e.g., a sha384 digest).
+    // ID for owner-defined configuration of the guest TD, e.g., specific to the workload rather than the run-time or OS.
+    // Defaults to all zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mrownerconfig: Option<String>,
+
+    // Quote generation socket.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_generation_socket: Option<SocketAddress>,
+
+    // Debug mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    debug: Option<bool>,
+}
+
+impl std::fmt::Display for ObjectTdxGuest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        serde_json::to_string(self)
+            .map_err(|_| std::fmt::Error)
+            .and_then(|s| write!(f, "{}", s))
+    }
+}
+
+#[allow(clippy::doc_lazy_continuation)]
+/// 1. Add property "quote-generation-socket" to tdx-guest
+/// https://lore.kernel.org/qemu-devel/Zv7dtghi20DZ9ozz@redhat.com/
+/// 2. Support user configurable mrconfigid/mrowner/mrownerconfig
+/// https://patchew.org/QEMU/20241105062408.3533704-1-xiaoyao.li@intel.com/20241105062408.3533704-15-xiaoyao.li@intel.com/
+/// 3. Add command line and validation for TDX type
+/// https://lists.libvirt.org/archives/list/devel@lists.libvirt.org/message/6N7KP5F5Z44NI3R5U7STSPWUYXK6QYUO/
+/// Example:
+/// -object { "qom-type": "tdx-guest","id": "tdx", "mrconfigid": "mrconfigid2", "debug":true,"sept-ve-disable":true, \
+/// "quote-generation-socket": { "type": "vsock","cid": "2","port": "4050" }}
+impl ObjectTdxGuest {
+    pub fn new(id: &str, mrconfigid: Option<String>, qgs_port: u32, debug: bool) -> Self {
+        let qgs_socket = SocketAddress::new(qgs_port);
+        Self {
+            qom_type: "tdx-guest".to_owned(),
+            id: id.to_owned(),
+            mrconfigid,
+            mrowner: None,
+            mrownerconfig: None,
+            sept_ve_disable: true,
+            quote_generation_socket: Some(qgs_socket),
+            debug: if debug { Some(debug) } else { None },
+        }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for ObjectTdxGuest {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec!["-object".to_owned(), self.to_string()])
     }
 }
 
@@ -2083,6 +2182,14 @@ impl<'a> QemuCmdLine<'a> {
             qemu_cmd_line.add_virtio_balloon();
         }
 
+        if let Some(seccomp_sandbox) = &config
+            .security_info
+            .seccomp_sandbox
+            .as_ref()
+            .filter(|s| !s.is_empty())
+        {
+            qemu_cmd_line.add_seccomp_sandbox(seccomp_sandbox);
+        }
         Ok(qemu_cmd_line)
     }
 
@@ -2176,6 +2283,10 @@ impl<'a> QemuCmdLine<'a> {
         let mut mem_file =
             MemoryBackendFile::new("entire-guest-memory-share", "/dev/shm", self.memory.size);
         mem_file.set_share(true);
+
+        if self.config.memory_info.enable_mem_prealloc {
+            mem_file.set_prealloc(true);
+        }
 
         // don't put the /dev/shm memory backend file into the anonymous container,
         // there has to be at most one of those so keep it by name in Memory instead
@@ -2299,6 +2410,10 @@ impl<'a> QemuCmdLine<'a> {
         console_socket_chardev.set_server(true);
         console_socket_chardev.set_wait(false);
         self.devices.push(Box::new(console_socket_chardev));
+
+        self.kernel
+            .params
+            .append(&mut KernelParams::from_string("console=hvc0"));
     }
 
     pub fn add_virtio_balloon(&mut self) {
@@ -2331,7 +2446,7 @@ impl<'a> QemuCmdLine<'a> {
     }
 
     pub fn add_sev_protection_device(&mut self, cbitpos: u32, firmware: &str) {
-        let sev_object = ObjectSevSnpGuest::new(false, cbitpos);
+        let sev_object = ObjectSevSnpGuest::new(true, cbitpos, None);
         self.devices.push(Box::new(sev_object));
 
         self.devices.push(Box::new(Bios::new(firmware.to_owned())));
@@ -2341,8 +2456,13 @@ impl<'a> QemuCmdLine<'a> {
             .set_nvdimm(false);
     }
 
-    pub fn add_sev_snp_protection_device(&mut self, cbitpos: u32, firmware: &str) {
-        let sev_snp_object = ObjectSevSnpGuest::new(true, cbitpos);
+    pub fn add_sev_snp_protection_device(
+        &mut self,
+        cbitpos: u32,
+        firmware: &str,
+        host_data: &Option<String>,
+    ) {
+        let sev_snp_object = ObjectSevSnpGuest::new(true, cbitpos, host_data.clone());
         self.devices.push(Box::new(sev_snp_object));
 
         self.devices.push(Box::new(Bios::new(firmware.to_owned())));
@@ -2352,6 +2472,23 @@ impl<'a> QemuCmdLine<'a> {
             .set_nvdimm(false);
 
         self.cpu.set_type("EPYC-v4");
+    }
+
+    pub fn add_tdx_protection_device(
+        &mut self,
+        id: &str,
+        firmware: &str,
+        qgs_port: u32,
+        mrconfigid: &Option<String>,
+        debug: bool,
+    ) {
+        let tdx_object = ObjectTdxGuest::new(id, mrconfigid.clone(), qgs_port, debug);
+        self.devices.push(Box::new(tdx_object));
+        self.devices.push(Box::new(Bios::new(firmware.to_owned())));
+
+        self.machine
+            .set_confidential_guest_support("tdx")
+            .set_nvdimm(false);
     }
 
     /// Note: add_pcie_root_port and add_pcie_switch_port follow kata-runtime's related implementations of vfio devices.
@@ -2495,6 +2632,11 @@ impl<'a> QemuCmdLine<'a> {
         Ok(())
     }
 
+    pub fn add_seccomp_sandbox(&mut self, param: &str) {
+        let seccomp_sandbox = SeccompSandbox::new(param);
+        self.devices.push(Box::new(seccomp_sandbox));
+    }
+
     pub async fn build(&self) -> Result<Vec<String>> {
         let mut result = Vec::new();
 
@@ -2579,5 +2721,25 @@ impl ToQemuParams for DeviceVirtioBalloon {
             "-device".to_owned(),
             "virtio-balloon,free-page-reporting=on".to_owned(),
         ])
+    }
+}
+
+#[derive(Debug)]
+struct SeccompSandbox {
+    param: String,
+}
+
+impl SeccompSandbox {
+    fn new(param: &str) -> Self {
+        SeccompSandbox {
+            param: param.to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for SeccompSandbox {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec!["-sandbox".to_owned(), self.param.clone()])
     }
 }
