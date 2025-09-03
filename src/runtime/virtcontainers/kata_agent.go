@@ -877,10 +877,10 @@ func setupStorages(ctx context.Context, sandbox *Sandbox) []*grpc.Storage {
 		if sharedFS == config.VirtioFS || sharedFS == config.VirtioFSNydus {
 			// If virtio-fs uses either of the two cache options 'auto, always',
 			// the guest directory can be mounted with option 'dax' allowing it to
-			// directly map contents from the host. When set to 'never', the mount
+			// directly map contents from the host. Otherwise, the mount
 			// options should not contain 'dax' lest the virtio-fs daemon crashing
 			// with an invalid address reference.
-			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeNever {
+			if sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeNever && sandbox.config.HypervisorConfig.VirtioFSCache != typeVirtioFSCacheModeMetadata {
 				// If virtio_fs_cache_size = 0, dax should not be used.
 				if sandbox.config.HypervisorConfig.VirtioFSCacheSize != 0 {
 					sharedDirVirtioFSOptions = append(sharedDirVirtioFSOptions, sharedDirVirtioFSDaxOptions)
@@ -2703,9 +2703,13 @@ func IsNydusRootFSType(s string) bool {
 	return strings.HasPrefix(path.Base(s), "nydus-overlayfs")
 }
 
-// HasErofsOptions checks if any of the options contain io.containerd.snapshotter.v1.erofs path
-func HasErofsOptions(options []string) bool {
-	for _, opt := range options {
+// IsErofsRootFS checks if any of the options contain io.containerd.snapshotter.v1.erofs path
+func IsErofsRootFS(root RootFs) bool {
+	// TODO: support containerd mount manager: https://github.com/containerd/containerd/issues/11303
+	if root.Type != "overlay" {
+		return false
+	}
+	for _, opt := range root.Options {
 		if strings.Contains(opt, "io.containerd.snapshotter.v1.erofs") {
 			return true
 		}
@@ -2713,21 +2717,15 @@ func HasErofsOptions(options []string) bool {
 	return false
 }
 
-func parseRootFsOptions(options []string) []string {
+func parseErofsRootFsOptions(options []string) []string {
 	lowerdirs := []string{}
 
 	for _, opt := range options {
 		if strings.HasPrefix(opt, "lowerdir=") {
 			lowerdirValue := strings.TrimPrefix(opt, "lowerdir=")
 
-			paths := strings.Split(lowerdirValue, ":")
-
-			for _, path := range paths {
-				path = strings.TrimSuffix(path, "/fs")
-				lowerdirs = append(lowerdirs, path)
-			}
+			lowerdirs = append(lowerdirs, strings.Split(lowerdirValue, ":")...)
 		}
 	}
-
 	return lowerdirs
 }

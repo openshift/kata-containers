@@ -17,7 +17,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 bitflags = "2.9.0"
 byte-unit = "5.1.6"
-cgroups-rs = "0.3.2"
+cgroups-rs = { version = "0.4.0", features = ["oci"] }
 futures = "0.3.11"
 lazy_static = { workspace = true }
 libc = { workspace = true }
@@ -33,6 +33,11 @@ tokio = { workspace = true, features = ["process"] }
 tracing = { workspace = true }
 uuid = { version = "0.4", features = ["v4"] }
 oci-spec = { workspace = true }
+inotify = "0.11.0"
+walkdir = "2.5.0"
+flate2 = { version = "1.0", features = ["zlib"] }
+tempfile = "3.19.1"
+hex = "0.4"
 
 ## Dependencies from `rust-netlink`
 netlink-packet-route = "0.22"

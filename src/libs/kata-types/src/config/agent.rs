@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use serde::{Deserialize, Deserializer};
 use std::io::Result;
 
 use crate::config::{ConfigOps, TomlConfig};
@@ -112,7 +113,14 @@ pub struct Agent {
     pub reconnect_timeout_ms: u32,
 
     /// Agent request timeout value in millisecond
-    #[serde(default = "default_request_timeout")]
+    /// This timeout value is used to set the maximum duration for the agent to process a CreateContainerRequest.
+    /// It's also used to ensure that workloads, especially those involving large image pulls within the guest,
+    /// have sufficient time to complete.
+    #[serde(
+        default = "default_request_timeout",
+        rename = "create_container_timeout",
+        deserialize_with = "deserialize_secs_to_millis"
+    )]
     pub request_timeout_ms: u32,
 
     /// Agent health check request timeout value in millisecond
@@ -124,12 +132,12 @@ pub struct Agent {
     /// These modules will be loaded in the guest kernel using modprobe(8).
     /// The following example can be used to load two kernel modules with parameters:
     ///  - kernel_modules=["e1000e InterruptThrottleRate=3000,3000,3000 EEE=1", "i915 enable_ppgtt=0"]
-    /// The first word is considered as the module name and the rest as its parameters.
-    /// Container will not be started when:
+    ///    The first word is considered as the module name and the rest as its parameters.
+    ///    Container will not be started when:
     /// - A kernel module is specified and the modprobe command is not installed in the guest
     ///   or it fails loading the module.
     /// - The module is not available in the guest or it doesn't met the guest kernel
-    ///    requirements, like architecture and version.
+    ///   requirements, like architecture and version.
     #[serde(default)]
     pub kernel_modules: Vec<String>,
 
@@ -140,6 +148,15 @@ pub struct Agent {
     /// Memory agent configuration
     #[serde(default)]
     pub mem_agent: MemAgent,
+}
+
+fn deserialize_secs_to_millis<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let secs = u32::deserialize(deserializer)?;
+
+    Ok(secs.saturating_mul(1000))
 }
 
 impl std::default::Default for Agent {

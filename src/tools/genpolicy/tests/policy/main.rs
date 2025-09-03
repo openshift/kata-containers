@@ -6,15 +6,14 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
-    use base64::prelude::*;
     use std::fmt::{self, Display};
     use std::fs::{self, File};
     use std::path;
     use std::str;
 
     use protocols::agent::{
-        CopyFileRequest, CreateContainerRequest, CreateSandboxRequest, ExecProcessRequest,
-        RemoveContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
+        AddARPNeighborsRequest, CopyFileRequest, CreateContainerRequest, CreateSandboxRequest,
+        ExecProcessRequest, RemoveContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
     };
     use serde::{Deserialize, Serialize};
 
@@ -32,6 +31,7 @@ mod tests {
         RemoveContainer(RemoveContainerRequest),
         UpdateInterface(UpdateInterfaceRequest),
         UpdateRoutes(UpdateRoutesRequest),
+        AddARPNeighbors(AddARPNeighborsRequest),
     }
 
     impl Display for TestRequest {
@@ -44,6 +44,7 @@ mod tests {
                 TestRequest::RemoveContainer(_) => write!(f, "RemoveContainerRequest"),
                 TestRequest::UpdateInterface(_) => write!(f, "UpdateInterfaceRequest"),
                 TestRequest::UpdateRoutes(_) => write!(f, "UpdateRoutesRequest"),
+                TestRequest::AddARPNeighbors(_) => write!(f, "AddARPNeighborsRequest"),
             }
         }
     }
@@ -63,17 +64,39 @@ mod tests {
     /// a JSON list of [TestCase] instances. Each instance will be of type enum TestRequest,
     /// with the tag `type` listing the exact type of request.
     async fn runtests(test_case_dir: &str) {
-        // Prepare temp dir for running genpolicy.
-        let (workdir, testdata_dir) = prepare_workdir(test_case_dir, &["pod.yaml"]);
+        // Check if config_map.yaml exists.
+        // If it does, we need to copy it to the workdir.
+        let is_config_map_file_present = path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/policy/testdata")
+            .join(test_case_dir)
+            .join("config_map.yaml")
+            .exists();
 
-        // Run the command and return the generated policy.
+        let files_to_copy = if is_config_map_file_present {
+            vec!["pod.yaml", "config_map.yaml"]
+        } else {
+            vec!["pod.yaml"]
+        };
+
+        // Prepare temp dir for running genpolicy.
+        let (workdir, testdata_dir) = prepare_workdir(test_case_dir, &files_to_copy);
+
+        let config_files = if is_config_map_file_present {
+            Some(vec![workdir
+                .join("config_map.yaml")
+                .to_str()
+                .unwrap()
+                .to_string()])
+        } else {
+            None
+        };
 
         let config = genpolicy::utils::Config {
             base64_out: false,
-            config_files: None,
+            config_files,
             containerd_socket_path: None, // Some(String::from("/var/run/containerd/containerd.sock")),
             insecure_registries: Vec::new(),
-            layers_cache_file_path: None,
+            layers_cache: genpolicy::layers_cache::ImageLayersCache::new(&None),
             raw_out: false,
             rego_rules_path: workdir.join("rules.rego").to_str().unwrap().to_string(),
             runtime_class_names: Vec::new(),
@@ -88,12 +111,12 @@ mod tests {
 
         // The container repos/network calls can be unreliable, so retry
         // a few times before giving up.
-        let mut policy = String::new();
+        let mut initdata_anno = String::new();
         for i in 0..6 {
-            policy = match genpolicy::policy::AgentPolicy::from_files(&config).await {
+            initdata_anno = match genpolicy::policy::AgentPolicy::from_files(&config).await {
                 Ok(policy) => {
                     assert_eq!(policy.resources.len(), 1);
-                    policy.resources[0].generate_policy(&policy)
+                    policy.resources[0].generate_initdata_anno(&policy)
                 }
                 Err(e) => {
                     if i == 5 {
@@ -107,7 +130,7 @@ mod tests {
             };
             break;
         }
-        let policy = BASE64_STANDARD.decode(&policy).unwrap();
+        let policy = decode_policy(&initdata_anno);
 
         // write policy to a file
         fs::write(workdir.join("policy.rego"), &policy).unwrap();
@@ -152,6 +175,15 @@ mod tests {
                 logs, results.1
             );
         }
+    }
+
+    fn decode_policy(initdata_anno: &str) -> String {
+        let initdata = kata_types::initdata::decode_initdata(initdata_anno)
+            .expect("should decode initdata anno");
+        initdata
+            .get_coco_data("policy.rego")
+            .expect("should read policy from initdata")
+            .to_string()
     }
 
     fn prepare_workdir(
@@ -219,6 +251,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_add_arp_neighbors() {
+        runtests("addarpneighbors").await;
+    }
+
+    #[tokio::test]
     async fn test_create_container_network_namespace() {
         runtests("createcontainer/network_namespace").await;
     }
@@ -231,6 +268,11 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_generate_name() {
         runtests("createcontainer/generate_name").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_gid() {
+        runtests("createcontainer/gid").await;
     }
 
     #[tokio::test]
@@ -254,7 +296,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_container_mounts() {
+    async fn test_create_container_volumes_empty_dir() {
         runtests("createcontainer/volumes/emptydir").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_volumes_config_map() {
+        runtests("createcontainer/volumes/config_map").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_volumes_container_image() {
+        runtests("createcontainer/volumes/container_image").await;
     }
 }

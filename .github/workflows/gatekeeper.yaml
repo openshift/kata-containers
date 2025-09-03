@@ -12,6 +12,8 @@ on:
       - reopened
       - labeled
 
+permissions: {}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
@@ -19,11 +21,17 @@ concurrency:
 jobs:
   gatekeeper:
     runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - id: gatekeeper
         env:
           TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}

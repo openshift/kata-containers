@@ -186,6 +186,9 @@ type SandboxConfig struct {
 	// Create container timeout which, if provided, indicates the create container timeout
 	// needed for the workload(s)
 	CreateContainerTimeout uint64
+
+	// ForceGuestPull enforces guest pull independent of snapshotter annotations.
+	ForceGuestPull bool
 }
 
 // valid checks that the sandbox configuration is valid.
@@ -446,6 +449,14 @@ func (s *Sandbox) IOStream(containerID, processID string) (io.WriteCloser, io.Re
 	}
 
 	return c.ioStream(processID)
+}
+
+// IsGuestPullEnforced returns true if guest pull is forced through the sandbox configuration.
+func (s *Sandbox) IsGuestPullForced() bool {
+	if s.config == nil {
+		return false
+	}
+	return s.config.ForceGuestPull
 }
 
 func createAssets(ctx context.Context, sandboxConfig *SandboxConfig) error {
@@ -2529,7 +2540,7 @@ func (s *Sandbox) resourceControllerDelete() error {
 		return nil
 	}
 
-	sandboxController, err := resCtrl.LoadResourceController(s.state.SandboxCgroupPath)
+	sandboxController, err := resCtrl.LoadResourceController(s.state.SandboxCgroupPath, s.config.SandboxCgroupOnly)
 	if err != nil {
 		return err
 	}
@@ -2544,7 +2555,7 @@ func (s *Sandbox) resourceControllerDelete() error {
 	}
 
 	if s.state.OverheadCgroupPath != "" {
-		overheadController, err := resCtrl.LoadResourceController(s.state.OverheadCgroupPath)
+		overheadController, err := resCtrl.LoadResourceController(s.state.OverheadCgroupPath, s.config.SandboxCgroupOnly)
 		if err != nil {
 			return err
 		}

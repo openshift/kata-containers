@@ -65,9 +65,10 @@ impl Hypervisor for CloudHypervisor {
         id: &str,
         netns: Option<String>,
         _annotations: &HashMap<String, String>,
+        selinux_label: Option<String>,
     ) -> Result<()> {
         let mut inner = self.inner.write().await;
-        inner.prepare_vm(id, netns).await
+        inner.prepare_vm(id, netns, selinux_label).await
     }
 
     async fn start_vm(&self, timeout: i32) -> Result<()> {
@@ -206,7 +207,7 @@ impl Hypervisor for CloudHypervisor {
 
     async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
         let inner = self.inner.read().await;
-        inner.resize_memory(new_mem_mb)
+        inner.resize_memory(new_mem_mb).await
     }
 
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)> {

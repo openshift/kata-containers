@@ -42,7 +42,9 @@ fn cap_vec2hashset(caps: Vec<String>) -> HashSet<oci::Capability> {
         .map(|cap: &String| {
             // cap might be JSON-encoded
             let decoded: &str = serde_json::from_str(cap).unwrap_or(cap);
-            decoded.strip_prefix("CAP_").unwrap_or(decoded)
+            decoded
+                .strip_prefix("CAP_")
+                .unwrap_or(decoded)
                 .parse::<oci::Capability>()
                 .unwrap_or_else(|_| panic!("Failed to parse {:?} to Enum Capability", cap))
         })
@@ -113,7 +115,7 @@ impl From<oci::PosixRlimit> for grpc::POSIXRlimit {
 impl From<oci::Process> for grpc::Process {
     fn from(from: oci::Process) -> Self {
         grpc::Process {
-            Terminal: from.terminal().map_or(false, |t| t),
+            Terminal: from.terminal().is_some_and(|t| t),
             ConsoleSize: from_option(from.console_size()),
             User: from_option(Some(from.user().clone())),
             Args: option_vec_to_vec(from.args()),
@@ -159,7 +161,7 @@ impl From<oci::LinuxMemory> for grpc::LinuxMemory {
             Kernel: from.kernel().map_or(0, |t| t),
             KernelTCP: from.kernel_tcp().map_or(0, |t| t),
             Swappiness: from.swappiness().map_or(0, |t| t),
-            DisableOOMKiller: from.disable_oom_killer().map_or(false, |t| t),
+            DisableOOMKiller: from.disable_oom_killer().is_some_and(|t| t),
             ..Default::default()
         }
     }
@@ -1318,8 +1320,6 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_cap_vec2hashset_bad() {
-        cap_vec2hashset(vec![
-            "CAP_DOES_NOT_EXIST".to_string(),
-        ]);
+        cap_vec2hashset(vec!["CAP_DOES_NOT_EXIST".to_string()]);
     }
 }

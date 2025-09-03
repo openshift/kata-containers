@@ -20,8 +20,6 @@ source "${cidir}/common.bash"
 # set GO111MODULE to "auto" to enable module-aware mode only when
 # a go.mod file is present in the current directory.
 export GO111MODULE="auto"
-export test_path="${test_path:-github.com/kata-containers/kata-containers/tests}"
-export test_dir="${GOPATH}/src/${test_path}"
 
 # List of files to delete on exit
 files_to_remove=()
@@ -125,7 +123,7 @@ usage()
 	cat <<EOF
 
 Usage: $script_name help
-       $script_name [options] repo-name [true]
+       $script_name [options] [repo-name] [true]
 
 Options:
 
@@ -175,7 +173,7 @@ Examples:
 
 - Auto-detect repository and run golang tests for current repository:
 
-  $ KATA_DEV_MODE=true $script_name --golang
+  $ $script_name --golang
 
 - Run all tests on the kata-containers repository, forcing the tests to
   consider all files, not just those changed by a PR branch:
@@ -782,6 +780,7 @@ static_check_docs()
 
 	exclude_doc_regexs+=(^CODE_OF_CONDUCT\.md$)
 	exclude_doc_regexs+=(^CONTRIBUTING\.md$)
+	exclude_doc_regexs+=(^SECURITY\.md$)
 
 	# Magic github template files
 	exclude_doc_regexs+=(^\.github/.*\.md$)
@@ -1231,10 +1230,7 @@ has_hadolint_or_install()
 	local linter_dest="${GOPATH}/bin/hadolint"
 
 	local has_linter=$(command -v "$linter_cmd")
-	if [[ -z "$has_linter" && "$KATA_DEV_MODE" == "yes" ]]; then
-		# Do not install if it is in development mode.
-		die "$linter_cmd command not found. You must have the version $linter_version installed to run this check."
-	elif [ -n "$has_linter" ]; then
+	if [ -n "$has_linter" ]; then
 		# Check if the expected linter version
 		if $linter_cmd --version | grep -v "$linter_version" &>/dev/null; then
 			warn "$linter_cmd command found but not the required version $linter_version"
@@ -1360,6 +1356,38 @@ static_check_dockerfiles()
 		[ "$ret" -eq 0 ] || die "failed to check Dockerfile '$file'"
 	done
 	popd
+}
+
+static_check_rego()
+{
+	local rego_files
+	rego_files=$(git ls-files | grep -E '.*\.rego$')
+
+	interpreters=("opa" "regorus")
+	for interpreter in "${interpreters[@]}"
+	do
+		if ! command -v "${interpreter}" &>/dev/null; then
+			die "Required rego interpreter '${interpreter}' not found in PATH"
+		fi
+	done
+
+	found_unparsable=0
+	for file in ${rego_files}
+	do
+		for interpreter in "${interpreters[@]}"
+			do
+			if ! ${interpreter} parse "${file}" > /dev/null; then
+				info "Failed to parse Rego file '${file}' with ${interpreter}"
+				found_unparsable=1
+			else
+				info "Successfully parsed Rego file '${file}' with ${interpreter}"
+			fi
+		done
+	done
+
+	if [[ ${found_unparsable} -ne 0 ]]; then
+		die "Unparsable rego files found"
+	fi
 }
 
 # Run the specified function (after first checking it is compatible with the
@@ -1505,6 +1533,7 @@ main()
 			--list) list_only="true" ;;
 			--no-arch) handle_funcs="arch-agnostic" ;;
 			--only-arch) handle_funcs="arch-specific" ;;
+			--rego) func=static_check_rego ;;
 			--repo) repo="$2"; shift ;;
 			--scripts) func=static_check_shell ;;
 			--vendor) func=static_check_vendor;;
@@ -1527,21 +1556,16 @@ main()
 
 	if [ -z "$repo" ]
 	then
-		if [ -n "$KATA_DEV_MODE" ]
-		then
-			# No repo param provided so assume it's the current
-			# one to avoid developers having to specify one now
-			# (backwards compatability).
-			repo=$(git config --get remote.origin.url |\
-				sed 's!https://!!g' || true)
-
-			info "Auto-detected repo as $repo"
-		else
-			if [ "$list_only" != "true" ]; then
-				echo >&2 "ERROR: need repo" && usage && exit 1
-			fi
-		fi
+		# No repo param provided so assume it's the current
+		# one to avoid developers having to specify one now
+		# (backwards compatability).
+		repo=$(git config --get remote.origin.url |\
+			sed 's!https://!!g' || true)
+		info "Auto-detected repo as $repo"
 	fi
+
+	test_path="${test_path:-"${repo}/tests"}"
+	test_dir="${GOPATH}/src/${test_path}"
 
 	repo_path=$GOPATH/src/$repo
 

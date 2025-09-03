@@ -310,7 +310,7 @@ impl MemDeviceMgr {
     pub fn remove_devices(&self, ctx: &mut DeviceOpContext) -> Result<(), DeviceMgrError> {
         for info in self.info_list.iter() {
             if let Some(device) = &info.device {
-                DeviceManager::destroy_mmio_virtio_device(device.clone(), ctx)?;
+                DeviceManager::destroy_mmio_device(device.clone(), ctx)?;
             }
         }
 
@@ -325,7 +325,7 @@ impl MemDeviceMgr {
         let device = self.info_list[index]
             .device
             .as_ref()
-            .ok_or_else(|| MemDeviceError::DeviceNotExist)?;
+            .ok_or(MemDeviceError::DeviceNotExist)?;
         if let Some(mmio_dev) = device.as_any().downcast_ref::<DbsMmioV2Device>() {
             let guard = mmio_dev.state();
             let inner_dev = guard.get_inner_device();
