@@ -15,6 +15,7 @@ readonly SCRIPT_DIR="${script_dir}/nvidia"
 # This will control how much output the inird/image will produce
 DEBUG=""
 KBUILD_SIGN_PIN=${KBUILD_SIGN_PIN:-}
+AGENT_POLICY="${AGENT_POLICY:-no}"
 
 NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:?NVIDIA_GPU_STACK must be set}
 VARIANT=${VARIANT:?VARIANT must be set}
@@ -48,38 +49,10 @@ setup_nvidia-nvrc() {
 
 	pushd "${PROJECT}" > /dev/null || exit 1
 
-	cargo build --release --target="${machine_arch}"-unknown-linux-gnu
-	cp target/"${machine_arch}"-unknown-linux-gnu/release/NVRC ../../destdir/bin/.
+	cargo build --release --target="${machine_arch}"-unknown-linux-musl
+	cp target/"${machine_arch}"-unknown-linux-musl/release/NVRC ../../destdir/bin/.
 
 	popd > /dev/null || exit 1
-
-	tar cvfa "${TARBALL}" -C ../destdir .
-	tar tvf  "${TARBALL}"
-
-	popd > /dev/null || exit 1
-}
-
-setup_nvidia-gpu-admin-tools() {
-	local TARGET="nvidia-gpu-admin-tools"
-	local TARGET_VERSION="v2024.12.06"
-	local TARGET_GIT="https://github.com/NVIDIA/gpu-admin-tools"
-	local TARGET_BUILD_DIR="${BUILD_DIR}/${TARGET}/builddir"
-	local TARGET_DEST_DIR="${BUILD_DIR}/${TARGET}/destdir"
-	local TARBALL="${BUILD_DIR}/kata-static-${TARGET}.tar.zst"
-
-	mkdir -p "${TARGET_BUILD_DIR}"
-	mkdir -p "${TARGET_DEST_DIR}/sbin"
-
-	pushd "${TARGET_BUILD_DIR}" > /dev/null || exit 1
-
-	rm -rf "$(basename "${TARGET_GIT}")"
-	git clone "${TARGET_GIT}"
-
-	rm -rf dist
-	# Installed via pipx local python environment
-	/usr/local/bin/pyinstaller -s -F gpu-admin-tools/nvidia_gpu_tools.py
-
-	cp dist/nvidia_gpu_tools ../destdir/sbin/.
 
 	tar cvfa "${TARBALL}" -C ../destdir .
 	tar tvf  "${TARBALL}"
@@ -130,7 +103,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 
 	info "nvidia: Setup GPU rootfs type=${rootfs_type}"
 
-	for component in "nvidia-gpu-admin-tools" "nvidia-dcgm-exporter" "nvidia-nvrc"; do
+	for component in "nvidia-dcgm-exporter" "nvidia-nvrc"; do
 		if [[ ! -e "${BUILD_DIR}/kata-static-${component}.tar.zst" ]]; then
 			setup_"${component}"
 		fi
@@ -227,9 +200,6 @@ chisseled_compute() {
 	echo "nvidia: chisseling GPU"
 
 	cp -a "${stage_one}"/nvidia_driver_version .
-
-	tar xvf "${BUILD_DIR}"/kata-static-nvidia-gpu-admin-tools.tar.zst -C .
-
 	cp -a "${stage_one}"/lib/modules/* lib/modules/.
 
 	libdir="lib/${machine_arch}-linux-gnu"
@@ -281,7 +251,9 @@ chisseled_init() {
 	ln -sf  /bin/NVRC sbin/init
 
 	cp -a "${stage_one}"/usr/bin/kata-agent   usr/bin/.
-	cp -a "${stage_one}"/etc/kata-opa         etc/.
+	if [[ "${AGENT_POLICY}" == "yes" ]]; then
+		cp -a "${stage_one}"/etc/kata-opa etc/.
+	fi
 	cp -a "${stage_one}"/etc/resolv.conf      etc/.
 	cp -a "${stage_one}"/supported-gpu.devids .
 

@@ -16,7 +16,7 @@ env_logger = "0.10.0"
 log = "0.4.17"
 
 # Command line parsing.
-clap = { version = "4.1.8", features = ["derive"] }
+clap = { version = "4.5.40", features = ["derive"] }
 
 # YAML file serialization/deserialization.
 base64 = "0.21.0"
@@ -52,7 +52,7 @@ serde-transcode = "1.1.1"
 tokio = { version = "1.38.0", features = ["rt-multi-thread"] }
 
 # OCI container specs.
-oci-spec = { version = "0.6.8", features = ["runtime"] }
+oci-spec = { version = "0.8.1", features = ["runtime"] }
 
 # Kata Agent protocol.
 protocols = { path = "../../libs/protocols", features = ["with-serde"] }
@@ -63,7 +63,7 @@ generic-array = "0.14.6"
 sha2 = "0.10.6"
 tarindex = { git = "https://github.com/kata-containers/tardev-snapshotter", rev = "06183a5" }
 tempfile = "3.19.1"
-zerocopy = "0.6.1"
+zerocopy = "0.6.6"
 fs2 = "0.4.3"
 
 # containerd image pull support

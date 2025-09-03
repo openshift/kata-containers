@@ -260,7 +260,7 @@ github.com/davecgh/go-spew/spew
 # github.com/distribution/reference v0.6.0
 ## explicit; go 1.20
 github.com/distribution/reference
-# github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c
+# github.com/docker/go-events v0.0.0-20250808211157-605354379745
 ## explicit
 github.com/docker/go-events
 # github.com/docker/go-units v0.5.0
@@ -616,8 +616,8 @@ golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# google.golang.org/genproto v0.0.0-20250818200422-3122310a409c
-## explicit; go 1.23.0
+# google.golang.org/genproto v0.0.0-20250826171959-ef028d996bc1
+## explicit; go 1.24.0
 google.golang.org/genproto/protobuf/field_mask
 # google.golang.org/genproto/googleapis/rpc v0.0.0-20250826171959-ef028d996bc1
 ## explicit; go 1.24.0

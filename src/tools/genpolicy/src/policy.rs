@@ -407,8 +407,8 @@ pub struct CommonData {
     /// Regex for an IP port number.
     pub ip_p: String,
 
-    /// Regex for a K8s service name.
-    pub svc_name: String,
+    /// Regex for a K8s service name (RFC 1035), after downward API transformation.
+    pub svc_name_downward_env: String,
 
     // Regex for a DNS label (e.g., host name).
     pub dns_label: String,
@@ -418,6 +418,9 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
+
+    /// Parse Container image as a storage object
+    pub image_layer_verification: String,
 }
 
 /// Configuration from "kubectl config".
@@ -615,7 +618,10 @@ impl AgentPolicy {
 
         let image_layers = yaml_container.registry.get_image_layers();
         let mut storages = Default::default();
-        get_image_layer_storages(&mut storages, &image_layers, &root);
+        const HOST_TARFS_DM_VERITY: &str = "host-tarfs-dm-verity";
+        if self.config.settings.common.image_layer_verification == HOST_TARFS_DM_VERITY {
+            get_image_layer_storages(&mut storages, &image_layers, &root);
+        }
         resource.get_container_mounts_and_storages(
             &mut mounts,
             &mut storages,

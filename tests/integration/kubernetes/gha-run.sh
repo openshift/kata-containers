@@ -175,7 +175,7 @@ function deploy_kata() {
 
 	ANNOTATIONS="default_vcpus"
 	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
-		ANNOTATIONS="image kernel default_vcpus"
+		ANNOTATIONS="image kernel default_vcpus disable_image_nvdimm"
 	fi
 	if [[ "${KATA_HYPERVISOR}" = "qemu" ]]; then
 		ANNOTATIONS="image initrd kernel default_vcpus"
@@ -294,6 +294,49 @@ function run_tests() {
 	popd
 }
 
+# Print a report about tests executed.
+#
+# Crawl over the output files found on each "reports/yyyy-mm-dd-hh:mm:ss"
+# directory.
+#
+function report_tests() {
+	local reports_dir="${kubernetes_dir}/reports"
+	local ok
+	local not_ok
+	local status
+
+	if [[ ! -d "${reports_dir}" ]]; then
+		info "no reports directory found: ${reports_dir}"
+		return
+	fi
+
+	for report_dir in "${reports_dir}"/*; do
+		mapfile -t ok < <(find "${report_dir}" -name "ok-*.out")
+		mapfile -t not_ok < <(find "${report_dir}" -name "not_ok-*.out")
+
+		cat <<-EOF
+		SUMMARY ($(basename "${report_dir}")):
+		 Pass:  ${#ok[*]}
+		 Fail:  ${#not_ok[*]}
+		EOF
+
+		echo -e "\nSTATUSES:"
+		for out in "${not_ok[@]}" "${ok[@]}"; do
+			status=$(basename "${out}" | cut -d '-' -f1)
+			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
+			echo " ${status} ${bats}"
+		done
+
+		echo -e "\nOUTPUTS:"
+		for out in "${not_ok[@]}" "${ok[@]}"; do
+			bats=$(basename "${out}" | cut -d '-' -f2- | sed 's/.out$//')
+			echo "::group::${bats}"
+			cat "${out}"
+			echo "::endgroup::"
+		done
+	done
+}
+
 function collect_artifacts() {
 	if [[ -z "${start_time:-}" ]]; then
 		warn "tests start time is not defined. Cannot gather journal information"
@@ -400,7 +443,7 @@ function cleanup() {
 }
 
 function deploy_snapshotter() {
-	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" || "${KATA_HYPERVISOR}" == "qemu-sev" ]]; then
+	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" ]]; then
 	       echo "[Skip] ${SNAPSHOTTER} is pre-installed in the TEE machine"
 	       return
 	fi
@@ -414,7 +457,7 @@ function deploy_snapshotter() {
 }
 
 function cleanup_snapshotter() {
-	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" || "${KATA_HYPERVISOR}" == "qemu-sev" ]]; then
+	if [[ "${KATA_HYPERVISOR}" == "qemu-tdx" || "${KATA_HYPERVISOR}" == "qemu-snp" ]]; then
 	       echo "[Skip] ${SNAPSHOTTER} is pre-installed in the TEE machine"
 	       return
 	fi
@@ -524,7 +567,6 @@ function main() {
 
 	case "${action}" in
 		install-azure-cli) install_azure_cli ;;
-		login-azure) login_azure ;;
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
@@ -534,7 +576,6 @@ function main() {
 		install-bats) install_bats ;;
 		install-kata-tools) install_kata_tools ;;
 		install-kbs-client) install_kbs_client ;;
-		install-kubectl) install_kubectl ;;
 		get-cluster-credentials) get_cluster_credentials "" ;;
 		deploy-csi-driver) return 0 ;;
 		deploy-kata) deploy_kata ;;
@@ -547,6 +588,7 @@ function main() {
 		deploy-kata-garm) deploy_kata "garm" ;;
 		deploy-kata-zvsi) deploy_kata "zvsi" ;;
 		deploy-snapshotter) deploy_snapshotter ;;
+		report-tests) report_tests ;;
 		run-tests) run_tests ;;
 		run-tests-kcli) run_tests "kcli" ;;
 		collect-artifacts) collect_artifacts ;;

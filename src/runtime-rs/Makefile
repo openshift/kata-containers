@@ -37,6 +37,11 @@ test:
 install:
 	@echo "PowerPC 64 LE is not currently supported"
 	exit 0
+else ifeq ($(ARCH), riscv64gc)
+default: runtime show-header
+test:
+	@echo "RISC-V 64 is not currently supported"
+	exit 0
 else
 ##TARGET default: build code
 default: runtime show-header
@@ -175,6 +180,12 @@ DEFMSIZE9P := 8192
 DEFVFIOMODE := guest-kernel
 DEFBINDMOUNTS := []
 DEFDANCONF := /run/kata-containers/dans
+DEFFORCEGUESTPULL := false
+QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT := 4050
+
+# Create Container Timeout in seconds
+DEFCREATECONTAINERTIMEOUT ?= 30
+
 SED = sed
 CLI_DIR = cmd
 SHIMV2 = containerd-shim-kata-v2
@@ -214,7 +225,7 @@ ifneq (,$(DBCMD))
     CONFIGS += $(CONFIG_DB)
     # dragonball-specific options (all should be suffixed by "_DB")
     VMROOTFSDRIVER_DB := virtio-blk-pci
-    DEFMAXVCPUS_DB := 1
+    DEFMAXVCPUS_DB := 0
     DEFBLOCKSTORAGEDRIVER_DB := virtio-blk-mmio
     DEFNETWORKMODEL_DB := tcfilter
     KERNELPARAMS_DB = console=ttyS1 agent.log_vport=1025
@@ -300,13 +311,15 @@ ifneq (,$(QEMUCMD))
     DEFSANDBOXCGROUPONLY_QEMU := false
 ifeq ($(ARCH), s390x)
     VMROOTFSDRIVER_QEMU := virtio-blk-ccw
+    DEFBLOCKSTORAGEDRIVER_QEMU := virtio-blk-ccw
 else
     VMROOTFSDRIVER_QEMU := virtio-pmem
+    DEFBLOCKSTORAGEDRIVER_QEMU := virtio-blk-pci
 endif
     DEFVCPUS_QEMU := 1
     DEFMAXVCPUS_QEMU := 0
     DEFSHAREDFS_QEMU_VIRTIOFS := virtio-fs
-    DEFBLOCKSTORAGEDRIVER_QEMU := virtio-scsi
+    DEFSHAREDFS_QEMU_SEL_VIRTIOFS := none
     DEFBLOCKDEVICEAIO_QEMU := io_uring
     DEFNETWORKMODEL_QEMU := tcfilter
     DEFDISABLEGUESTSELINUX := true
@@ -461,6 +474,7 @@ USER_VARS += DEFBLOCKDEVICEAIO_QEMU
 USER_VARS += DEFBLOCKSTORAGEDRIVER_FC
 USER_VARS += DEFSHAREDFS_CLH_VIRTIOFS
 USER_VARS += DEFSHAREDFS_QEMU_VIRTIOFS
+USER_VARS += DEFSHAREDFS_QEMU_SEL_VIRTIOFS
 USER_VARS += DEFVIRTIOFSDAEMON
 USER_VARS += DEFVALIDVIRTIOFSDAEMONPATHS
 USER_VARS += DEFVIRTIOFSCACHESIZE
@@ -503,6 +517,9 @@ USER_VARS += KATA_INSTALL_GROUP
 USER_VARS += KATA_INSTALL_OWNER
 USER_VARS += KATA_INSTALL_CFG_PERMS
 USER_VARS += DEFDANCONF
+USER_VARS += DEFFORCEGUESTPULL
+USER_VARS += QEMUTDXQUOTEGENERATIONSERVICESOCKETPORT
+USER_VARS += DEFCREATECONTAINERTIMEOUT
 
 SOURCES := \
   $(shell find . 2>&1 | grep -E '.*\.rs$$') \
