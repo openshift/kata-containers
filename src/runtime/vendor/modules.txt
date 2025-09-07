@@ -251,8 +251,8 @@ github.com/cpuguy83/go-md2man/v2/md2man
 # github.com/cri-o/cri-o v1.30.10
 ## explicit; go 1.22.0
 github.com/cri-o/cri-o/pkg/annotations
-# github.com/cyphar/filepath-securejoin v0.3.4
-## explicit; go 1.21
+# github.com/cyphar/filepath-securejoin v0.4.1
+## explicit; go 1.18
 github.com/cyphar/filepath-securejoin
 # github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 ## explicit
