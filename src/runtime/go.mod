@@ -21,7 +21,7 @@ require (
 	github.com/containerd/cri-containerd v1.19.0
 	github.com/containerd/fifo v1.1.0
 	github.com/containerd/ttrpc v1.2.7
-	github.com/containerd/typeurl/v2 v2.1.1
+	github.com/containerd/typeurl/v2 v2.2.3
 	github.com/containernetworking/plugins v1.4.1
 	github.com/coreos/go-systemd/v22 v22.5.1-0.20231103132048-7d375ecc2b09
 	github.com/cri-o/cri-o v1.30.10
