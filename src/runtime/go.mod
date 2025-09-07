@@ -27,7 +27,7 @@ require (
 	github.com/cri-o/cri-o v1.30.10
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.7.0
-	github.com/go-ini/ini v1.28.2
+	github.com/go-ini/ini v1.67.0
 	github.com/go-openapi/errors v0.20.4
 	github.com/go-openapi/runtime v0.26.0
 	github.com/go-openapi/strfmt v0.21.8
@@ -121,7 +121,6 @@ require (
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
-	github.com/smartystreets/goconvey v1.8.1 // indirect
 	go.mongodb.org/mongo-driver v1.12.1 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
