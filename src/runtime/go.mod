@@ -3,7 +3,7 @@ module github.com/kata-containers/kata-containers/src/runtime
 // Keep in sync with version in versions.yaml
 go 1.24.0
 
-toolchain go1.24.6
+toolchain go1.25.1
 
 // WARNING: Do NOT use `replace` directives as those break dependabot:
 // https://github.com/kata-containers/kata-containers/issues/11020
