@@ -19,7 +19,7 @@ COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
 
 # Red Hat labels
 LABEL name="openshift-sandboxed-containers-operator-monitor" \
-version="1.10.1" \
+version="1.10.2" \
 com.redhat.component="osc-monitor-container" \
 summary="osc-monitor provides the kata-monitor binary to expose sandboxed containers custom metrics" \
 maintainer="support@redhat.com" \
