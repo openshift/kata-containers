@@ -49,7 +49,7 @@ require (
 	github.com/prometheus/procfs v0.12.0
 	github.com/safchain/ethtool v0.3.0
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	github.com/urfave/cli v1.22.14
 	github.com/vishvananda/netlink v1.2.1-beta.2
 	github.com/vishvananda/netns v0.0.4
