@@ -40,7 +40,7 @@ require (
 	github.com/moby/sys/userns v0.1.0
 	github.com/opencontainers/runc v1.2.0
 	github.com/opencontainers/runtime-spec v1.2.0
-	github.com/opencontainers/selinux v1.11.0
+	github.com/opencontainers/selinux v1.12.0
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.18.0
