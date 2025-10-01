@@ -75,7 +75,7 @@ assets:
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
       uscan-url: >-
         https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v45.0"
+      version: "v48.0"
 
     firecracker:
       description: "Firecracker micro-VMM"
@@ -83,13 +83,13 @@ assets:
       uscan-url: >-
         https://github.com/firecracker-microvm/firecracker/tags
         .*/v?(\d\S+)\.tar\.gz
-      version: "v1.8.0"
+      version: "v1.12.1"
 
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v9.1.2"
-      tag: "v9.1.2"
+      version: "v10.1.0"
+      tag: "v10.1.0"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -162,7 +162,7 @@ assets:
     architecture:
       aarch64:
         name: "alpine"
-        version: "3.18"
+        version: "3.22"
         nvidia-gpu:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -182,7 +182,7 @@ assets:
           version: "noble"  # 24.04 LTS
       x86_64:
         name: "alpine"
-        version: "3.18"
+        version: "3.22"
         confidential:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -196,11 +196,11 @@ assets:
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.12.36"
+    version: "v6.12.47"
     confidential:
       description: "Linux kernel with x86_64 TEEs (SNP and TDX) support"
       url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.12.36"
+      version: "v6.16.7"
 
   kernel-arm-experimental:
     description: "Linux kernel with cpu/mem hotplug support on arm64"
@@ -210,7 +210,7 @@ assets:
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.12.36"
+    version: "v6.12.47"
 
 externals:
   description: "Third-party projects used by the system"
@@ -233,18 +233,18 @@ externals:
   coco-guest-components:
     description: "Provides attested key unwrapping for image decryption"
     url: "https://github.com/confidential-containers/guest-components/"
-    version: "1a521e14b8c0a039ae7ae98f520fcb5020d95dec"
+    version: "608b48205009e091d3843b8f7d21934f2cea6792"
     toolchain: "1.85.1"
 
   coco-trustee:
     description: "Provides attestation and secret delivery components"
     url: "https://github.com/confidential-containers/trustee"
-    version: "beb4ce9346bc7f9a7ff0f686eb868472767ad8fb"
+    version: "ea56c1bfa7e912f39e270ffe738b19ac8113af3d"
     # image / ita_image and image_tag / ita_image_tag must be in sync
     image: "ghcr.io/confidential-containers/staged-images/kbs"
-    image_tag: "beb4ce9346bc7f9a7ff0f686eb868472767ad8fb"
+    image_tag: "ea56c1bfa7e912f39e270ffe738b19ac8113af3d"
     ita_image: "ghcr.io/confidential-containers/staged-images/kbs-ita-as"
-    ita_image_tag: "beb4ce9346bc7f9a7ff0f686eb868472767ad8fb-x86_64"
+    ita_image_tag: "ea56c1bfa7e912f39e270ffe738b19ac8113af3d-x86_64"
     toolchain: "1.85.1"
 
   crio:
@@ -359,20 +359,35 @@ externals:
     url: "https://github.com/tianocore/edk2"
     x86_64:
       description: "Vanilla firmware build"
-      version: "edk2-stable202411"
+      version: "edk2-stable202508"
       package: "OvmfPkg/OvmfPkgX64.dsc"
       package_output_dir: "OvmfX64"
     sev:
       # Used by AMD SEV-SNP for measured direct boot
       description: "AmdSev build needed for SEV measured direct boot."
-      version: "edk2-stable202411"
+      version: "edk2-stable202508"
       package: "OvmfPkg/AmdSev/AmdSevX64.dsc"
       package_output_dir: "AmdSev"
     arm64:
       description: "UEFI for arm64 virtual machines."
-      version: "edk2-stable202411"
+      version: "edk2-stable202508"
       package: "ArmVirtPkg/ArmVirtQemu.dsc"
       package_output_dir: "ArmVirtQemu-AARCH64"
+
+  protoc:
+    description: "Protobuf compiler"
+    url: "https://github.com/protocolbuffers/protobuf/releases"
+    version: "v21.12"
+
+  protoc-gen-go:
+    description: "Protobuf Go compiler"
+    url: "https://github.com/protocolbuffers/protobuf-go/releases"
+    version: "v1.28.1"
+
+  ttrpc:
+    description: "ttRPC libary and code generation utilities"
+    url: "https://github.com/containerd/ttrpc/releases"
+    version: "v1.2.7"
 
   virtiofsd:
     description: "vhost-user virtio-fs device backend written in Rust"
@@ -400,12 +415,13 @@ languages:
   golang:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
-    version: "1.23.10"
+    # When updating this, also update in go.mod files.
+    version: "1.24.6"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.23.10"
+      newest-version: "1.24.6"
 
   rust:
     description: "Rust language"

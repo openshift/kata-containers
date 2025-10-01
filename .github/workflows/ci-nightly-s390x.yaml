@@ -4,8 +4,7 @@ on:
 
 name: Nightly CI for s390x
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   check-internal-test-result:
@@ -16,7 +15,8 @@ jobs:
         test_title:
           - kata-vfio-ap-e2e-tests
           - cc-vfio-ap-e2e-tests
-          - cc-se-e2e-tests
+          - cc-se-e2e-tests-go
+          - cc-se-e2e-tests-rs
     steps:
     - name: Fetch a test result for {{ matrix.test_title }}
       run: |

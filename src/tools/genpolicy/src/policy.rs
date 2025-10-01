@@ -12,19 +12,16 @@ use crate::mount_and_storage;
 use crate::no_policy;
 use crate::pod;
 use crate::policy;
-use crate::registry;
 use crate::secret;
 use crate::utils;
 use crate::yaml;
 
 use anyhow::Result;
-use base64::{engine::general_purpose, Engine as _};
 use log::debug;
 use oci_spec::runtime as oci;
 use protocols::agent;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
-use sha2::{Digest, Sha256};
 use std::boxed;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
@@ -357,6 +354,16 @@ pub struct UpdateInterfaceRequestDefaults {
     forbidden_hw_addrs: Vec<String>,
 }
 
+/// UpdateInterfaceRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AddARPNeighborsRequestDefaults {
+    /// Explicitly blocked interface names. Intent is to block changes to loopback interface.
+    forbidden_device_names: Vec<String>,
+    /// Explicitly blocked IP address ranges.
+    /// Should include loopback addresses and other CIDRs that should not be routed outside the VM.
+    forbidden_cidrs_regex: Vec<String>,
+}
+
 /// Settings specific to each kata agent endpoint, loaded from
 /// genpolicy-settings.json.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -375,6 +382,9 @@ pub struct RequestDefaults {
 
     /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
     pub UpdateInterfaceRequest: UpdateInterfaceRequestDefaults,
+
+    /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
+    pub AddARPNeighborsRequest: AddARPNeighborsRequestDefaults,
 
     /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
     pub CloseStdinRequest: bool,
@@ -395,8 +405,8 @@ pub struct CommonData {
     /// Path to the shared container files - e.g., "/run/kata-containers/shared/containers".
     pub cpath: String,
 
-    /// Path to the shared container files for mount sources - e.g., "/run/kata-containers/shared/containers".
-    pub mount_source_cpath: String,
+    /// Path to the container root - e.g., "/run/kata-containers/$(bundle-id)/rootfs".
+    pub root_path: String,
 
     /// Regex prefix for shared file paths - e.g., "^$(cpath)/$(bundle-id)-[a-z0-9]{16}-".
     pub sfprefix: String,
@@ -418,9 +428,6 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
-
-    /// Parse Container image as a storage object
-    pub image_layer_verification: String,
 }
 
 /// Configuration from "kubectl config".
@@ -528,11 +535,11 @@ impl AgentPolicy {
     pub fn export_policy(&mut self) {
         let mut yaml_string = String::new();
         for i in 0..self.resources.len() {
-            let policy = self.resources[i].generate_policy(self);
+            let annotation = self.resources[i].generate_initdata_anno(self);
             if self.config.base64_out {
-                println!("{}", policy);
+                println!("{}", annotation);
             }
-            yaml_string += &self.resources[i].serialize(&policy);
+            yaml_string += &self.resources[i].serialize(&annotation);
         }
 
         if let Some(yaml_file) = &self.config.yaml_file {
@@ -550,7 +557,7 @@ impl AgentPolicy {
         }
     }
 
-    pub fn generate_policy(&self, resource: &dyn yaml::K8sResource) -> String {
+    pub fn generate_initdata_anno(&self, resource: &dyn yaml::K8sResource) -> String {
         let yaml_containers = resource.get_containers();
         let mut policy_containers = Vec::new();
 
@@ -570,7 +577,10 @@ impl AgentPolicy {
         if self.config.raw_out {
             std::io::stdout().write_all(policy.as_bytes()).unwrap();
         }
-        general_purpose::STANDARD.encode(policy.as_bytes())
+        let mut initdata = kata_types::initdata::InitData::new("sha256", "0.1.0");
+        initdata.insert_data("policy.rego", policy);
+
+        kata_types::initdata::encode_initdata(&initdata)
     }
 
     pub fn get_container_policy(
@@ -616,12 +626,7 @@ impl AgentPolicy {
             is_pause_container,
         );
 
-        let image_layers = yaml_container.registry.get_image_layers();
         let mut storages = Default::default();
-        const HOST_TARFS_DM_VERITY: &str = "host-tarfs-dm-verity";
-        if self.config.settings.common.image_layer_verification == HOST_TARFS_DM_VERITY {
-            get_image_layer_storages(&mut storages, &image_layers, &root);
-        }
         resource.get_container_mounts_and_storages(
             &mut mounts,
             &mut storages,
@@ -784,71 +789,6 @@ impl KataSpec {
     }
 }
 
-fn get_image_layer_storages(
-    storages: &mut Vec<agent::Storage>,
-    image_layers: &Vec<registry::ImageLayer>,
-    root: &KataRoot,
-) {
-    let mut new_storages: Vec<agent::Storage> = Vec::new();
-    let mut layer_names: Vec<String> = Vec::new();
-    let mut layer_hashes: Vec<String> = Vec::new();
-    let mut previous_chain_id = String::new();
-    let layers_count = image_layers.len();
-    let mut layer_index = layers_count;
-
-    for layer in image_layers {
-        // See https://github.com/opencontainers/image-spec/blob/main/config.md#layer-chainid
-        let chain_id = if previous_chain_id.is_empty() {
-            layer.diff_id.clone()
-        } else {
-            let mut hasher = Sha256::new();
-            hasher.update(format!("{previous_chain_id} {}", &layer.diff_id));
-            format!("sha256:{:x}", hasher.finalize())
-        };
-        debug!(
-            "previous_chain_id = {}, chain_id = {}",
-            &previous_chain_id, &chain_id
-        );
-        previous_chain_id.clone_from(&chain_id);
-
-        layer_names.push(name_to_hash(&chain_id));
-        layer_hashes.push(layer.verity_hash.to_string());
-        layer_index -= 1;
-
-        new_storages.push(agent::Storage {
-            driver: "blk".to_string(),
-            driver_options: Vec::new(),
-            source: String::new(), // TODO
-            fstype: "tar".to_string(),
-            options: vec![format!("$(hash{layer_index})")],
-            mount_point: format!("$(layer{layer_index})"),
-            fs_group: protobuf::MessageField::none(),
-            special_fields: ::protobuf::SpecialFields::new(),
-        });
-    }
-
-    new_storages.reverse();
-    for storage in new_storages {
-        storages.push(storage);
-    }
-
-    layer_names.reverse();
-    layer_hashes.reverse();
-
-    let overlay_storage = agent::Storage {
-        driver: "overlayfs".to_string(),
-        driver_options: Vec::new(),
-        source: String::new(), // TODO
-        fstype: "fuse3.kata-overlay".to_string(),
-        options: vec![layer_names.join(":"), layer_hashes.join(":")],
-        mount_point: root.Path.clone(),
-        fs_group: protobuf::MessageField::none(),
-        special_fields: ::protobuf::SpecialFields::new(),
-    };
-
-    storages.push(overlay_storage);
-}
-
 async fn parse_config_file(
     yaml_file: String,
     config: &utils::Config,
@@ -878,13 +818,6 @@ async fn parse_config_file(
     }
 
     Ok(k8sRes)
-}
-
-/// Converts the given name to a string representation of its sha256 hash.
-fn name_to_hash(name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name);
-    format!("{:x}", hasher.finalize())
 }
 
 fn substitute_env_variables(env: &mut Vec<String>) {

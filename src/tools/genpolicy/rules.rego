@@ -467,18 +467,28 @@ allow_devices(p_devices, i_devices) if {
     print("allow_devices: true")
 }
 
+
 allow_linux(state_ops, p_oci, i_oci) := {"ops": ops, "allowed": true} if {
     p_namespaces := p_oci.Linux.Namespaces
     print("allow_linux: p namespaces =", p_namespaces)
 
+    p_namespaces_normalized := [
+        {"Path": obj.Path, "Type": normalize_namespace_type(obj.Type)}
+        | obj := p_namespaces[_]
+    ]
+
     i_namespaces := i_oci.Linux.Namespaces
     print("allow_linux: i namespaces =", i_namespaces)
 
-    i_namespace_without_network := [obj | obj := i_namespaces[_]; obj.Type != "network"]
+    i_namespace_without_network_normalized := [
+        {"Path": obj.Path, "Type": normalize_namespace_type(obj.Type)}
+        | obj := i_namespaces[_]; obj.Type != "network"; obj.Type != "cgroup"
+    ]
 
-    print("allow_linux: i_namespace_without_network =", i_namespace_without_network)
+    print("allow_linux: p_namespaces_normalized =", p_namespaces_normalized)
+    print("allow_linux: i_namespace_without_network_normalized =", i_namespace_without_network_normalized)
 
-    p_namespaces == i_namespace_without_network
+    p_namespaces_normalized == i_namespace_without_network_normalized
 
     allow_masked_paths(p_oci, i_oci)
     allow_readonly_paths(p_oci, i_oci)
@@ -669,6 +679,7 @@ allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) if {
     # Reject possible attempts to match multiple input mounts with a single Policy mount.
     p_matches := { p_index | some i_index; p_index = allow_mount(p_oci, input.OCI.Mounts[i_index], bundle_id, sandbox_id) }
 
+    print("allow_by_bundle_or_sandbox_id: p_matches =", p_matches)
     count(p_matches) == count(input.OCI.Mounts)
 
     allow_storages(p_storages, i_storages, bundle_id, sandbox_id)
@@ -967,7 +978,7 @@ allow_root_path(p_oci, i_oci, bundle_id) if {
     p_path1 := p_oci.Root.Path
     print("allow_root_path: i_path =", i_path, "p_path1 =", p_path1)
 
-    p_path2 := replace(p_path1, "$(cpath)", policy_data.common.cpath)
+    p_path2 := replace(p_path1, "$(root_path)", policy_data.common.root_path)
     print("allow_root_path: p_path2 =", p_path2)
 
     p_path3 := replace(p_path2, "$(bundle-id)", bundle_id)
@@ -983,8 +994,8 @@ allow_root_path(p_oci, i_oci, bundle_id) if {
 allow_mount(p_oci, i_mount, bundle_id, sandbox_id):= p_index if {
     print("allow_mount: i_mount =", i_mount)
 
-    p_mount := p_oci.Mounts[p_index]
-    print("allow_mount: p_mount =", p_mount)
+    some p_index, p_mount in p_oci.Mounts
+    print("allow_mount: p_index =", p_index, "p_mount =", p_mount)
     check_mount(p_mount, i_mount, bundle_id, sandbox_id)
 
     print("allow_mount: true, p_index =", p_index)
@@ -1007,7 +1018,7 @@ check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
 mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
     regex1 := p_mount.source
     regex2 := replace(regex1, "$(sfprefix)", policy_data.common.sfprefix)
-    regex3 := replace(regex2, "$(cpath)", policy_data.common.mount_source_cpath)
+    regex3 := replace(regex2, "$(cpath)", policy_data.common.cpath)
     regex4 := replace(regex3, "$(bundle-id)", bundle_id)
 
     print("mount_source_allows 1: regex4 =", regex4)
@@ -1018,7 +1029,7 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
     regex1 := p_mount.source
     regex2 := replace(regex1, "$(sfprefix)", policy_data.common.sfprefix)
-    regex3 := replace(regex2, "$(cpath)", policy_data.common.mount_source_cpath)
+    regex3 := replace(regex2, "$(cpath)", policy_data.common.cpath)
     regex4 := replace(regex3, "$(sandbox-id)", sandbox_id)
 
     print("mount_source_allows 2: regex4 =", regex4)
@@ -1031,6 +1042,9 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 # Create container Storages
 
 allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
+    print("allow_storages: p_storages =", p_storages)
+    print("allow_storages: i_storages =", i_storages)
+
     p_count := count(p_storages)
     i_count := count(i_storages)
     img_pull_count := count([s | s := i_storages[_]; s.driver == "image_guest_pull"])
@@ -1038,34 +1052,14 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     p_count == i_count - img_pull_count
 
-    image_info := allow_container_image_storage(p_storages)
-    layer_ids := image_info.layer_ids
-    root_hashes := image_info.root_hashes
-
     every i_storage in i_storages {
-        allow_storage(p_storages, i_storage, bundle_id, sandbox_id, layer_ids, root_hashes)
+        allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
     }
 
     print("allow_storages: true")
 }
 
-# Currently, Image Layer Integrity Verification through Policy is only required for Guest VMs
-# that use container image layers provided as dm-verity-protected block device images created on the Host.
-allow_container_image_storage(p_storages) = { "layer_ids": [], "root_hashes": [] } if {
-    policy_data.common.image_layer_verification != "host-tarfs-dm-verity"
-}
-allow_container_image_storage(p_storages) = { "layer_ids": layer_ids, "root_hashes": root_hashes } if {
-    policy_data.common.image_layer_verification == "host-tarfs-dm-verity"
-
-    some overlay_storage in p_storages
-    overlay_storage.driver == "overlayfs"
-    count(overlay_storage.options) == 2
-
-    layer_ids := split(overlay_storage.options[0], ":")
-    root_hashes := split(overlay_storage.options[1], ":")
-}
-
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id, layer_ids, root_hashes) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     some p_storage in p_storages
 
     print("allow_storage: p_storage =", p_storage)
@@ -1077,12 +1071,12 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id, layer_ids, root_hash
     p_storage.fstype           == i_storage.fstype
 
     allow_storage_source(p_storage, i_storage, bundle_id)
-    allow_storage_options(p_storage, i_storage, layer_ids, root_hashes)
-    allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids)
+    allow_storage_options(p_storage, i_storage)
+    allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id)
 
     print("allow_storage: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id, layer_ids, root_hashes) if {
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     i_storage.driver == "image_guest_pull"
     print("allow_storage with image_guest_pull: start")
     i_storage.fstype == "overlay"
@@ -1121,7 +1115,7 @@ allow_storage_source(p_storage, i_storage, bundle_id) if {
     print("allow_storage_source 3: true")
 }
 
-allow_storage_options(p_storage, i_storage, layer_ids, root_hashes) if {
+allow_storage_options(p_storage, i_storage) if {
     print("allow_storage_options 1: start")
 
     p_storage.driver != "blk"
@@ -1130,163 +1124,48 @@ allow_storage_options(p_storage, i_storage, layer_ids, root_hashes) if {
 
     print("allow_storage_options 1: true")
 }
-allow_storage_options(p_storage, i_storage, layer_ids, root_hashes) if {
-    print("allow_storage_options 2: start")
 
-    p_storage.driver == "overlayfs"
-    count(p_storage.options) == 2
-
-    policy_ids := split(p_storage.options[0], ":")
-    print("allow_storage_options 2: policy_ids =", policy_ids)
-    policy_ids == layer_ids
-
-    policy_hashes := split(p_storage.options[1], ":")
-    print("allow_storage_options 2: policy_hashes =", policy_hashes)
-
-    p_count := count(policy_ids)
-    print("allow_storage_options 2: p_count =", p_count)
-    p_count >= 1
-    p_count == count(policy_hashes)
-
-    i_count := count(i_storage.options)
-    print("allow_storage_options 2: i_count =", i_count)
-    i_count == p_count + 3
-
-    print("allow_storage_options 2: i_storage.options[0] =", i_storage.options[0])
-    i_storage.options[0] == "io.katacontainers.fs-opt.layer-src-prefix=/var/lib/containerd/io.containerd.snapshotter.v1.tardev/layers"
-
-    print("allow_storage_options 2: i_storage.options[i_count - 2] =", i_storage.options[i_count - 2])
-    i_storage.options[i_count - 2] == "io.katacontainers.fs-opt.overlay-rw"
-
-    lowerdir := concat("=", ["lowerdir", p_storage.options[0]])
-    print("allow_storage_options 2: lowerdir =", lowerdir)
-
-    i_storage.options[i_count - 1] == lowerdir
-    print("allow_storage_options 2: i_storage.options[i_count - 1] =", i_storage.options[i_count - 1])
-
-    every i, policy_id in policy_ids {
-        allow_overlay_layer(policy_id, policy_hashes[i], i_storage.options[i + 1])
-    }
-
-    print("allow_storage_options 2: true")
-}
-allow_storage_options(p_storage, i_storage, layer_ids, root_hashes) if {
-    print("allow_storage_options 3: start")
-
-    p_storage.driver == "blk"
-    count(p_storage.options) == 1
-
-    startswith(p_storage.options[0], "$(hash")
-    hash_suffix := trim_left(p_storage.options[0], "$(hash")
-
-    endswith(hash_suffix, ")")
-    hash_index := trim_right(hash_suffix, ")")
-    i := to_number(hash_index)
-    print("allow_storage_options 3: i =", i)
-
-    hash_option := concat("=", ["io.katacontainers.fs-opt.root-hash", root_hashes[i]])
-    print("allow_storage_options 3: hash_option =", hash_option)
-
-    count(i_storage.options) == 4
-    i_storage.options[0] == "ro"
-    i_storage.options[1] == "io.katacontainers.fs-opt.block_device=file"
-    i_storage.options[2] == "io.katacontainers.fs-opt.is-layer"
-    i_storage.options[3] == hash_option
-
-    print("allow_storage_options 3: true")
-}
-
-allow_overlay_layer(policy_id, policy_hash, i_option) if {
-    print("allow_overlay_layer: policy_id =", policy_id, "policy_hash =", policy_hash)
-    print("allow_overlay_layer: i_option =", i_option)
-
-    startswith(i_option, "io.katacontainers.fs-opt.layer=")
-    i_value := replace(i_option, "io.katacontainers.fs-opt.layer=", "")
-    i_value_decoded := base64.decode(i_value)
-    print("allow_overlay_layer: i_value_decoded =", i_value_decoded)
-
-    policy_suffix := concat("=", ["tar,ro,io.katacontainers.fs-opt.block_device=file,io.katacontainers.fs-opt.is-layer,io.katacontainers.fs-opt.root-hash", policy_hash])
-    p_value := concat(",", [policy_id, policy_suffix])
-    print("allow_overlay_layer: p_value =", p_value)
-
-    p_value == i_value_decoded
-
-    print("allow_overlay_layer: true")
-}
-
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) if {
-    p_storage.fstype == "tar"
-
-    startswith(p_storage.mount_point, "$(layer")
-    mount_suffix := trim_left(p_storage.mount_point, "$(layer")
-
-    endswith(mount_suffix, ")")
-    layer_index := trim_right(mount_suffix, ")")
-    i := to_number(layer_index)
-    print("allow_mount_point 1: i =", i)
-
-    layer_id := layer_ids[i]
-    print("allow_mount_point 1: layer_id =", layer_id)
-
-    p_mount := concat("/", ["/run/kata-containers/sandbox/layers", layer_id])
-    print("allow_mount_point 1: p_mount =", p_mount)
-
-    p_mount == i_storage.mount_point
-
-    print("allow_mount_point 1: true")
-}
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) if {
-    p_storage.fstype == "fuse3.kata-overlay"
-
-    mount1 := replace(p_storage.mount_point, "$(cpath)", policy_data.common.cpath)
-    mount2 := replace(mount1, "$(bundle-id)", bundle_id)
-    print("allow_mount_point 2: mount2 =", mount2)
-
-    mount2 == i_storage.mount_point
-
-    print("allow_mount_point 2: true")
-}
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) if {
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     p_storage.fstype == "local"
 
     mount1 := p_storage.mount_point
     print("allow_mount_point 3: mount1 =", mount1)
 
-    mount2 := replace(mount1, "$(cpath)", policy_data.common.mount_source_cpath)
-    print("allow_mount_point 3: mount2 =", mount2)
+    mount2 := replace(mount1, "$(cpath)", policy_data.common.cpath)
+    print("allow_mount_point 1: mount2 =", mount2)
 
     mount3 := replace(mount2, "$(sandbox-id)", sandbox_id)
-    print("allow_mount_point 3: mount3 =", mount3)
+    print("allow_mount_point 1: mount3 =", mount3)
 
     regex.match(mount3, i_storage.mount_point)
 
-    print("allow_mount_point 3: true")
+    print("allow_mount_point 1: true")
 }
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) if {
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     p_storage.fstype == "bind"
 
     mount1 := p_storage.mount_point
-    print("allow_mount_point 4: mount1 =", mount1)
+    print("allow_mount_point 2: mount1 =", mount1)
 
     mount2 := replace(mount1, "$(cpath)", policy_data.common.cpath)
-    print("allow_mount_point 4: mount2 =", mount2)
+    print("allow_mount_point 2: mount2 =", mount2)
 
     mount3 := replace(mount2, "$(bundle-id)", bundle_id)
-    print("allow_mount_point 4: mount3 =", mount3)
+    print("allow_mount_point 2: mount3 =", mount3)
 
     regex.match(mount3, i_storage.mount_point)
 
-    print("allow_mount_point 4: true")
+    print("allow_mount_point 2: true")
 }
-allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id, layer_ids) if {
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     p_storage.fstype == "tmpfs"
 
     mount1 := p_storage.mount_point
-    print("allow_mount_point 5: mount1 =", mount1)
+    print("allow_mount_point 3: mount1 =", mount1)
 
     regex.match(mount1, i_storage.mount_point)
 
-    print("allow_mount_point 5: true")
+    print("allow_mount_point 3: true")
 }
 
 # ExecProcessRequest.process.Capabilities
@@ -1334,8 +1213,15 @@ match_caps(p_caps, i_caps) if {
     count(p_caps) == 1
     p_caps[0] == "$(default_caps)"
 
+    print("match_caps 2: i_caps =", i_caps)
     print("match_caps 2: default_caps =", policy_data.common.default_caps)
-    policy_data.common.default_caps == i_caps
+
+    norm_defaults := { strip_cap_prefix(c) | c := policy_data.common.default_caps[_] }
+    norm_input := { strip_cap_prefix(c) | c := i_caps[_] }
+    print("match_caps 2: norm_defaults =", norm_defaults)
+    print("match_caps 2: norm_input    =", norm_input)
+
+    norm_defaults == norm_input
 
     print("match_caps 2: true")
 }
@@ -1345,13 +1231,34 @@ match_caps(p_caps, i_caps) if {
     count(p_caps) == 1
     p_caps[0] == "$(privileged_caps)"
 
+    print("match_caps 3: i_caps =", i_caps)
     print("match_caps 3: privileged_caps =", policy_data.common.privileged_caps)
-    policy_data.common.privileged_caps == i_caps
+
+    norm_defaults := { strip_cap_prefix(c) | c := policy_data.common.privileged_caps[_] }
+    norm_input    := { strip_cap_prefix(c) | c := i_caps[_] }
+    print("match_caps 3: norm_defaults =", norm_defaults)
+    print("match_caps 3: norm_input    =", norm_input)
+
+    norm_defaults == norm_input
 
     print("match_caps 3: true")
 }
 
 ######################################################################
+
+normalize_namespace_type(type) := normalized_type if {
+    lower(type) == "mount"
+    normalized_type := "mnt"
+} else := normalized_type if {
+    normalized_type := type
+}
+
+strip_cap_prefix(s) := result if {
+    startswith(s, "CAP_")
+    result := substring(s, 4, count(s) - 4)
+} else := result if {
+    result := s
+}
 
 check_directory_traversal(i_path) if {
     not regex.match("(^|/)..($|/)", i_path)
@@ -1385,7 +1292,7 @@ CopyFileRequest if {
 
     some regex1 in policy_data.request_defaults.CopyFileRequest
     regex2 := replace(regex1, "$(sfprefix)", policy_data.common.sfprefix)
-    regex3 := replace(regex2, "$(cpath)", policy_data.common.mount_source_cpath)
+    regex3 := replace(regex2, "$(cpath)", policy_data.common.cpath)
     regex4 := replace(regex3, "$(bundle-id)", "[a-z0-9]{64}")
     print("CopyFileRequest: regex4 =", regex4)
 
@@ -1429,7 +1336,6 @@ allow_interactive_exec(p_container, i_process) if {
     print("allow_interactive_exec: true")
 }
 
-# get p_container from state
 get_state_container(container_id):= p_container if {
     idx := get_state_val(container_id)
     p_container := policy_data.containers[idx]
@@ -1533,6 +1439,25 @@ UpdateInterfaceRequest if {
     not i_interface.hwAddr in p_hwaddrs
 
     print("UpdateInterfaceRequest: true")
+}
+
+AddARPNeighborsRequest if {
+    p_defaults := policy_data.request_defaults.AddARPNeighborsRequest
+    print("AddARPNeighborsRequest: policy =", p_defaults)
+
+    every i_neigh in input.neighbors.ARPNeighbors {
+        print("AddARPNeighborsRequest: i_neigh =", i_neigh)
+
+        not i_neigh.device in p_defaults.forbidden_device_names
+        i_neigh.toIPAddress.mask == ""
+        every p_cidr in p_defaults.forbidden_cidrs_regex {
+            not regex.match(p_cidr, i_neigh.toIPAddress.address)
+        }
+        i_neigh.state == 128
+        bits.or(i_neigh.flags, 136) == 136
+    }
+
+    print("AddARPNeighborsRequest: true")
 }
 
 CloseStdinRequest if {

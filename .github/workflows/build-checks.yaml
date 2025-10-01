@@ -5,8 +5,8 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
+permissions: {}
+
 
 name: Build checks
 jobs:
@@ -40,6 +40,10 @@ jobs:
               - XDG_RUNTIME_DIR
           - name: runtime-rs
             path: src/runtime-rs
+            needs:
+              - rust
+          - name: libs
+            path: src/libs
             needs:
               - rust
           - name: agent-ctl

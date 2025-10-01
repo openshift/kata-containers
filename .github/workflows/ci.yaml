@@ -35,10 +35,12 @@ on:
         required: true
       QUAY_DEPLOYER_PASSWORD:
         required: true
+      NGC_API_KEY:
+        required: true
+      KBUILD_SIGN_PIN:
+        required: true
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
   build-kata-static-tarball-amd64:
@@ -52,6 +54,8 @@ jobs:
       tarball-suffix: -${{ inputs.tag }}
       commit-hash: ${{ inputs.commit-hash }}
       target-branch: ${{ inputs.target-branch }}
+    secrets:
+      KBUILD_SIGN_PIN: ${{ secrets.KBUILD_SIGN_PIN }}
 
   publish-kata-deploy-payload-amd64:
     needs: build-kata-static-tarball-amd64
@@ -286,6 +290,10 @@ jobs:
     if: ${{ inputs.skip-test != 'yes' }}
     needs: publish-kata-deploy-payload-amd64
     uses: ./.github/workflows/run-k8s-tests-on-aks.yaml
+
+    permissions:
+      contents: read
+      id-token: write # Used for OIDC access to log into Azure
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -323,6 +331,21 @@ jobs:
       pr-number: ${{ inputs.pr-number }}
       target-branch: ${{ inputs.target-branch }}
 
+  run-k8s-tests-on-nvidia-gpu:
+    if: ${{ inputs.skip-test != 'yes' }}
+    needs: publish-kata-deploy-payload-amd64
+    uses: ./.github/workflows/run-k8s-tests-on-nvidia-gpu.yaml
+    with:
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ inputs.tag }}-amd64
+      commit-hash: ${{ inputs.commit-hash }}
+      pr-number: ${{ inputs.pr-number }}
+      target-branch: ${{ inputs.target-branch }}
+    secrets:
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+
+
   run-kata-coco-tests:
     if: ${{ inputs.skip-test != 'yes' }}
     needs:
@@ -330,6 +353,9 @@ jobs:
      - build-and-publish-tee-confidential-unencrypted-image
      - publish-csi-driver-amd64
     uses: ./.github/workflows/run-kata-coco-tests.yaml
+    permissions:
+      contents: read
+      id-token: write # Used for OIDC access to log into Azure
     with:
       tarball-suffix: -${{ inputs.tag }}
       registry: ghcr.io
@@ -375,20 +401,6 @@ jobs:
     if: ${{ inputs.skip-test != 'yes' }}
     needs: [publish-kata-deploy-payload-amd64]
     uses: ./.github/workflows/run-kata-deploy-tests.yaml
-    with:
-      registry: ghcr.io
-      repo: ${{ github.repository_owner }}/kata-deploy-ci
-      tag: ${{ inputs.tag }}-amd64
-      commit-hash: ${{ inputs.commit-hash }}
-      pr-number: ${{ inputs.pr-number }}
-      target-branch: ${{ inputs.target-branch }}
-
-  run-metrics-tests:
-    # Skip metrics tests whilst runner is broken
-    if: false
-    # if: ${{ inputs.skip-test != 'yes' }}
-    needs: build-kata-static-tarball-amd64
-    uses: ./.github/workflows/run-metrics.yaml
     with:
       registry: ghcr.io
       repo: ${{ github.repository_owner }}/kata-deploy-ci

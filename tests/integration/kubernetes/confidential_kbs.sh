@@ -234,7 +234,7 @@ function kbs_k8s_delete() {
 	pushd "${COCO_KBS_DIR}"
 	if [[ "${KATA_HYPERVISOR}" = "qemu-tdx" ]]; then
 		kubectl delete -k config/kubernetes/ita
-	elif [[ "${KATA_HYPERVISOR}" = "qemu-se" ]]; then
+	elif [[ "${KATA_HYPERVISOR}" = qemu-se* ]]; then
 		kubectl delete -k config/kubernetes/overlays/ibm-se
 	else
 		kubectl delete -k config/kubernetes/overlays/
@@ -304,8 +304,8 @@ function kbs_k8s_deploy() {
 	# expects at least one secret served at install time.
 	echo "somesecret" > overlays/key.bin
 
-	# For qemu-se runtime, prepare the necessary resources
-	if [[ "${KATA_HYPERVISOR}" == "qemu-se" ]]; then
+	# For qemu-se* runtime, prepare the necessary resources
+	if [[ "${KATA_HYPERVISOR}" == qemu-se* ]]; then
 		mv overlays/key.bin overlays/ibm-se/key.bin
 		prepare_credentials_for_qemu_se
 		# SE_SKIP_CERTS_VERIFICATION should be set to true
@@ -329,6 +329,9 @@ function kbs_k8s_deploy() {
 			# `api_key`property by a valid ITA/ITTS API key, in the
 			# ITA/ITTS specific configuration
 			sed -i -e "s/tBfd5kKX2x9ahbodKV1.../${ITA_KEY}/g" kbs-config.toml
+			# Trustee moved to ITA v2 appraisal API which changed the tee-pubkey/attester_type paths under tdx.
+			sed -i -e '/trusted_jwk_sets/a extra_teekey_paths = ["/tdx/attester_runtime_data/tee-pubkey"]' kbs-config.toml
+			sed -i -e 's:attester_type:tdx"]["attester_type:' policy.rego
 		popd
 
 		if [[ -n "${HTTPS_PROXY}" ]]; then

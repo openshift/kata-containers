@@ -12,16 +12,18 @@ use agent::{
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use common::message::{Action, Message};
 use common::types::utils::option_system_time_into;
 use common::types::ContainerProcess;
+use common::{
+    message::{Action, Message},
+    types::DEFAULT_SHM_SIZE,
+};
 use common::{
     types::{SandboxConfig, SandboxExitInfo, SandboxStatus},
     ContainerManager, Sandbox, SandboxNetworkEnv,
 };
 
 use containerd_shim_protos::events::task::{TaskExit, TaskOOM};
-use hypervisor::PortDeviceConfig;
 use hypervisor::VsockConfig;
 use hypervisor::HYPERVISOR_FIRECRACKER;
 use hypervisor::HYPERVISOR_REMOTE;
@@ -30,9 +32,11 @@ use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{utils::get_hvsock_path, HybridVsockConfig, DEFAULT_GUEST_VSOCK_CID};
 use hypervisor::{BlockConfig, Hypervisor};
+use hypervisor::{BlockDeviceAio, PortDeviceConfig};
 use hypervisor::{ProtectionDeviceConfig, SevSnpConfig, TdxConfig};
 use kata_sys_util::hooks::HookStates;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
+use kata_sys_util::spec::load_oci_spec;
 use kata_types::capabilities::CapabilityBits;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
@@ -92,6 +96,7 @@ pub struct VirtSandbox {
     hypervisor: Arc<dyn Hypervisor>,
     monitor: Arc<HealthCheck>,
     sandbox_config: Option<SandboxConfig>,
+    shm_size: u64,
 }
 
 impl std::fmt::Debug for VirtSandbox {
@@ -122,6 +127,7 @@ impl VirtSandbox {
             hypervisor,
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
+            shm_size: sandbox_config.shm_size,
             sandbox_config: Some(sandbox_config),
         })
     }
@@ -374,10 +380,6 @@ impl VirtSandbox {
         hypervisor_config: &HypervisorConfig,
         init_data: Option<String>,
     ) -> Result<Option<ProtectionDeviceConfig>> {
-        if !hypervisor_config.security_info.confidential_guest {
-            return Ok(None);
-        }
-
         let available_protection = available_guest_protection()?;
         info!(
             sl!(),
@@ -429,6 +431,7 @@ impl VirtSandbox {
                     debug: false,
                 })))
             },
+            GuestProtection::NoProtection => Ok(None),
             _ => Err(anyhow!("confidential_guest requested by configuration but no supported protection available"))
         }
     }
@@ -452,6 +455,10 @@ impl VirtSandbox {
             GuestProtection::Snp(_details) => {
                 calculate_initdata_digest(&initdata, ProtectedPlatform::Snp)?
             }
+            GuestProtection::Se => calculate_initdata_digest(&initdata, ProtectedPlatform::Se)?,
+            GuestProtection::NoProtection => {
+                calculate_initdata_digest(&initdata, ProtectedPlatform::NoProtection)?
+            }
             // TODO: there's more `GuestProtection` types to be supported.
             _ => return Ok(None),
         };
@@ -469,11 +476,12 @@ impl VirtSandbox {
             sl!(),
             "initdata push data into compressed block: {:?}", &image_path
         );
-        let block_driver = &hypervisor_config.boot_info.vm_rootfs_driver;
+        let block_driver = &hypervisor_config.blockdev_info.block_device_driver;
         let block_config = BlockConfig {
             path_on_host: image_path.display().to_string(),
             is_readonly: true,
             driver_option: block_driver.clone(),
+            blkdev_aio: BlockDeviceAio::Native,
             ..Default::default()
         };
         let initdata_config = InitDataConfig(block_config, initdata_digest);
@@ -510,12 +518,18 @@ impl Sandbox for VirtSandbox {
             warn!(sl!(), "sandbox is started");
             return Ok(());
         }
+        let selinux_label = load_oci_spec().ok().and_then(|spec| {
+            spec.process()
+                .as_ref()
+                .and_then(|process| process.selinux_label().clone())
+        });
 
         self.hypervisor
             .prepare_vm(
                 id,
                 sandbox_config.network_env.netns.clone(),
                 &sandbox_config.annotations,
+                selinux_label,
             )
             .await
             .context("prepare vm")?;
@@ -606,7 +620,7 @@ impl Sandbox for VirtSandbox {
             dns: sandbox_config.dns.clone(),
             storages: self
                 .resource_manager
-                .get_storage_for_sandbox()
+                .get_storage_for_sandbox(self.shm_size)
                 .await
                 .context("get storages for sandbox")?,
             sandbox_pidns: false,
@@ -922,6 +936,7 @@ impl Persist for VirtSandbox {
             resource_manager,
             monitor: Arc::new(HealthCheck::new(true, keep_abnormal)),
             sandbox_config: None,
+            shm_size: DEFAULT_SHM_SIZE,
         })
     }
 }
