@@ -123,7 +123,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 
 	# We need the kernel packages for building the drivers cleanly will be
 	# deinstalled and removed from the roofs once the build finishes.
-	tar -xvf "${BUILD_DIR}"/kata-static-kernel-nvidia-gpu"${appendix}"-headers.tar.xz -C .
+	tar --zstd -xvf "${BUILD_DIR}"/kata-static-kernel-nvidia-gpu"${appendix}"-headers.tar.zst -C .
 
 	# If we find a local downloaded run file build the kernel modules
 	# with it, otherwise use the distribution packages. Run files may have
@@ -237,13 +237,17 @@ chisseled_gpudirect() {
 
 chisseled_init() {
 	echo "nvidia: chisseling init"
-	tar xvf "${BUILD_DIR}"/kata-static-busybox.tar.xz -C .
+	tar --zstd -xvf "${BUILD_DIR}"/kata-static-busybox.tar.zst -C .
 
 	mkdir -p dev etc proc run/cdi sys tmp usr var lib/modules lib/firmware \
 		 usr/share/nvidia lib/"${machine_arch}"-linux-gnu lib64        \
 		 usr/bin etc/modprobe.d
 
 	ln -sf ../run var/run
+
+	# Needed for various RUST static builds with LIBC=gnu
+	libdir=lib/"${machine_arch}"-linux-gnu
+	cp -a "${stage_one}"/"${libdir}"/libgcc_s.so.1*    "${libdir}"/.
 
 	tar xvf "${BUILD_DIR}"/kata-static-nvidia-nvrc.tar.zst -C .
 	# make sure NVRC is the init process for the initrd and image case

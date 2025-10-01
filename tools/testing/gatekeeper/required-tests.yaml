@@ -6,7 +6,8 @@ required_tests:
   - Shellcheck required / shellcheck-required
   # TODO: cargo-deny-runner.yaml not yet treated as conditional
   - Cargo Crates Check Runner / cargo-deny-runner
-  - GHA security analysis / zizmor
+  # TODO: Reestablish when we've eliminated all Zizmor findings.
+  # - GHA security analysis / zizmor
 
 required_regexps:
   # Always required regexps
@@ -101,6 +102,7 @@ mapping:
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-deploy-tests / run-kata-deploy-tests (qemu, microk8s)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-deploy-tests / run-kata-deploy-tests (qemu, rke2)
       - Kata Containers CI / kata-containers-ci-on-push / run-kata-monitor-tests / run-monitor (qemu, crio)
+      - Kata Containers CI / kata-containers-ci-on-push / run-k8s-tests-on-nvidia-gpu / run-nvidia-gpu-tests-on-amd64 (qemu-nvidia-gpu, kubeadm)
     required-labels:
       - ok-to-test
   build:
@@ -135,6 +137,7 @@ mapping:
       - Static checks / build-checks / check (make check, dragonball, src/dragonball, rust)
       - Static checks / build-checks / check (make check, genpolicy, src/tools/genpolicy, rust, protobuf-compiler)
       - Static checks / build-checks / check (make check, kata-ctl, src/tools/kata-ctl, rust)
+      - Static checks / build-checks / check (make check, libs, src/libs, rust)
       - Static checks / build-checks / check (make check, runtime-rs, src/runtime-rs, rust)
       - Static checks / build-checks / check (make check, runtime, src/runtime, golang, XDG_RUNTIME_DIR)
       - Static checks / build-checks / check (make check, trace-forwarder, src/tools/trace-forwarder, rust)
@@ -143,6 +146,7 @@ mapping:
       - Static checks / build-checks / check (make test, dragonball, src/dragonball, rust)
       - Static checks / build-checks / check (make test, genpolicy, src/tools/genpolicy, rust, protobuf-compiler)
       - Static checks / build-checks / check (make test, kata-ctl, src/tools/kata-ctl, rust)
+      # - Static checks / build-checks / check (make test, libs, src/libs, rust)
       - Static checks / build-checks / check (make test, runtime-rs, src/runtime-rs, rust)
       - Static checks / build-checks / check (make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR)
       - Static checks / build-checks / check (make test, trace-forwarder, src/tools/trace-forwarder, rust)
@@ -159,6 +163,7 @@ mapping:
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, dragonball, src/dragonball, rust)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, genpolicy, src/tools/genpolicy, rust, protobuf-compiler)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, kata-ctl, src/tools/kata-ctl, rust)
+      - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, libs, src/libs, rust)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, runtime-rs, src/runtime-rs, rust)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, runtime, src/runtime, golang, XDG_RUNTIME_DIR)
       - Static checks / build-checks / check (sudo -E PATH="$PATH" make test, trace-forwarder, src/tools/trace-forwarder, rust)

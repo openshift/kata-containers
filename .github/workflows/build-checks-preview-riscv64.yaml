@@ -12,12 +12,12 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 name: Build checks preview riscv64
 jobs:
   check:
+    name: check
     runs-on: ${{ inputs.instance }}
     strategy:
       fail-fast: false

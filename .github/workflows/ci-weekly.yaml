@@ -30,8 +30,7 @@ on:
       KBUILD_SIGN_PIN:
         required: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build-kata-static-tarball-amd64:
@@ -67,6 +66,7 @@ jobs:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
   build-and-publish-tee-confidential-unencrypted-image:
+    name: build-and-publish-tee-confidential-unencrypted-image
     permissions:
       contents: read
       packages: write

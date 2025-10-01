@@ -27,14 +27,14 @@ setup() {
 	auto_generate_policy "${pod_policy_settings_dir}" "${pod_yaml_file}"
 
 	# Add policy to pod-secret-env.yaml.
-	#
-	# TODO: auto-generate policy for this pod YAML after solving
-	# https://github.com/kata-containers/kata-containers/issues/10033
 	pod_env_yaml_file="${pod_config_dir}/pod-secret-env.yaml"
 	set_node "$pod_env_yaml_file" "$node"
 	pod_env_cmd="printenv"
 	pod_env_exec_command=(sh -c "${pod_env_cmd}")
-	add_allow_all_policy_to_yaml "${pod_env_yaml_file}"
+	pod_env_policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
+	add_exec_to_policy_settings "${pod_env_policy_settings_dir}" "${pod_env_exec_command[@]}"
+	add_requests_to_policy_settings "${pod_env_policy_settings_dir}" "ReadStreamRequest"
+	auto_generate_policy "${pod_env_policy_settings_dir}" "${pod_env_yaml_file}" "${pod_config_dir}/inject_secret.yaml"
 }
 
 @test "Credentials using secrets" {
@@ -55,8 +55,8 @@ setup() {
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$pod_name"
 
 	# List the files
-	kubectl exec $pod_name -- "${pod_exec_command[@]}" | grep -w "password"
-	kubectl exec $pod_name -- "${pod_exec_command[@]}" | grep -w "username"
+	pod_exec_with_retries "${pod_name}" "${pod_exec_command[@]}" | grep -w "password"
+	pod_exec_with_retries "${pod_name}" "${pod_exec_command[@]}" | grep -w "username"
 
 	# Create a pod that has access to the secret data through environment variables
 	kubectl create -f "${pod_env_yaml_file}"
@@ -65,8 +65,8 @@ setup() {
 	kubectl wait --for=condition=Ready --timeout=$timeout pod "$second_pod_name"
 
 	# Display environment variables
-	kubectl exec $second_pod_name -- "${pod_env_exec_command[@]}" | grep -w "SECRET_USERNAME"
-	kubectl exec $second_pod_name -- "${pod_env_exec_command[@]}" | grep -w "SECRET_PASSWORD"
+	pod_exec_with_retries "${second_pod_name}" "${pod_env_exec_command[@]}" | grep -w "SECRET_USERNAME"
+	pod_exec_with_retries "${second_pod_name}" "${pod_env_exec_command[@]}" | grep -w "SECRET_PASSWORD"
 }
 
 teardown() {
@@ -76,6 +76,7 @@ teardown() {
 	kubectl delete secret "$secret_name"
 
 	delete_tmp_policy_settings_dir "${pod_policy_settings_dir}"
+	delete_tmp_policy_settings_dir "${pod_env_policy_settings_dir}"
 
 	teardown_common "${node}" "${node_start_time:-}"
 }

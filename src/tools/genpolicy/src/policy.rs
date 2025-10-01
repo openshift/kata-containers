@@ -17,7 +17,6 @@ use crate::utils;
 use crate::yaml;
 
 use anyhow::Result;
-use base64::{engine::general_purpose, Engine as _};
 use log::debug;
 use oci_spec::runtime as oci;
 use protocols::agent;
@@ -355,6 +354,16 @@ pub struct UpdateInterfaceRequestDefaults {
     forbidden_hw_addrs: Vec<String>,
 }
 
+/// UpdateInterfaceRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AddARPNeighborsRequestDefaults {
+    /// Explicitly blocked interface names. Intent is to block changes to loopback interface.
+    forbidden_device_names: Vec<String>,
+    /// Explicitly blocked IP address ranges.
+    /// Should include loopback addresses and other CIDRs that should not be routed outside the VM.
+    forbidden_cidrs_regex: Vec<String>,
+}
+
 /// Settings specific to each kata agent endpoint, loaded from
 /// genpolicy-settings.json.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -373,6 +382,9 @@ pub struct RequestDefaults {
 
     /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
     pub UpdateInterfaceRequest: UpdateInterfaceRequestDefaults,
+
+    /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
+    pub AddARPNeighborsRequest: AddARPNeighborsRequestDefaults,
 
     /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
     pub CloseStdinRequest: bool,
@@ -523,11 +535,11 @@ impl AgentPolicy {
     pub fn export_policy(&mut self) {
         let mut yaml_string = String::new();
         for i in 0..self.resources.len() {
-            let policy = self.resources[i].generate_policy(self);
+            let annotation = self.resources[i].generate_initdata_anno(self);
             if self.config.base64_out {
-                println!("{}", policy);
+                println!("{}", annotation);
             }
-            yaml_string += &self.resources[i].serialize(&policy);
+            yaml_string += &self.resources[i].serialize(&annotation);
         }
 
         if let Some(yaml_file) = &self.config.yaml_file {
@@ -545,7 +557,7 @@ impl AgentPolicy {
         }
     }
 
-    pub fn generate_policy(&self, resource: &dyn yaml::K8sResource) -> String {
+    pub fn generate_initdata_anno(&self, resource: &dyn yaml::K8sResource) -> String {
         let yaml_containers = resource.get_containers();
         let mut policy_containers = Vec::new();
 
@@ -565,7 +577,10 @@ impl AgentPolicy {
         if self.config.raw_out {
             std::io::stdout().write_all(policy.as_bytes()).unwrap();
         }
-        general_purpose::STANDARD.encode(policy.as_bytes())
+        let mut initdata = kata_types::initdata::InitData::new("sha256", "0.1.0");
+        initdata.insert_data("policy.rego", policy);
+
+        kata_types::initdata::encode_initdata(&initdata)
     }
 
     pub fn get_container_policy(
@@ -945,7 +960,7 @@ fn get_container_annotations(
     if let Some(name) = resource.get_sandbox_name() {
         annotations
             .entry("io.kubernetes.cri.sandbox-name".to_string())
-            .or_insert(name);
+            .or_insert(format!("^{name}$"));
     }
 
     if !is_pause_container {

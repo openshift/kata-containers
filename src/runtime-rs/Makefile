@@ -147,6 +147,7 @@ DEFMAXMEMSZ := 0
 ##VAR DEFBRIDGES=<number> Default number of bridges
 DEFBRIDGES := 0
 DEFENABLEANNOTATIONS := [\"kernel_params\"]
+DEFENABLEANNOTATIONS_COCO := [\"kernel_params\",\"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFDISABLEGUESTEMPTYDIR := false
 ##VAR DEFAULTEXPFEATURES=[features] Default experimental features enabled
@@ -226,7 +227,7 @@ ifneq (,$(DBCMD))
     # dragonball-specific options (all should be suffixed by "_DB")
     VMROOTFSDRIVER_DB := virtio-blk-pci
     DEFMAXVCPUS_DB := 0
-    DEFBLOCKSTORAGEDRIVER_DB := virtio-blk-mmio
+    DEFBLOCKSTORAGEDRIVER_DB := virtio-blk-pci
     DEFNETWORKMODEL_DB := tcfilter
     KERNELPARAMS_DB = console=ttyS1 agent.log_vport=1025
     KERNELTYPE_DB = uncompressed
@@ -314,7 +315,7 @@ ifeq ($(ARCH), s390x)
     DEFBLOCKSTORAGEDRIVER_QEMU := virtio-blk-ccw
 else
     VMROOTFSDRIVER_QEMU := virtio-pmem
-    DEFBLOCKSTORAGEDRIVER_QEMU := virtio-blk-pci
+    DEFBLOCKSTORAGEDRIVER_QEMU := virtio-scsi
 endif
     DEFVCPUS_QEMU := 1
     DEFMAXVCPUS_QEMU := 0
@@ -482,6 +483,7 @@ USER_VARS += DEFVIRTIOFSCACHE
 USER_VARS += DEFVIRTIOFSQUEUESIZE
 USER_VARS += DEFVIRTIOFSEXTRAARGS
 USER_VARS += DEFENABLEANNOTATIONS
+USER_VARS += DEFENABLEANNOTATIONS_COCO
 USER_VARS += DEFENABLEIOTHREADS
 USER_VARS += DEFSECCOMPSANDBOXPARAM
 USER_VARS += DEFGUESTSELINUXLABEL

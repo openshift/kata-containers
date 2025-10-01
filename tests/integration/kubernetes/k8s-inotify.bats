@@ -12,11 +12,11 @@ setup() {
 	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
 	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
 	issue_url="https://github.com/kata-containers/kata-containers/issues/8906"
-	[ "${KATA_HYPERVISOR}" == "qemu-se" ] && skip "test not working for IBM Z LPAR (see ${issue_url})"
+        [[ "${KATA_HYPERVISOR}" == qemu-se* ]] && skip "test not working for IBM Z LPAR (see ${issue_url})"
 	get_pod_config_dir
 
 	pod_yaml="${pod_config_dir}"/inotify-configmap-pod.yaml
-	add_allow_all_policy_to_yaml "${pod_yaml}"
+	auto_generate_policy "${pod_config_dir}" "${pod_yaml}"
 }
 
 @test "configmap update works, and preserves symlinks" {
@@ -50,7 +50,7 @@ teardown() {
 	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
 	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
 	issue_url="https://github.com/kata-containers/kata-containers/issues/8906"
-	[ "${KATA_HYPERVISOR}" == "qemu-se" ] && skip "test not working for IBM Z LPAR (see ${issue_url})"
+        [[ "${KATA_HYPERVISOR}" == qemu-se* ]] && skip "test not working for IBM Z LPAR (see ${issue_url})"
 
 	# Debugging information
 	kubectl describe "pod/$pod_name"

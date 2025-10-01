@@ -857,11 +857,7 @@ impl yaml::K8sResource for Pod {
     }
 
     fn get_sandbox_name(&self) -> Option<String> {
-        let name = self.metadata.get_name();
-        if !name.is_empty() {
-            return Some(name);
-        }
-        panic!("No pod name.");
+        yaml::name_regex_from_meta(&self.metadata)
     }
 
     fn get_namespace(&self) -> Option<String> {
@@ -884,8 +880,8 @@ impl yaml::K8sResource for Pod {
         );
     }
 
-    fn generate_policy(&self, agent_policy: &policy::AgentPolicy) -> String {
-        agent_policy.generate_policy(self)
+    fn generate_initdata_anno(&self, agent_policy: &policy::AgentPolicy) -> String {
+        agent_policy.generate_initdata_anno(self)
     }
 
     fn serialize(&mut self, policy: &str) -> String {

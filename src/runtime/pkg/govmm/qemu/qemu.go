@@ -330,6 +330,9 @@ type Object struct {
 	// for the SNP_LAUNCH_FINISH command defined in the SEV-SNP firmware ABI (default: all-zero)
 	SnpIdAuth string
 
+	// SnpGuestPolicy is the integer representation of the SEV-SNP guest policy.
+	SnpGuestPolicy *uint64
+
 	// Raw byte slice of initdata digest
 	InitdataDigest []byte
 }
@@ -414,6 +417,9 @@ func (object Object) QemuParams(config *Config) []string {
 		}
 		if object.SnpIdAuth != "" {
 			objectParams = append(objectParams, fmt.Sprintf("id-auth=%s", object.SnpIdAuth))
+		}
+		if object.SnpGuestPolicy != nil {
+			objectParams = append(objectParams, fmt.Sprintf("policy=%d", *object.SnpGuestPolicy))
 		}
 		if len(object.InitdataDigest) > 0 {
 			// due to https://github.com/confidential-containers/qemu/blob/amd-snp-202402240000/qapi/qom.json#L926-L929
@@ -2403,9 +2409,10 @@ func (v RngDevice) deviceName(config *Config) string {
 // BalloonDevice represents a memory balloon device.
 // nolint: govet
 type BalloonDevice struct {
-	DeflateOnOOM  bool
-	DisableModern bool
-	ID            string
+	DeflateOnOOM      bool
+	DisableModern     bool
+	FreePageReporting bool
+	ID                string
 
 	// ROMFile specifies the ROM file being used for this device.
 	ROMFile string
@@ -2451,6 +2458,11 @@ func (b BalloonDevice) QemuParams(config *Config) []string {
 	}
 	if s := b.Transport.disableModern(config, b.DisableModern); s != "" {
 		deviceParams = append(deviceParams, s)
+	}
+	if b.FreePageReporting {
+		deviceParams = append(deviceParams, "free-page-reporting=on")
+	} else {
+		deviceParams = append(deviceParams, "free-page-reporting=off")
 	}
 	qemuParams = append(qemuParams, "-device")
 	qemuParams = append(qemuParams, strings.Join(deviceParams, ","))

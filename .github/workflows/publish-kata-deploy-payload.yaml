@@ -34,11 +34,11 @@ on:
       QUAY_DEPLOYER_PASSWORD:
         required: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   kata-payload:
+    name: kata-payload
     permissions:
       contents: read
       packages: write
@@ -85,6 +85,6 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           ./tools/packaging/kata-deploy/local-build/kata-deploy-build-and-upload-payload.sh \
-          "$(pwd)/kata-static.tar.xz" \
+          "$(pwd)/kata-static.tar.zst" \
           "${REGISTRY}/${REPO}" \
           "${TAG}"

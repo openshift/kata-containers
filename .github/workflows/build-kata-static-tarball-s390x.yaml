@@ -27,11 +27,11 @@ on:
         required: true
 
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build-asset:
+    name: build-asset
     runs-on: s390x
     permissions:
       contents: read
@@ -115,11 +115,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-s390x-${{ matrix.asset }}${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-${{ matrix.asset }}.tar.xz
+          path: kata-build/kata-static-${{ matrix.asset }}.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   build-asset-rootfs:
+    name: build-asset-rootfs
     runs-on: s390x
     needs: build-asset
     permissions:
@@ -182,11 +183,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-s390x-${{ matrix.asset }}${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-${{ matrix.asset }}.tar.xz
+          path: kata-build/kata-static-${{ matrix.asset }}.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   build-asset-boot-image-se:
+    name: build-asset-boot-image-se
     runs-on: s390x
     needs: [build-asset, build-asset-rootfs]
     permissions:
@@ -230,12 +232,13 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-s390x${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-boot-image-se.tar.xz
+          path: kata-build/kata-static-boot-image-se.tar.zst
           retention-days: 1
           if-no-files-found: error
 
   # We don't need the binaries installed in the rootfs as part of the release tarball, so can delete them now we've built the rootfs
   remove-rootfs-binary-artifacts:
+    name: remove-rootfs-binary-artifacts
     runs-on: ubuntu-22.04
     needs: [build-asset-rootfs, build-asset-boot-image-se]
     strategy:
@@ -251,6 +254,7 @@ jobs:
           name: kata-artifacts-s390x-${{ matrix.asset}}${{ inputs.tarball-suffix }}
 
   build-asset-shim-v2:
+    name: build-asset-shim-v2
     runs-on: s390x
     needs: [build-asset, build-asset-rootfs, remove-rootfs-binary-artifacts]
     permissions:
@@ -307,11 +311,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-s390x-shim-v2${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-shim-v2.tar.xz
+          path: kata-build/kata-static-shim-v2.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   create-kata-tarball:
+    name: create-kata-tarball
     runs-on: s390x
     needs:
       - build-asset
@@ -348,6 +353,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-static-tarball-s390x${{ inputs.tarball-suffix }}
-          path: kata-static.tar.xz
+          path: kata-static.tar.zst
           retention-days: 15
           if-no-files-found: error

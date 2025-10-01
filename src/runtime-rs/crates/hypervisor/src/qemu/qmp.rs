@@ -4,11 +4,13 @@
 //
 
 use crate::device::pci_path::PciPath;
-use crate::qemu::cmdline_generator::{DeviceVirtioNet, Netdev};
+use crate::qemu::cmdline_generator::{DeviceVirtioNet, Netdev, QMP_SOCKET_FILE};
+use crate::utils::get_jailer_root;
 use crate::VcpuThreadIds;
 
 use anyhow::{anyhow, Context, Result};
 use kata_types::config::hypervisor::VIRTIO_SCSI;
+use kata_types::rootless::is_rootless;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -634,6 +636,7 @@ impl Qmp {
             // add SCSI frontend device
             blkdev_add_args.insert("scsi-id".to_string(), scsi_id.into());
             blkdev_add_args.insert("lun".to_string(), lun.into());
+            blkdev_add_args.insert("share-rw".to_string(), true.into());
 
             self.qmp
                 .execute(&qmp::device_add {
@@ -654,6 +657,7 @@ impl Qmp {
         } else {
             let (bus, slot) = self.find_free_slot()?;
             blkdev_add_args.insert("addr".to_owned(), format!("{:02}", slot).into());
+            blkdev_add_args.insert("share-rw".to_string(), true.into());
 
             self.qmp
                 .execute(&qmp::device_add {
@@ -823,4 +827,12 @@ pub fn get_pci_path_by_qdev_id(
         path.pop();
     }
     None
+}
+
+pub fn get_qmp_socket_path(sid: &str) -> String {
+    if is_rootless() {
+        [get_jailer_root(sid).as_str(), QMP_SOCKET_FILE].join("/")
+    } else {
+        QMP_SOCKET_FILE.to_string()
+    }
 }

@@ -55,7 +55,7 @@ rootfs_type=@DEFROOTFSTYPE@
 # List of valid annotation names for the hypervisor
 # Each member of the list is a regular expression, which is the base name
 # of the annotation, e.g. "path" for io.katacontainers.config.hypervisor.path"
-enable_annotations = @DEFENABLEANNOTATIONSTEE@
+enable_annotations = @DEFENABLEANNOTATIONS_COCO@
 
 # List of valid annotations values for the hypervisor
 # Each member of the list is a path pattern as described by glob(3).
@@ -212,6 +212,10 @@ virtio_fs_extra_args = @DEFVIRTIOFSEXTRAARGS@
 #    Metadata, data, and pathname lookup are not cached in guest. They are
 #    always fetched from host and any changes are immediately pushed to host.
 #
+#  - metadata
+#    Metadata and pathname lookup are cached in guest and never expire.
+#    Data is never cached in guest.
+#
 #  - auto
 #    Metadata and pathname lookup cache expires after a configured amount of
 #    time (default is 1 second). Data is cached while the file is open (close
@@ -268,6 +272,16 @@ enable_iothreads = @DEFENABLEIOTHREADS@
 # to be very predictable
 # Default false
 #enable_mem_prealloc = true
+
+# Reclaim guest freed memory.
+# Enabling this will result in the VM balloon device having f_reporting=on set.
+# Then the hypervisor will use it to reclaim guest freed memory.
+# This is useful for reducing the amount of memory used by a VM.
+# Enabling this feature may sometimes reduce the speed of memory access in
+# the VM.
+#
+# Default false
+#reclaim_guest_freed_memory = true
 
 # Enable huge pages for VM RAM, default false
 # Enabling this will result in the VM memory

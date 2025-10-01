@@ -34,9 +34,7 @@ export dragonball_limitations="https://github.com/kata-containers/kata-container
 # overwrite it.
 export KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/config}"
 
-# ALLOW_ALL_POLICY is a Rego policy that allows all the Agent ttrpc requests.
 K8S_TEST_DIR="${kubernetes_dir:-"${BATS_TEST_DIRNAME}"}"
-ALLOW_ALL_POLICY="${ALLOW_ALL_POLICY:-$(base64 -w 0 "${K8S_TEST_DIR}/../../../src/kata-opa/allow-all.rego")}"
 
 AUTO_GENERATE_POLICY="${AUTO_GENERATE_POLICY:-}"
 GENPOLICY_PULL_METHOD="${GENPOLICY_PULL_METHOD:-}"
@@ -127,11 +125,25 @@ adapt_common_policy_settings_for_non_coco() {
 	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
 }
 
+# adapt common policy settings for CBL-Mariner Hosts
+adapt_common_policy_settings_for_cbl_mariner() {
+	local settings_dir=$1
+
+	info "Adapting common policy settings for KATA_HOST_OS=cbl-mariner"
+	jq '.kata_config.oci_version = "1.2.0"' "${settings_dir}/genpolicy-settings.json" > temp.json && sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+}
+
 # adapt common policy settings for various platforms
 adapt_common_policy_settings() {
 	local settings_dir=$1
 
 	is_coco_platform || adapt_common_policy_settings_for_non_coco "${settings_dir}"
+
+	case "${KATA_HOST_OS}" in
+		"cbl-mariner")
+			adapt_common_policy_settings_for_cbl_mariner "${settings_dir}"
+			;;
+	esac
 }
 
 # If auto-generated policy testing is enabled, make a copy of the genpolicy settings,
@@ -294,6 +306,31 @@ hard_coded_policy_tests_enabled() {
 	[[ "${enabled}" == "yes" ]]
 }
 
+encode_policy_in_init_data() {
+  local input="$1"   # either a filename or a policy
+  local POLICY
+
+  # if input is a file, read its contents
+  if [[ -f "$input" ]]; then
+    POLICY="$(< "$input")"
+  else
+    POLICY="$input"
+  fi
+
+  cat <<EOF | gzip -c | base64 -w0
+version = "0.1.0"
+algorithm = "sha256"
+
+[data]
+"policy.rego" = '''
+$POLICY
+'''
+EOF
+}
+
+# ALLOW_ALL_POLICY is a Rego policy that allows all the Agent ttrpc requests.
+ALLOW_ALL_POLICY="${ALLOW_ALL_POLICY:-$(encode_policy_in_init_data "${K8S_TEST_DIR}/../../../src/kata-opa/allow-all.rego")}"
+
 add_allow_all_policy_to_yaml() {
 	hard_coded_policy_tests_enabled || return 0
 
@@ -302,21 +339,20 @@ add_allow_all_policy_to_yaml() {
 	# By default was changing only the first object.
 	# With yq>4 we need to make it explicit during the read and write.
 	local resource_kind
-	resource_kind=$(yq .kind "${yaml_file}" | head -1)
+	resource_kind=$(yq eval 'select(documentIndex == 0) | .kind' "${yaml_file}")
 
 	case "${resource_kind}" in
-
 	Pod)
 		info "Adding allow all policy to ${resource_kind} from ${yaml_file}"
 		yq -i \
-			".metadata.annotations.\"io.katacontainers.config.agent.policy\" = \"${ALLOW_ALL_POLICY}\"" \
+			".metadata.annotations.\"io.katacontainers.config.hypervisor.cc_init_data\" = \"${ALLOW_ALL_POLICY}\"" \
       "${yaml_file}"
 		;;
 
 	Deployment|Job|ReplicationController)
 		info "Adding allow all policy to ${resource_kind} from ${yaml_file}"
 		yq -i \
-			".spec.template.metadata.annotations.\"io.katacontainers.config.agent.policy\" = \"${ALLOW_ALL_POLICY}\"" \
+			".spec.template.metadata.annotations.\"io.katacontainers.config.hypervisor.cc_init_data\" = \"${ALLOW_ALL_POLICY}\"" \
       "${yaml_file}"
 		;;
 
@@ -394,35 +430,90 @@ teardown_common() {
 	fi
 }
 
-# Invoke "kubectl exec", log its output, and check that a grep pattern is present in the output.
+# Execute a command in a pod and grep kubectl's output.
 #
-# Retry "kubectl exec" several times in case it unexpectedly returns an empty output string,
-# in an attempt to work around issues similar to https://github.com/kubernetes/kubernetes/issues/124571.
+# This function retries "kubectl exec" several times, if:
+# - kubectl returns a failure exit code, or
+# - kubectl exits successfully but produces empty console output.
+# These retries are an attempt to work around issues similar to https://github.com/kubernetes/kubernetes/issues/124571.
 #
 # Parameters:
 #	$1	- pod name
 #	$2	- the grep pattern
 #	$3+	- the command to execute using "kubectl exec"
 #
+# Exit code:
+#	Equal to grep's exit code
 grep_pod_exec_output() {
 	local -r pod_name="$1"
 	shift
 	local -r grep_arg="$1"
 	shift
-	local grep_out=""
+	pod_exec_with_retries "${pod_name}" "$@" | grep "${grep_arg}"
+}
+
+# Execute a command in a pod and echo kubectl's output to stdout.
+#
+# This function retries "kubectl exec" several times, if:
+# - kubectl returns a failure exit code, or
+# - kubectl exits successfully but produces empty console output.
+# These retries are an attempt to work around issues similar to https://github.com/kubernetes/kubernetes/issues/124571.
+#
+# Parameters:
+#	$1	- pod name
+#	$2+	- the command to execute using "kubectl exec"
+#
+# Exit code:
+#	0
+pod_exec_with_retries() {
+	local -r pod_name="$1"
+	shift
+	local -r container_name=""
+
+	container_exec_with_retries "${pod_name}" "${container_name}" "$@"
+}
+
+# Execute a command in a pod's container and echo kubectl's output to stdout.
+#
+# If the caller specifies an empty container name as parameter, the command is executed in pod's default container,
+# or in pod's first container if there is no default.
+#
+# This function retries "kubectl exec" several times, if:
+# - kubectl returns a failure exit code, or
+# - kubectl exits successfully but produces empty console output.
+# These retries are an attempt to work around issues similar to https://github.com/kubernetes/kubernetes/issues/124571.
+#
+# Parameters:
+#	$1	- pod name
+#	$2	- container name
+#	$3+	- the command to execute using "kubectl exec"
+#
+# Exit code:
+#	0
+container_exec_with_retries() {
+	local -r pod_name="$1"
+	shift
+	local -r container_name="$1"
+	shift
 	local cmd_out=""
 
 	for _ in {1..10}; do
-		info "Executing in pod ${pod_name}: $*"
-		cmd_out=$(kubectl exec "${pod_name}" -- "$@")
-		if [[ -n "${cmd_out}" ]]; then
-			info "command output: ${cmd_out}"
-			grep_out=$(echo "${cmd_out}" | grep "${grep_arg}")
-			info "grep output: ${grep_out}"
-			break
+		if [[ -n "${container_name}" ]]; then
+			bats_unbuffered_info "Executing in pod ${pod_name}, container ${container_name}: $*"
+			cmd_out=$(kubectl exec "${pod_name}" -c "${container_name}" -- "$@") || (bats_unbuffered_info "kubectl exec failed" ; cmd_out="")
+		else
+			bats_unbuffered_info "Executing in pod ${pod_name}: $*"
+			cmd_out=$(kubectl exec "${pod_name}" -- "$@") || (bats_unbuffered_info "kubectl exec failed" ; cmd_out="")
 		fi
-		warn "Empty output from kubectl exec"
-		sleep 1
+
+		if [[ -n "${cmd_out}" ]]; then
+			bats_unbuffered_info "command output: ${cmd_out}"
+			break
+		else
+			bats_unbuffered_info "Warning: empty output from kubectl exec"
+			sleep 1
+		fi
 	done
-	[[ -n "${grep_out}" ]]
+
+	echo "${cmd_out}"
 }

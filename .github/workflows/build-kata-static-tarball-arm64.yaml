@@ -24,11 +24,11 @@ on:
       QUAY_DEPLOYER_PASSWORD:
         required: false
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build-asset:
+    name: build-asset
     runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
@@ -121,7 +121,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-arm64-${{ matrix.asset }}${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-${{ matrix.asset }}.tar.xz
+          path: kata-build/kata-static-${{ matrix.asset }}.tar.zst
           retention-days: 15
           if-no-files-found: error
 
@@ -130,11 +130,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-arm64-${{ matrix.asset }}-headers${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-${{ matrix.asset }}-headers.tar.xz
+          path: kata-build/kata-static-${{ matrix.asset }}-headers.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   build-asset-rootfs:
+    name: build-asset-rootfs
     runs-on: ubuntu-22.04-arm
     needs: build-asset
     permissions:
@@ -195,12 +196,13 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-arm64-${{ matrix.asset }}${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-${{ matrix.asset }}.tar.xz
+          path: kata-build/kata-static-${{ matrix.asset }}.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   # We don't need the binaries installed in the rootfs as part of the release tarball, so can delete them now we've built the rootfs
   remove-rootfs-binary-artifacts:
+    name: remove-rootfs-binary-artifacts
     runs-on: ubuntu-22.04-arm
     needs: build-asset-rootfs
     strategy:
@@ -215,6 +217,7 @@ jobs:
 
   # We don't need the binaries installed in the rootfs as part of the release tarball, so can delete them now we've built the rootfs
   remove-rootfs-binary-artifacts-for-release:
+    name: remove-rootfs-binary-artifacts-for-release
     runs-on: ubuntu-22.04-arm
     needs: build-asset-rootfs
     strategy:
@@ -228,6 +231,7 @@ jobs:
           name: kata-artifacts-arm64-${{ matrix.asset}}${{ inputs.tarball-suffix }}
 
   build-asset-shim-v2:
+    name: build-asset-shim-v2
     runs-on: ubuntu-22.04-arm
     needs: [build-asset, build-asset-rootfs, remove-rootfs-binary-artifacts, remove-rootfs-binary-artifacts-for-release]
     permissions:
@@ -282,11 +286,12 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-artifacts-arm64-shim-v2${{ inputs.tarball-suffix }}
-          path: kata-build/kata-static-shim-v2.tar.xz
+          path: kata-build/kata-static-shim-v2.tar.zst
           retention-days: 15
           if-no-files-found: error
 
   create-kata-tarball:
+    name: create-kata-tarball
     runs-on: ubuntu-22.04-arm
     needs: [build-asset, build-asset-rootfs, build-asset-shim-v2]
     permissions:
@@ -319,6 +324,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kata-static-tarball-arm64${{ inputs.tarball-suffix }}
-          path: kata-static.tar.xz
+          path: kata-static.tar.zst
           retention-days: 15
           if-no-files-found: error
