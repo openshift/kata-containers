@@ -175,7 +175,7 @@ function deploy_kata() {
 
 	ANNOTATIONS="default_vcpus"
 	if [[ "${KATA_HOST_OS}" = "cbl-mariner" ]]; then
-		ANNOTATIONS="image kernel default_vcpus disable_image_nvdimm"
+		ANNOTATIONS="image kernel default_vcpus disable_image_nvdimm cc_init_data"
 	fi
 	if [[ "${KATA_HYPERVISOR}" = "qemu" ]]; then
 		ANNOTATIONS="image initrd kernel default_vcpus"
@@ -289,7 +289,7 @@ function run_tests() {
 	if [[ "${KATA_HYPERVISOR}" = "dragonball" ]] && [[ "${SNAPSHOTTER}" = "devmapper" ]]; then
 		echo "Skipping tests for ${KATA_HYPERVISOR} using devmapper"
 	else
-		bash run_kubernetes_tests.sh
+		bash "${K8STESTS}"
 	fi
 	popd
 }
@@ -566,7 +566,6 @@ function main() {
 	action="${1:-}"
 
 	case "${action}" in
-		install-azure-cli) install_azure_cli ;;
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
@@ -589,7 +588,14 @@ function main() {
 		deploy-kata-zvsi) deploy_kata "zvsi" ;;
 		deploy-snapshotter) deploy_snapshotter ;;
 		report-tests) report_tests ;;
-		run-tests) run_tests ;;
+		run-tests)
+			K8STESTS=run_kubernetes_tests.sh
+			run_tests
+			;;
+		run-nv-tests)
+			K8STESTS=run_kubernetes_nv_tests.sh
+			run_tests
+			;;
 		run-tests-kcli) run_tests "kcli" ;;
 		collect-artifacts) collect_artifacts ;;
 		cleanup) cleanup ;;

@@ -7,8 +7,8 @@ use super::cmdline_generator::{get_network_device, QemuCmdLine, QMP_SOCKET_FILE}
 use super::qmp::Qmp;
 use crate::device::topology::PCIePort;
 use crate::{
-    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, HypervisorConfig,
-    MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
+    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
+    HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
 };
 
 use crate::utils::{bytes_to_megs, enter_netns, megs_to_bytes};
@@ -22,14 +22,16 @@ use kata_types::{
 };
 use persist::sandbox_persist::Persist;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::sync::{mpsc, Mutex};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, ChildStderr, Command},
+};
+use tokio::{
+    net::UnixStream,
+    sync::{mpsc, Mutex},
 };
 
 const VSOCK_SCHEME: &str = "vsock";
@@ -63,10 +65,22 @@ impl QemuInner {
         }
     }
 
-    pub(crate) async fn prepare_vm(&mut self, id: &str, netns: Option<String>) -> Result<()> {
+    pub(crate) async fn prepare_vm(
+        &mut self,
+        id: &str,
+        netns: Option<String>,
+        selinux_label: Option<String>,
+    ) -> Result<()> {
         info!(sl!(), "Preparing QEMU VM");
         self.id = id.to_string();
         self.netns = netns;
+
+        if !self.hypervisor_config().disable_selinux {
+            if let Some(label) = selinux_label.as_ref() {
+                self.config.security_info.selinux_label = Some(label.to_string());
+                selinux::set_exec_label(label).context("failed to set SELinux process label")?;
+            }
+        }
 
         let vm_path = [KATA_PATH, self.id.as_str()].join("/");
         std::fs::create_dir_all(vm_path)?;
@@ -194,11 +208,23 @@ impl QemuInner {
 
         info!(sl!(), "qemu cmd: {:?}", command);
 
-        // we need move the qemu process into Network Namespace.
+        // we need move the qemu process into Network Namespace and set SELinux label.
         unsafe {
+            let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre_exec = command.pre_exec(move || {
                 let _ = enter_netns(&netns);
-
+                if let Some(label) = selinux_label.as_ref() {
+                    if let Err(e) = selinux::set_exec_label(label) {
+                        error!(sl!(), "Failed to set SELinux label in child process: {}", e);
+                        // Don't return error here to avoid breaking the process startup
+                        // Log the error and continue
+                    } else {
+                        info!(
+                            sl!(),
+                            "Successfully set SELinux label in child process: {}", &label
+                        );
+                    }
+                }
                 Ok(())
             });
         }
@@ -222,6 +248,12 @@ impl QemuInner {
                 error!(sl!(), "couldn't initialise QMP: {:?}", e);
                 return Err(e);
             }
+        }
+
+        //When hypervisor debug is enabled, output the kernel boot messages for debugging.
+        if self.config.debug_info.enable_debug {
+            let stream = UnixStream::connect(console_socket_path.as_os_str()).await?;
+            tokio::spawn(log_qemu_console(stream));
         }
 
         Ok(())
@@ -288,13 +320,14 @@ impl QemuInner {
         todo!()
     }
 
-    pub(crate) async fn get_thread_ids(&self) -> Result<VcpuThreadIds> {
+    pub(crate) async fn get_thread_ids(&mut self) -> Result<VcpuThreadIds> {
         info!(sl!(), "QemuInner::get_thread_ids()");
-        //todo!()
-        let vcpu_thread_ids: VcpuThreadIds = VcpuThreadIds {
-            vcpus: HashMap::new(),
-        };
-        Ok(vcpu_thread_ids)
+
+        Ok(self
+            .qmp
+            .as_mut()
+            .and_then(|qmp| qmp.get_vcpu_thread_ids().ok())
+            .unwrap_or_default())
     }
 
     pub(crate) async fn get_vmm_master_tid(&self) -> Result<u32> {
@@ -569,6 +602,24 @@ impl QemuInner {
     }
 }
 
+async fn log_qemu_console(console: UnixStream) -> Result<()> {
+    info!(sl!(), "starting reading qemu console");
+
+    let stderr_reader = BufReader::new(console);
+    let mut stderr_lines = stderr_reader.lines();
+
+    while let Some(buffer) = stderr_lines
+        .next_line()
+        .await
+        .context("next_line() failed on qemu console")?
+    {
+        info!(sl!(), "vm console: {:?}", buffer);
+    }
+
+    info!(sl!(), "finished reading qemu console");
+    Ok(())
+}
+
 async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {
     info!(sl!(), "starting reading qemu stderr");
 
@@ -632,16 +683,24 @@ impl QemuInner {
                 qmp.hotplug_network_device(&netdev, &virtio_net_device)?
             }
             DeviceType::Block(mut block_device) => {
-                block_device.config.pci_path = qmp
+                let (pci_path, scsi_addr) = qmp
                     .hotplug_block_device(
                         &self.config.blockdev_info.block_device_driver,
-                        &block_device.device_id,
+                        block_device.config.index,
                         &block_device.config.path_on_host,
+                        &block_device.config.blkdev_aio.to_string(),
                         block_device.config.is_direct,
                         block_device.config.is_readonly,
                         block_device.config.no_drop,
                     )
                     .context("hotplug block device")?;
+
+                if pci_path.is_some() {
+                    block_device.config.pci_path = pci_path;
+                }
+                if scsi_addr.is_some() {
+                    block_device.config.scsi_addr = scsi_addr;
+                }
 
                 return Ok(DeviceType::Block(block_device));
             }

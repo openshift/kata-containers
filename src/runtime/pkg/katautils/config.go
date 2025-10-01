@@ -109,6 +109,7 @@ type hypervisor struct {
 	RemoteHypervisorSocket         string                    `toml:"remote_hypervisor_socket"`
 	SnpIdBlock                     string                    `toml:"snp_id_block"`
 	SnpIdAuth                      string                    `toml:"snp_id_auth"`
+	SnpGuestPolicy                 *uint64                   `toml:"snp_guest_policy"`
 	HypervisorPathList             []string                  `toml:"valid_hypervisor_paths"`
 	JailerPathList                 []string                  `toml:"valid_jailer_paths"`
 	VirtioFSDaemonList             []string                  `toml:"valid_virtio_fs_daemon_paths"`
@@ -951,6 +952,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		VirtioFSQueueSize:        h.VirtioFSQueueSize,
 		VirtioFSExtraArgs:        h.VirtioFSExtraArgs,
 		MemPrealloc:              h.MemPrealloc,
+		ReclaimGuestFreedMemory:  h.ReclaimGuestFreedMemory,
 		HugePages:                h.HugePages,
 		IOMMU:                    h.IOMMU,
 		IOMMUPlatform:            h.getIOMMUPlatform(),
@@ -992,6 +994,7 @@ func newQemuHypervisorConfig(h hypervisor) (vc.HypervisorConfig, error) {
 		ExtraMonitorSocket:       extraMonitorSocket,
 		SnpIdBlock:               h.SnpIdBlock,
 		SnpIdAuth:                h.SnpIdAuth,
+		SnpGuestPolicy:           h.SnpGuestPolicy,
 	}, nil
 }
 

@@ -16,9 +16,11 @@ ifeq ($(ARCH),)
 endif
 ifeq ($(ARCH),x86_64)
     override ARCH = amd64
+    override EDK2_NAME = ovmf
 endif
 ifeq ($(ARCH),aarch64)
     override ARCH = arm64
+    override EDK2_NAME = aavmf
 endif
 ifeq ($(ARCH),riscv64gc)
     override ARCH = riscv64
@@ -215,7 +217,7 @@ DEFMAXMEMSZ := 0
 #Default number of bridges
 DEFBRIDGES := 1
 DEFENABLEANNOTATIONS := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\"]
-DEFENABLEANNOTATIONSTEE := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"default_vcpus\", \"default_memory\"]
+DEFENABLEANNOTATIONS_COCO := [\"enable_iommu\", \"virtio_fs_extra_args\", \"kernel_params\", \"default_vcpus\", \"default_memory\", \"cc_init_data\"]
 DEFDISABLEGUESTSECCOMP := true
 DEFDISABLEGUESTEMPTYDIR := false
 #Default experimental features enabled
@@ -460,10 +462,10 @@ ifneq (,$(QEMUCMD))
     FIRMWAREPATH_NV := $(PREFIXDEPS)/share/ovmf/OVMF.fd
 
     ifneq (,$(QEMUFW))
-        FIRMWAREPATH := $(PREFIXDEPS)/share/ovmf/$(QEMUFW)
+        FIRMWAREPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFW)
     endif
     ifneq (,$(QEMUFWVOL))
-        FIRMWAREVOLUMEPATH := $(PREFIXDEPS)/share/ovmf/$(QEMUFWVOL)
+        FIRMWAREVOLUMEPATH := $(PREFIXDEPS)/share/$(EDK2_NAME)/$(QEMUFWVOL)
     endif
 endif
 
@@ -729,7 +731,7 @@ USER_VARS += DEFVIRTIOFSCACHE
 USER_VARS += DEFVIRTIOFSQUEUESIZE
 USER_VARS += DEFVIRTIOFSEXTRAARGS
 USER_VARS += DEFENABLEANNOTATIONS
-USER_VARS += DEFENABLEANNOTATIONSTEE
+USER_VARS += DEFENABLEANNOTATIONS_COCO
 USER_VARS += DEFENABLEIOTHREADS
 USER_VARS += DEFSECCOMPSANDBOXPARAM
 USER_VARS += DEFENABLEVHOSTUSERSTORE

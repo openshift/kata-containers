@@ -6,7 +6,6 @@
 use std::io::Result;
 use std::path::Path;
 use std::sync::Arc;
-use std::u32;
 
 use super::{default, register_hypervisor_plugin};
 use crate::config::default::MAX_DRAGONBALL_VCPUS;
@@ -66,7 +65,7 @@ impl ConfigPlugin for DragonballConfig {
             }
 
             if db.cpu_info.default_vcpus as u32 > db.cpu_info.default_maxvcpus {
-                db.cpu_info.default_vcpus = db.cpu_info.default_maxvcpus as i32;
+                db.cpu_info.default_vcpus = db.cpu_info.default_maxvcpus as f32;
             }
 
             if db.machine_info.entropy_source.is_empty() {
@@ -135,7 +134,7 @@ impl ConfigPlugin for DragonballConfig {
                 ));
             }
 
-            if (db.cpu_info.default_vcpus > 0
+            if (db.cpu_info.default_vcpus > 0.0
                 && db.cpu_info.default_vcpus as u32 > default::MAX_DRAGONBALL_VCPUS)
                 || db.cpu_info.default_maxvcpus > default::MAX_DRAGONBALL_VCPUS
             {

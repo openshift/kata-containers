@@ -123,7 +123,7 @@ setup_nvidia_gpu_rootfs_stage_one() {
 
 	# We need the kernel packages for building the drivers cleanly will be
 	# deinstalled and removed from the roofs once the build finishes.
-	tar -xvf "${BUILD_DIR}"/kata-static-kernel-nvidia-gpu"${appendix}"-headers.tar.xz -C .
+	tar --zstd -xvf "${BUILD_DIR}"/kata-static-kernel-nvidia-gpu"${appendix}"-headers.tar.zst -C .
 
 	# If we find a local downloaded run file build the kernel modules
 	# with it, otherwise use the distribution packages. Run files may have
@@ -237,7 +237,7 @@ chisseled_gpudirect() {
 
 chisseled_init() {
 	echo "nvidia: chisseling init"
-	tar xvf "${BUILD_DIR}"/kata-static-busybox.tar.xz -C .
+	tar --zstd -xvf "${BUILD_DIR}"/kata-static-busybox.tar.zst -C .
 
 	mkdir -p dev etc proc run/cdi sys tmp usr var lib/modules lib/firmware \
 		 usr/share/nvidia lib/"${machine_arch}"-linux-gnu lib64        \
@@ -290,6 +290,27 @@ compress_rootfs() {
 
 }
 
+coco_guest_components() {
+	if [[ ${type} != "confidential" ]]; then
+		return
+	fi
+
+	readonly source="usr/local/bin"
+	readonly dest="${source}"
+
+	info "nvidia: installing the confidential containers guest components tarball"
+
+	mkdir -p "${dest}"
+
+	cp -a "${stage_one}/${source}"/attestation-agent     "${dest}/."
+	cp -a "${stage_one}/${source}"/api-server-rest       "${dest}/."
+	cp -a "${stage_one}/${source}"/confidential-data-hub "${dest}/."
+
+	cp -a "${stage_one}"/etc/ocicrypt_config.json etc/.
+
+	info "TODO: nvidia: luks-encrypt-storage is a bash script, we do not have a shell!"
+}
+
 toggle_debug() {
 	if echo "${NVIDIA_GPU_STACK}" | grep -q '\<debug\>'; then
 		export DEBUG="true"
@@ -300,6 +321,8 @@ setup_nvidia_gpu_rootfs_stage_two() {
 	readonly stage_one="${BUILD_DIR:?}/rootfs-${VARIANT}-stage-one"
 	readonly stage_two="${ROOTFS_DIR:?}"
 	readonly stack="${NVIDIA_GPU_STACK:?}"
+
+	readonly type=${1:-""}
 
 	echo "nvidia: chisseling the following stack components: ${stack}"
 
@@ -333,6 +356,8 @@ setup_nvidia_gpu_rootfs_stage_two() {
 			chisseled_gpudirect
 		fi
 	done
+
+	coco_guest_components
 
 	compress_rootfs
 

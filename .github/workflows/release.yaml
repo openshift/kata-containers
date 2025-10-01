@@ -2,8 +2,7 @@ name: Release Kata Containers
 on:
   workflow_dispatch
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   release:
@@ -35,6 +34,7 @@ jobs:
       target-arch: amd64
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
+      KBUILD_SIGN_PIN: ${{ secrets.KBUILD_SIGN_PIN }}
 
   build-and-push-assets-arm64:
     needs: release
@@ -126,7 +126,7 @@ jobs:
 
       - name: Set KATA_STATIC_TARBALL env var
         run: |
-          tarball=$(pwd)/kata-static.tar.xz
+          tarball=$(pwd)/kata-static.tar.zst
           echo "KATA_STATIC_TARBALL=${tarball}" >> "$GITHUB_ENV"
 
       - name: Download amd64 artifacts
