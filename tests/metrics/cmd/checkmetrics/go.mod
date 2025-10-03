@@ -4,12 +4,12 @@ module example.com/m
 go 1.24.6
 
 require (
-	github.com/BurntSushi/toml v1.3.2
+	github.com/BurntSushi/toml v1.5.0
 	github.com/montanaflynn/stats v0.7.1
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/sirupsen/logrus v1.9.3
-	github.com/stretchr/testify v1.8.4
-	github.com/urfave/cli v1.22.14
+	github.com/stretchr/testify v1.10.0
+	github.com/urfave/cli v1.22.17
 )
 
 require (
