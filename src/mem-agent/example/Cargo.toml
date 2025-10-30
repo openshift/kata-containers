@@ -33,4 +33,4 @@ name = "mem-agent-ctl"
 path = "./ctl.rs"
 
 [build-dependencies]
-ttrpc-codegen = "0.4"
+ttrpc-codegen = "0.6"
