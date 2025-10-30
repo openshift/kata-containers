@@ -35,7 +35,7 @@ uuid = { version = "0.4", features = ["v4"] }
 oci-spec = { workspace = true }
 
 ## Dependencies from `rust-netlink`
-netlink-packet-route = "0.22"
+netlink-packet-route = "0.25"
 netlink-sys = "0.8"
 rtnetlink = "0.16"
 
