@@ -28,7 +28,7 @@ toml = "0.5.8"
 serde-enum-str = "0.4"
 sysinfo = "0.34.2"
 
-oci-spec = { version = "0.6.8", features = ["runtime"] }
+oci-spec = { version = "0.8.0", features = ["runtime"] }
 safe-path = { path = "../safe-path" }
 
 [dev-dependencies]
