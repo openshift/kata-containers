@@ -12,7 +12,7 @@ rustjail = { path = "../../agent/rustjail", features = ["standard-oci-runtime"] 
 runtime-spec = { path = "../../libs/runtime-spec" }
 oci-spec = { version = "0.6.8", features = ["runtime"] }
 logging = { path = "../../libs/logging" }
-liboci-cli = "0.0.4"
+liboci-cli = "0.5.0"
 clap = { version = "3.0.6", features = ["derive", "cargo"] }
 libc = "0.2.108"
 nix = "0.23.0"
