@@ -11,7 +11,7 @@ keywords = ["dragonball", "secure-sandbox", "arch", "ARM64", "x86"]
 readme = "README.md"
 
 [dependencies]
-memoffset = "0.6"
+memoffset = "0.9"
 kvm-bindings = { workspace = true, features = ["fam-wrappers"] }
 kvm-ioctls = {workspace = true}
 thiserror = "1"
