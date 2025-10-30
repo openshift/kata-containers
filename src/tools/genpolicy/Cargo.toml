@@ -19,7 +19,7 @@ log = "0.4.17"
 clap = { version = "4.1.8", features = ["derive"] }
 
 # YAML file serialization/deserialization.
-base64 = "0.21.0"
+base64 = "0.22.0"
 serde = { version = "1.0.159", features = ["derive"] }
 regex = "1.10.5"
 
