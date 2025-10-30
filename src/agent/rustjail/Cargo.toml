@@ -26,7 +26,7 @@ regex.workspace = true
 path-absolutize = "1.2.0"
 anyhow = "1.0.32"
 cgroups.workspace = true
-rlimit = "0.5.3"
+rlimit = "0.10.0"
 cfg-if.workspace = true
 
 tokio = { workspace = true, features = [
