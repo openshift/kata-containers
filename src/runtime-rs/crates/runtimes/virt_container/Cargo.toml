@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 slog = { workspace = true }
 slog-scope = { workspace = true }
 tokio = { workspace = true }
-toml = "0.4.2"
+toml = "0.9.0"
 url = { workspace = true }
 async-std = "1.12.0"
 tracing = { workspace = true }
