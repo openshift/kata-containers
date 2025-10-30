@@ -67,7 +67,7 @@ zerocopy = "0.6.1"
 fs2 = "0.4.3"
 
 # containerd image pull support
-k8s-cri = "0.7.0"
+k8s-cri = "0.10.0"
 tonic = "0.9.2"
 tower = "0.4.13"
 containerd-client = "0.4.0"
