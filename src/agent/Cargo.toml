@@ -31,7 +31,7 @@ futures = "0.3.30"
 
 # Async runtime
 tokio = { version = "1.44.2", features = ["full"] }
-tokio-vsock = "0.3.4"
+tokio-vsock = "0.7.0"
 
 netlink-sys = { version = "0.7.0", features = ["tokio_socket"] }
 rtnetlink = "0.14.0"
