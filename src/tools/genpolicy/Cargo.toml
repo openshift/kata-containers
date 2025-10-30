@@ -34,7 +34,7 @@ regex = "1.10.5"
 #
 # In YAML, the value yes without quotes is reserved for boolean,
 # and confuses kubectl, that expects a string value.
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 
 # Container repository.
 anyhow = "1.0.32"
