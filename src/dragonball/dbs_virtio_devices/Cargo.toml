@@ -23,7 +23,7 @@ dbs-address-space = { workspace = true }
 dbs-boot = { workspace = true }
 epoll = ">=4.3.1, <4.3.2"
 io-uring = "0.5.2"
-fuse-backend-rs = { version = "0.10.5", optional = true }
+fuse-backend-rs = { version = "0.13.0", optional = true }
 kvm-bindings = { workspace = true}
 kvm-ioctls = {workspace = true}
 libc = "0.2.119"
