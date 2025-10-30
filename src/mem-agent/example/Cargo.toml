@@ -21,7 +21,7 @@ byteorder = "1.5"
 protobuf = "3.1"
 lazy_static = "1.4"
 # Rust 1.68 doesn't support 0.5.9
-home = "=0.5.5"
+home = "=0.5.12"
 mem-agent = { path = "../" }
 
 [[example]]
