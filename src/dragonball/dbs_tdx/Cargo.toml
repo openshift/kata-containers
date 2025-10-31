@@ -11,7 +11,7 @@ keywords = ["dragonball", "secure-sandbox", "TDX", "confidential container"]
 readme = "README.md"
 
 [dependencies]
-thiserror = "1.0"
+thiserror = "2.0"
 kvm-bindings = { workspace = true, features = ["fam-wrappers"] }
 vmm-sys-util = {workspace = true}
 
