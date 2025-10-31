@@ -10,7 +10,7 @@ rust-version = "1.85.1"
 [workspace.dependencies]
 oci-spec = { version = "0.8.1", features = ["runtime"] }
 lazy_static = "1.3.0"
-ttrpc = { version = "0.8.4", features = ["async"], default-features = false }
+ttrpc = { version = "0.9.0", features = ["async"], default-features = false }
 protobuf = "3.7.2"
 libc = "0.2.94"
 # Notes: nix needs to stay in sync with libs
