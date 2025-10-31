@@ -23,7 +23,7 @@ dbs-interrupt = { workspace = true, features = [
     "kvm-legacy-irq",
     "kvm-msi-irq",
 ] }
-downcast-rs = "1.2.0"
+downcast-rs = "2.0.0"
 byteorder = "1.4.3"
 serde = "1.0.27"
 
