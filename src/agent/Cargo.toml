@@ -26,7 +26,7 @@ const_format = "0.2.30"
 
 # Async helpers
 async-trait = "0.1.50"
-async-recursion = "0.3.2"
+async-recursion = "1.0.0"
 futures = "0.3.30"
 
 # Async runtime
