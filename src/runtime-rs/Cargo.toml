@@ -52,7 +52,7 @@ async-trait = "0.1.48"
 containerd-shim = { version = "0.6.0", features = ["async"] }
 containerd-shim-protos = { version = "0.6.0", features = ["async"] }
 go-flag = "0.1.0"
-hyper = "0.14.20"
+hyper = "1.0.0"
 hyperlocal = "0.8.0"
 lazy_static = "1.4"
 libc = "0.2"
