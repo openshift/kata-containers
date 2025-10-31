@@ -59,7 +59,7 @@ protocols = { path = "../../libs/protocols", features = ["with-serde"] }
 protobuf = "3.2.0"
 
 # dm-verity root hash support
-generic-array = "0.14.6"
+generic-array = "1.0.0"
 sha2 = "0.10.6"
 tarindex = { git = "https://github.com/kata-containers/tardev-snapshotter", rev = "06183a5" }
 tempfile = "3.19.1"
