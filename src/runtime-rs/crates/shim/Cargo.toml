@@ -52,7 +52,7 @@ runtimes = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rand = { workspace = true }
-serial_test = "0.10.0"
+serial_test = "3.0.0"
 
 # Local dev-dependencies
 tests_utils = { workspace = true }
