@@ -21,7 +21,7 @@ regorus = { version = "0.2.8", default-features = false, features = [
     "regex",
     "std",
 ] }
-json-patch = "2.0.0"
+json-patch = "4.0.0"
 
 
 # Note: this crate sets the slog 'max_*' features which allows the log level
