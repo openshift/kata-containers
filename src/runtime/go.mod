@@ -13,7 +13,7 @@ require (
 	github.com/BurntSushi/toml v1.3.2
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/blang/semver/v4 v4.0.0
-	github.com/container-orchestrated-devices/container-device-interface v0.6.0
+	github.com/container-orchestrated-devices/container-device-interface v1.0.1
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/console v1.0.5
 	github.com/containerd/containerd v1.7.27
