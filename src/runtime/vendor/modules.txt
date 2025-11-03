@@ -358,10 +358,9 @@ github.com/hashicorp/go-multierror
 # github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9
 ## explicit
 github.com/intel-go/cpuid
-# github.com/intel/goresctrl v0.6.0
-## explicit; go 1.20
+# github.com/intel/goresctrl v0.10.0
+## explicit; go 1.23
 github.com/intel/goresctrl/pkg/kubernetes
-github.com/intel/goresctrl/pkg/log
 github.com/intel/goresctrl/pkg/path
 github.com/intel/goresctrl/pkg/rdt
 github.com/intel/goresctrl/pkg/utils

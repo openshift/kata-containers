@@ -195,8 +195,8 @@ github.com/hpcloud/tail v1.0.0/go.mod h1:ab1qPbhIpdTxEkNHXyeSf5vhxWSCs/tWer42PpO
 github.com/ianlancetaylor/demangle v0.0.0-20200824232613-28f6c0f3b639/go.mod h1:aSSvb/t6k1mPoxDqO4vJh6VOCGPwU4O0C2/Eqndh1Sc=
 github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9 h1:x9HFDMDCsaxTvC4X3o0ZN6mw99dT/wYnTItGwhBRmg0=
 github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9/go.mod h1:RmeVYf9XrPRbRc3XIx0gLYA8qOFvNoPOfaEZduRlEp4=
-github.com/intel/goresctrl v0.6.0 h1:lOqo9o+uXtqPwSB4vpd1greUcWlkBSTPdnbTFgRILf4=
-github.com/intel/goresctrl v0.6.0/go.mod h1:Qg+rhwvfW78p22OJi649sCH71bJIBX7zT0b+IGe69eE=
+github.com/intel/goresctrl v0.10.0 h1:Q94PBhLtQM/aVxVTKzB1j/ooMuV+9XleTN1fq2OGsSo=
+github.com/intel/goresctrl v0.10.0/go.mod h1:1S8GDqL46GuKb525bxNhIEEkhf4rhVcbSf9DuKhp7mw=
 github.com/josharian/intern v1.0.0 h1:vlS4z54oSdjm0bgjRigI+G1HpF+tI+9rE5LLzOg8HmY=
 github.com/josharian/intern v1.0.0/go.mod h1:5DoeVV0s6jJacbCEi61lwdGj/aVlrQvzHFFd8Hwg//Y=
 github.com/josharian/native v1.1.0 h1:uuaP0hAbW7Y4l0ZRQ6C9zfb7Mg1mbFKry/xzDAfmtLA=
