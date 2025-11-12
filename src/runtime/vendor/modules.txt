@@ -272,6 +272,9 @@ github.com/felixge/httpsnoop
 # github.com/fsnotify/fsnotify v1.7.0
 ## explicit; go 1.17
 github.com/fsnotify/fsnotify
+# github.com/fxamacker/cbor/v2 v2.9.0
+## explicit; go 1.20
+github.com/fxamacker/cbor/v2
 # github.com/go-ini/ini v1.28.2
 ## explicit
 github.com/go-ini/ini
@@ -294,8 +297,8 @@ github.com/go-openapi/analysis/internal/flatten/sortref
 # github.com/go-openapi/errors v0.20.4
 ## explicit; go 1.14
 github.com/go-openapi/errors
-# github.com/go-openapi/jsonpointer v0.20.0
-## explicit; go 1.18
+# github.com/go-openapi/jsonpointer v0.21.0
+## explicit; go 1.20
 github.com/go-openapi/jsonpointer
 # github.com/go-openapi/jsonreference v0.20.2
 ## explicit; go 1.13
@@ -321,12 +324,14 @@ github.com/go-openapi/spec
 # github.com/go-openapi/strfmt v0.21.8
 ## explicit; go 1.19
 github.com/go-openapi/strfmt
-# github.com/go-openapi/swag v0.22.4
-## explicit; go 1.18
+# github.com/go-openapi/swag v0.23.0
+## explicit; go 1.20
 github.com/go-openapi/swag
 # github.com/go-openapi/validate v0.22.3
 ## explicit; go 1.18
 github.com/go-openapi/validate
+# github.com/go-task/slim-sprig/v3 v3.0.0
+## explicit; go 1.20
 # github.com/godbus/dbus/v5 v5.1.1-0.20241109141217-c266b19b28e9
 ## explicit; go 1.20
 github.com/godbus/dbus/v5
@@ -335,7 +340,6 @@ github.com/godbus/dbus/v5
 github.com/gogo/protobuf/gogoproto
 github.com/gogo/protobuf/proto
 github.com/gogo/protobuf/protoc-gen-gogo/descriptor
-github.com/gogo/protobuf/sortkeys
 # github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8
 ## explicit; go 1.20
 github.com/golang/groupcache/lru
@@ -510,6 +514,9 @@ github.com/vishvananda/netlink/nl
 # github.com/vishvananda/netns v0.0.4
 ## explicit; go 1.17
 github.com/vishvananda/netns
+# github.com/x448/float16 v0.8.4
+## explicit; go 1.11
+github.com/x448/float16
 # gitlab.com/nvidia/cloud-native/go-nvlib v0.0.0-20220601114329-47893b162965
 ## explicit; go 1.16
 gitlab.com/nvidia/cloud-native/go-nvlib/pkg/nvpci
@@ -580,6 +587,9 @@ go.opentelemetry.io/otel/trace
 go.opentelemetry.io/otel/trace/embedded
 go.opentelemetry.io/otel/trace/internal/telemetry
 go.opentelemetry.io/otel/trace/noop
+# go.yaml.in/yaml/v2 v2.4.2
+## explicit; go 1.15
+go.yaml.in/yaml/v2
 # golang.org/x/exp v0.0.0-20250819193227-8b4c13bb791b
 ## explicit; go 1.24.0
 golang.org/x/exp/constraints
@@ -733,16 +743,21 @@ gopkg.in/yaml.v2
 # gopkg.in/yaml.v3 v3.0.1
 ## explicit
 gopkg.in/yaml.v3
-# k8s.io/apimachinery v0.30.0
-## explicit; go 1.22.0
+# k8s.io/apimachinery v0.34.2
+## explicit; go 1.24.0
 k8s.io/apimachinery/pkg/api/resource
-# k8s.io/cri-api v0.30.0
-## explicit; go 1.22.0
+k8s.io/apimachinery/pkg/runtime/serializer/cbor/direct
+k8s.io/apimachinery/pkg/runtime/serializer/cbor/internal/modes
+# k8s.io/cri-api v0.34.2
+## explicit; go 1.24.0
 k8s.io/cri-api/pkg/apis/runtime/v1
-# sigs.k8s.io/yaml v1.4.0
-## explicit; go 1.12
+# sigs.k8s.io/json v0.0.0-20241014173422-cfa47c3a1cc8
+## explicit; go 1.23
+sigs.k8s.io/json
+sigs.k8s.io/json/internal/golang/encoding/json
+# sigs.k8s.io/yaml v1.6.0
+## explicit; go 1.22
 sigs.k8s.io/yaml
-sigs.k8s.io/yaml/goyaml.v2
 # tags.cncf.io/container-device-interface v0.8.1
 ## explicit; go 1.20
 tags.cncf.io/container-device-interface/internal/validation
