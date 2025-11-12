@@ -45,7 +45,7 @@ require (
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.62.0
 	github.com/prometheus/procfs v0.15.1
-	github.com/safchain/ethtool v0.5.10
+	github.com/safchain/ethtool v0.7.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.10.0
 	github.com/urfave/cli v1.22.15
@@ -57,7 +57,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.36.0
 	go.opentelemetry.io/otel/trace v1.36.0
 	golang.org/x/oauth2 v0.30.0
-	golang.org/x/sys v0.34.0
+	golang.org/x/sys v0.38.0
 	google.golang.org/grpc v1.74.2
 	google.golang.org/protobuf v1.36.8
 	k8s.io/apimachinery v0.33.0
