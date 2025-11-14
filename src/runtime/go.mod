@@ -38,7 +38,7 @@ require (
 	github.com/moby/sys/userns v0.1.0
 	github.com/opencontainers/runc v1.2.6
 	github.com/opencontainers/runtime-spec v1.2.1
-	github.com/opencontainers/selinux v1.12.0
+	github.com/opencontainers/selinux v1.13.1
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.22.0
@@ -82,7 +82,7 @@ require (
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/containernetworking/cni v1.3.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
-	github.com/cyphar/filepath-securejoin v0.4.1 // indirect
+	github.com/cyphar/filepath-securejoin v0.5.1 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-events v0.0.0-20250808211157-605354379745 // indirect
