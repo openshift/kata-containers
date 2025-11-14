@@ -33,7 +33,7 @@ require (
 	github.com/go-openapi/strfmt v0.21.8
 	github.com/go-openapi/swag v0.22.4
 	github.com/go-openapi/validate v0.22.3
-	github.com/godbus/dbus/v5 v5.1.1-0.20241109141217-c266b19b28e9
+	github.com/godbus/dbus/v5 v5.2.0
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/intel-go/cpuid v0.0.0-20210602155658-5747e5cec0d9
 	github.com/mdlayher/vsock v1.2.1
