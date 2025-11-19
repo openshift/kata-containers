@@ -42,7 +42,7 @@ virtio-queue = {workspace = true}
 vmm-sys-util = {workspace = true}
 vm-memory = { workspace = true, features = ["backend-mmap"] }
 sendfd = "0.4.3"
-vhost-rs = { version = "0.6.1", package = "vhost", optional = true }
+vhost-rs = { version = "0.15.0", package = "vhost", optional = true }
 timerfd = "1.0"
 
 [dev-dependencies]
