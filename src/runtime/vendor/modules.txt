@@ -450,11 +450,11 @@ github.com/opencontainers/runc/libcontainer/cgroups/systemd
 github.com/opencontainers/runc/libcontainer/configs
 github.com/opencontainers/runc/libcontainer/devices
 github.com/opencontainers/runc/libcontainer/utils
-# github.com/opencontainers/runtime-spec v1.2.1
+# github.com/opencontainers/runtime-spec v1.3.0
 ## explicit
 github.com/opencontainers/runtime-spec/specs-go
 github.com/opencontainers/runtime-spec/specs-go/features
-# github.com/opencontainers/runtime-tools v0.9.1-0.20250523060157-0ea5ed0382a2
+# github.com/opencontainers/runtime-tools v0.9.1-0.20251205004911-5e639034dcdc
 ## explicit; go 1.21
 github.com/opencontainers/runtime-tools/generate
 github.com/opencontainers/runtime-tools/generate/seccomp
