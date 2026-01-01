@@ -42,7 +42,7 @@ hex = "0.4"
 ## Dependencies from `rust-netlink`
 netlink-packet-route = "0.22"
 netlink-sys = "0.8"
-rtnetlink = "0.16"
+rtnetlink = "0.20"
 
 # Local dependencies
 agent = { workspace = true }
