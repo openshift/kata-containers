@@ -9,9 +9,6 @@
         ]
     },
     "gomod": {
-        "ignorePaths": [
-            "**/tools/**"
-        ]
+        "enabled": false
     }
-    
 }
