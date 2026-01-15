@@ -4,7 +4,7 @@
 
 # Set up an Ubuntu image with 'phoronix-test-suite' installed
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 LABEL DOCKERFILE_VERSION="1.0"
 
