@@ -13,7 +13,7 @@ require (
 )
 
 require (
-	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
+	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
