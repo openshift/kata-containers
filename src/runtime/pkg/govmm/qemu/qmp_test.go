@@ -50,6 +50,10 @@ func (l qmpTestLogger) Errorf(format string, v ...interface{}) {
 	l.Infof(format, v...)
 }
 
+func (l qmpTestLogger) Debugf(format string, v ...interface{}) {
+	l.Infof(format, v...)
+}
+
 // nolint: govet
 type qmpTestCommand struct {
 	name string
@@ -1066,7 +1070,7 @@ func TestQMPPCIDeviceAdd(t *testing.T) {
 	blockdevID := fmt.Sprintf("drive_%s", volumeUUID)
 	devID := fmt.Sprintf("device_%s", volumeUUID)
 	err := q.ExecutePCIDeviceAdd(context.Background(), blockdevID, devID,
-		"virtio-blk-pci", "0x1", "", "", 1, true, false)
+		"virtio-blk-pci", "0x1", "", "", 1, true, false, "")
 	if err != nil {
 		t.Fatalf("Unexpected error %v", err)
 	}
@@ -1134,6 +1138,51 @@ func TestQMPAPVFIOMediatedDeviceAdd(t *testing.T) {
 	}
 	q.Shutdown()
 	<-disconnectedCh
+}
+
+func TestExecuteVFIODeviceAdd(t *testing.T) {
+	bdf := "04:00.0"
+	romfile := ""
+
+	for _, tc := range []struct {
+		name      string
+		iommufdID string
+	}{
+		{
+			name:      "with IOMMUFD",
+			iommufdID: "0",
+		},
+		{
+			name:      "without IOMMUFD",
+			iommufdID: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			connectedCh := make(chan *QMPVersion)
+			disconnectedCh := make(chan struct{})
+
+			buf := newQMPTestCommandBuffer(t)
+
+			// Note: At the time of writing, the QMPTestCommandBuffer does not
+			// support verifying parameters passed to object-add and device_add.
+			// So we just verify that the commands are sent in the correct order.
+			if tc.iommufdID != "" {
+				buf.AddCommand("object-add", nil, "return", nil)
+			}
+			buf.AddCommand("device_add", nil, "return", nil)
+
+			cfg := QMPConfig{Logger: qmpTestLogger{}}
+			q := startQMPLoop(buf, cfg, connectedCh, disconnectedCh)
+			checkVersion(t, connectedCh)
+
+			err := q.ExecuteVFIODeviceAdd(context.Background(), "devID", bdf, "rp1", romfile, tc.iommufdID)
+			if err != nil {
+				t.Fatalf("Unexpected error %v", err)
+			}
+			q.Shutdown()
+			<-disconnectedCh
+		})
+	}
 }
 
 // Checks that CPU are correctly added using device_add

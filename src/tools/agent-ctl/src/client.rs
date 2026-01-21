@@ -462,7 +462,7 @@ fn setup_hybrid_vsock(path: &str, hybrid_vsock_port: u64) -> Result<UnixStream> 
         // waiting for the hybrid vsock hypervisor to route the call for us ;)
         //
         // See: https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md#host-initiated-connections
-        let msg = format!("{} {}\n", CONNECT_CMD, hybrid_vsock_port);
+        let msg = format!("{CONNECT_CMD} {hybrid_vsock_port}\n");
         stream.write_all(msg.as_bytes())?;
 
         // Now, see if we get the expected response
@@ -474,7 +474,7 @@ fn setup_hybrid_vsock(path: &str, hybrid_vsock_port: u64) -> Result<UnixStream> 
         if msg.starts_with(OK_CMD) {
             let response = msg
                 .strip_prefix(OK_CMD)
-                .ok_or(format!("invalid response: {:?}", msg))
+                .ok_or(format!("invalid response: {msg:?}"))
                 .map_err(|e| anyhow!(e))?
                 .trim();
 
@@ -630,7 +630,7 @@ pub fn client(cfg: &mut Config, commands: Vec<&str>) -> Result<()> {
 
         let mut builtin_cmds = get_builtin_cmd_details();
         builtin_cmds.sort();
-        builtin_cmds.iter().for_each(|n| println!("  {}", n));
+        builtin_cmds.iter().for_each(|n| println!("  {n}"));
 
         println!();
 
@@ -638,7 +638,7 @@ pub fn client(cfg: &mut Config, commands: Vec<&str>) -> Result<()> {
 
         let mut agent_cmds = get_agent_cmd_details();
         agent_cmds.sort();
-        agent_cmds.iter().for_each(|n| println!("  {}", n));
+        agent_cmds.iter().for_each(|n| println!("  {n}"));
 
         println!();
 
@@ -653,7 +653,7 @@ pub fn client(cfg: &mut Config, commands: Vec<&str>) -> Result<()> {
     let result = run_commands(cfg, commands);
 
     // stop the vm if booted
-    if vm_ref.is_some() {
+    if let Some(vm_ref) = vm_ref {
         info!(sl!(), "stopping test vm");
         // TODO: The error handling here is for cloud-hypervisor.
         // We use tokio::runtime to call the async operations of
@@ -663,7 +663,7 @@ pub fn client(cfg: &mut Config, commands: Vec<&str>) -> Result<()> {
         // But since we return from the tokio::runtime block
         // the runtime is dropped. During stop_vm call, cloud hypervisor
         // waits for the logger task which is in cancelled state as a result.
-        match vm::remove_vm(vm_ref.unwrap()) {
+        match vm::remove_vm(vm_ref) {
             Ok(_) => info!(sl!(), "Successfully shut down test vm"),
             Err(e) => warn!(sl!(), "Error shutting down vm:{:?}", e),
         }
@@ -704,6 +704,12 @@ fn handle_vm(cfg: &mut Config) -> Result<Option<vm::TestVm>> {
         }
     }
 
+    // set the fs share path in config
+    if vm_instance.share_fs.pid != 0 {
+        debug!(sl!(), "share path: {}", cfg.shared_fs_host_path);
+        cfg.shared_fs_host_path = vm_instance.share_fs.shared_path.clone();
+    }
+
     info!(sl!(), "socket server addr: {}", cfg.server_address);
     Ok(Some(vm_instance))
 }
@@ -732,8 +738,7 @@ fn run_commands(cfg: &Config, commands: Vec<&str>) -> Result<()> {
 
     if !cfg.no_auto_values {
         ttrpc_ctx.add(METADATA_CFG_NS.into(), AUTO_VALUES_CFG_NAME.to_string());
-
-        debug!(sl!(), "Automatic value generation disabled");
+        debug!(sl!(), "Automatic value generation enabled");
     }
 
     // Special-case loading the OCI config file so it is accessible
@@ -743,6 +748,11 @@ fn run_commands(cfg: &Config, commands: Vec<&str>) -> Result<()> {
 
     // Convenience option
     options.insert("bundle-dir".to_string(), cfg.bundle_dir.clone());
+
+    // when running with `--vm`, add host path for fs share to options
+    if !cfg.shared_fs_host_path.is_empty() {
+        options.insert("shared-path".to_string(), cfg.shared_fs_host_path.clone());
+    }
 
     info!(sl!(), "client setup complete";
         "server-address" => cfg.server_address.to_string());
@@ -945,17 +955,17 @@ fn interactive_client_loop(
 }
 
 fn readline(prompt: &str) -> std::result::Result<String, String> {
-    print!("{}: ", prompt);
+    print!("{prompt}: ");
 
     io::stdout()
         .flush()
-        .map_err(|e| format!("failed to flush: {:?}", e))?;
+        .map_err(|e| format!("failed to flush: {e:?}"))?;
 
     let mut line = String::new();
 
     std::io::stdin()
         .read_line(&mut line)
-        .map_err(|e| format!("failed to read line: {:?}", e))?;
+        .map_err(|e| format!("failed to read line: {e:?}"))?;
 
     // Remove NL
     Ok(line.trim_end().to_string())
@@ -1063,7 +1073,7 @@ fn agent_cmd_container_create(
     ctx: &Context,
     client: &AgentServiceClient,
     _health: &HealthClient,
-    _options: &mut Options,
+    options: &mut Options,
     args: &str,
 ) -> Result<()> {
     let input: CreateContainerInput = utils::make_request(args)?;
@@ -1075,7 +1085,13 @@ fn agent_cmd_container_create(
 
     let ctx = clone_context(ctx);
 
-    let req = utils::make_create_container_request(input)?;
+    // setup host/guest fs sharing for container rootfs
+    let share_fs_path = match options.get("shared-path") {
+        Some(p) => p.to_string(),
+        None => "".to_string(),
+    };
+
+    let req = utils::make_create_container_request(input, share_fs_path)?;
 
     debug!(sl!(), "sending request"; "request" => format!("{:?}", req));
 
@@ -1093,7 +1109,7 @@ fn agent_cmd_container_remove(
     ctx: &Context,
     client: &AgentServiceClient,
     _health: &HealthClient,
-    _options: &mut Options,
+    options: &mut Options,
     args: &str,
 ) -> Result<()> {
     let req: RemoveContainerRequest = utils::make_request(args)?;
@@ -1109,8 +1125,14 @@ fn agent_cmd_container_remove(
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
 
-    // Un-mount the rootfs mount point.
-    utils::remove_container_image_mount(req.container_id())?;
+    // Unmount the share fs
+    let share_fs_path = match options.get("shared-path") {
+        Some(p) => p.to_string(),
+        None => "".to_string(),
+    };
+
+    // Unmount the rootfs mount point.
+    utils::remove_container_image_mount(req.container_id(), &share_fs_path)?;
 
     Ok(())
 }
@@ -1140,10 +1162,7 @@ fn agent_cmd_container_exec(
         let process = ttrpc_spec
             .Process
             .into_option()
-            .ok_or(format!(
-                "failed to get process from OCI spec: {}",
-                bundle_dir,
-            ))
+            .ok_or(format!("failed to get process from OCI spec: {bundle_dir}",))
             .map_err(|e| anyhow!(e))?;
 
         req.set_container_id(cid);
@@ -2127,7 +2146,7 @@ fn builtin_cmd_sleep(args: &str) -> (Result<()>, bool) {
 }
 
 fn builtin_cmd_echo(args: &str) -> (Result<()>, bool) {
-    println!("{}", args);
+    println!("{args}");
 
     (Ok(()), false)
 }
@@ -2139,7 +2158,7 @@ fn builtin_cmd_quit(_args: &str) -> (Result<()>, bool) {
 fn builtin_cmd_list(_args: &str) -> (Result<()>, bool) {
     let cmds = get_all_cmd_details();
 
-    cmds.iter().for_each(|n| println!(" - {}", n));
+    cmds.iter().for_each(|n| println!(" - {n}"));
 
     println!();
 

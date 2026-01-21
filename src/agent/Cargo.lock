@@ -459,14 +459,8 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
 dependencies = [
- "bit-vec 0.8.0",
+ "bit-vec",
 ]
-
-[[package]]
-name = "bit-vec"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
 
 [[package]]
 name = "bit-vec"
@@ -666,30 +660,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdi"
-version = "0.1.0"
-source = "git+https://github.com/cncf-tags/container-device-interface-rs?rev=3b1e83dda5efcc83c7a4f134466ec006b37109c9#3b1e83dda5efcc83c7a4f134466ec006b37109c9"
-dependencies = [
- "anyhow",
- "clap",
- "const_format",
- "jsonschema",
- "lazy_static",
- "libc",
- "nix 0.24.3",
- "notify",
- "oci-spec",
- "once_cell",
- "path-clean",
- "regex",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "serde_yaml",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,6 +776,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-xid",
+]
+
+[[package]]
+name = "container-device-interface"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2605001b0e8214dae8af146a43ccaa965d960403e330f174c21327154530df8b"
+dependencies = [
+ "anyhow",
+ "clap",
+ "const_format",
+ "jsonschema",
+ "lazy_static",
+ "libc",
+ "nix 0.24.3",
+ "notify",
+ "oci-spec",
+ "once_cell",
+ "path-clean",
+ "regex",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -1212,9 +1207,9 @@ dependencies = [
 
 [[package]]
 name = "fancy-regex"
-version = "0.14.0"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+checksum = "998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f"
 dependencies = [
  "bit-set",
  "regex-automata 0.4.9",
@@ -1249,7 +1244,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ced92e76e966ca2fd84c8f7aa01a4aea65b0eb6648d72f7c8f3e2764a67fece"
 dependencies = [
  "crc32fast",
- "libz-sys",
  "miniz_oxide",
 ]
 
@@ -2013,9 +2007,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1b46a0365a611fbf1d2143104dcf910aada96fafd295bab16c60b802bf6fa1d"
+checksum = "d46662859bc5f60a145b75f4632fbadc84e829e45df6c5de74cfc8e05acb96b5"
 dependencies = [
  "ahash 0.8.12",
  "base64 0.22.1",
@@ -2049,11 +2043,11 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "capctl",
- "cdi",
  "cfg-if",
  "cgroups-rs",
  "clap",
  "const_format",
+ "container-device-interface",
  "derivative",
  "futures",
  "ipnetwork",
@@ -2064,7 +2058,7 @@ dependencies = [
  "libc",
  "log",
  "logging",
- "mem-agent-lib",
+ "mem-agent",
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys 0.7.0",
@@ -2266,17 +2260,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libz-sys"
-version = "1.1.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b70e7a7df205e92a1a4cd9aaae7898dac0aa555503cc0a649494d0d60e7651d"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2350,7 +2333,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mem-agent-lib"
+name = "mem-agent"
 version = "0.2.0"
 dependencies = [
  "anyhow",
@@ -3422,9 +3405,9 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.30.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8eff4fa778b5c2a57e85c5f2fe3a709c52f0e60d23146e2151cbef5893f420e"
+checksum = "9e9c261f7ce75418b3beadfb3f0eb1299fe8eb9640deba45ffa2cb783098697d"
 dependencies = [
  "ahash 0.8.12",
  "fluent-uri 0.3.2",
@@ -3718,7 +3701,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "awaitgroup",
- "bit-vec 0.6.3",
+ "bit-vec",
  "capctl",
  "caps",
  "cfg-if",
@@ -4819,12 +4802,6 @@ name = "value-bag"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "943ce29a8a743eb10d6082545d861b24f9d1b160b7d741e0f2cdf726bec909c5"
-
-[[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

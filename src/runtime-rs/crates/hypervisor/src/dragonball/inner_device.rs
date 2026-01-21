@@ -23,10 +23,12 @@ use dragonball::api::v1::{
     BlockDeviceConfigInfo, FsDeviceConfigInfo, FsMountConfigInfo, NetworkInterfaceConfig,
     VsockDeviceConfigInfo,
 };
+use dragonball::config_manager::{RateLimiterConfigInfo, TokenBucketConfigInfo};
 use dragonball::device_manager::{
     blk_dev_mgr::BlockDeviceType,
     vfio_dev_mgr::{HostDeviceConfig, VfioPciDeviceConfig},
 };
+use kata_types::config::hypervisor::DEFAULT_RATE_LIMITER_REFILL_TIME;
 
 const MB_TO_B: u32 = 1024 * 1024;
 const DEFAULT_VIRTIO_FS_NUM_QUEUES: i32 = 1;
@@ -225,6 +227,27 @@ impl DragonballInner {
         let jailed_drive = self.get_resource(path, id).context("get resource")?;
         self.cached_block_devices.insert(id.to_string());
 
+        let bandwidth = TokenBucketConfigInfo {
+            size: self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
+            one_time_burst: self
+                .config
+                .blockdev_info
+                .disk_rate_limiter_bw_one_time_burst
+                .unwrap_or(0),
+            refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+        };
+
+        let ops = TokenBucketConfigInfo {
+            size: self.config.blockdev_info.disk_rate_limiter_ops_max_rate,
+            one_time_burst: self
+                .config
+                .blockdev_info
+                .disk_rate_limiter_ops_one_time_burst
+                .unwrap_or(0),
+            refill_time: DEFAULT_RATE_LIMITER_REFILL_TIME,
+        };
+        let block_rate_limit = RateLimiterConfigInfo { bandwidth, ops };
+
         let blk_cfg = BlockDeviceConfigInfo {
             drive_id: id.to_string(),
             device_type: BlockDeviceType::get_type(path),
@@ -233,6 +256,7 @@ impl DragonballInner {
             no_drop,
             is_read_only: read_only,
             use_pci_bus,
+            rate_limiter: Some(block_rate_limit),
             ..Default::default()
         };
         self.vmm_instance
@@ -260,7 +284,7 @@ impl DragonballInner {
             .context("insert network device")
     }
 
-    /// Add vhost-user-net deivce to Dragonball
+    /// Add vhost-user-net device to Dragonball
     fn add_vhost_user_net_device(&mut self, config: &VhostUserConfig) -> Result<()> {
         let guest_mac = MacAddr::parse_str(&config.mac_address).ok();
         let net_cfg = NetworkInterfaceConfig {
@@ -316,7 +340,7 @@ impl DragonballInner {
             flags.add_flag("drop-sys-resource", &mut fs_cfg.drop_sys_resource);
             flags.add_flag("o", &mut opt_list);
         })
-        .with_context(|| format!("parse args: {:?}", args))?;
+        .with_context(|| format!("parse args: {args:?}"))?;
 
         // more options parsed for inline virtio-fs' custom config
         args.append(options);

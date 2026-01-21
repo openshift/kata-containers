@@ -41,6 +41,14 @@ ifeq ($(AGENT_POLICY),yes)
     override EXTRA_RUSTFEATURES += agent-policy
 endif
 
+##VAR INIT_DATA=yes|no define if agent enables the init data feature
+INIT_DATA ?= yes
+
+# Enable the init data fature of rust build
+ifeq ($(INIT_DATA),yes)
+    override EXTRA_RUSTFEATURES += init-data
+endif
+
 include ../../utils.mk
 
 ##VAR STANDARD_OCI_RUNTIME=yes|no define if agent enables standard oci runtime feature
@@ -122,7 +130,7 @@ $(TARGET): $(GENERATED_CODE) $(TARGET_PATH)
 $(TARGET_PATH): show-summary
 	@RUSTFLAGS="$(EXTRA_RUSTFLAGS) --deny warnings" cargo build --target $(TRIPLE) $(if $(findstring release,$(BUILD_TYPE)),--release) $(EXTRA_RUSTFEATURES)
 
-$(GENERATED_FILES): %: %.in
+$(GENERATED_FILES): %: %.in $(VERSION_FILE)
 	@sed $(foreach r,$(GENERATED_REPLACEMENTS),-e 's|@$r@|$($r)|g') "$<" > "$@"
 
 ##TARGET optimize: optimized  build
