@@ -4,7 +4,7 @@ github.com/cpuguy83/go-md2man/md2man
 # github.com/davecgh/go-spew v1.1.1
 ## explicit
 github.com/davecgh/go-spew/spew
-# github.com/mattn/go-runewidth v0.0.16
+# github.com/mattn/go-runewidth v0.0.13
 ## explicit; go 1.9
 github.com/mattn/go-runewidth
 # github.com/olekukonko/tablewriter v0.0.6-0.20210304033056-74c60be0ef68
