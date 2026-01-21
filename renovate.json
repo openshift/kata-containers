@@ -6,7 +6,8 @@
     "dockerfile": {
         "ignorePaths": [
             "**/tools/**",
-            "**/tests/**"
+            "**/tests/**",
+            "**/vendor/**"
         ]
     },
     "gomod": {
