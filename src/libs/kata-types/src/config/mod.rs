@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use lazy_static::lazy_static;
 
-use crate::{eother, sl};
+use crate::sl;
 
 /// Default configuration values.
 pub mod default;
@@ -24,8 +24,9 @@ pub mod hypervisor;
 pub use self::agent::Agent;
 use self::default::DEFAULT_AGENT_DBG_CONSOLE_PORT;
 pub use self::hypervisor::{
-    BootInfo, CloudHypervisorConfig, DragonballConfig, FirecrackerConfig, Hypervisor, QemuConfig,
-    RemoteConfig, HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_FIRECRACKER, HYPERVISOR_NAME_QEMU,
+    BootInfo, CloudHypervisorConfig, DragonballConfig, Factory, FirecrackerConfig, Hypervisor,
+    QemuConfig, RemoteConfig, HYPERVISOR_NAME_DRAGONBALL, HYPERVISOR_NAME_FIRECRACKER,
+    HYPERVISOR_NAME_QEMU,
 };
 
 mod runtime;
@@ -177,6 +178,15 @@ impl TomlConfig {
         Ok(config)
     }
 
+    /// Get the `Factory` configuration from the active hypervisor.
+    pub fn get_factory(&self) -> Factory {
+        let hypervisor_name = self.runtime.hypervisor_name.as_str();
+        self.hypervisor
+            .get(hypervisor_name)
+            .map(|hv| hv.factory.clone())
+            .unwrap_or_default()
+    }
+
     /// Adjust Kata configuration information.
     pub fn adjust_config(&mut self) -> Result<()> {
         Hypervisor::adjust_config(self)?;
@@ -321,10 +331,9 @@ impl TomlConfig {
 ///
 /// Each member in `patterns` is a path pattern as described by glob(3)
 pub fn validate_path_pattern<P: AsRef<Path>>(patterns: &[String], path: P) -> Result<()> {
-    let path = path
-        .as_ref()
-        .to_str()
-        .ok_or_else(|| eother!("Invalid path {}", path.as_ref().to_string_lossy()))?;
+    let path = path.as_ref().to_str().ok_or_else(|| {
+        std::io::Error::other(format!("Invalid path {}", path.as_ref().to_string_lossy()))
+    })?;
     for p in patterns.iter() {
         if let Ok(glob) = glob::Pattern::new(p) {
             if glob.matches(path) {
@@ -333,7 +342,9 @@ pub fn validate_path_pattern<P: AsRef<Path>>(patterns: &[String], path: P) -> Re
         }
     }
 
-    Err(eother!("Path {} is not permitted", path))
+    Err(std::io::Error::other(format!(
+        "Path {path} is not permitted"
+    )))
 }
 
 /// Kata configuration information.

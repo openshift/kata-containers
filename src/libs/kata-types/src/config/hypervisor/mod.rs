@@ -25,7 +25,7 @@
 
 use super::{default, ConfigOps, ConfigPlugin, TomlConfig};
 use crate::annotations::KATA_ANNO_CFG_HYPERVISOR_PREFIX;
-use crate::{eother, resolve_path, sl, validate_path};
+use crate::{resolve_path, sl, validate_path};
 use byte_unit::{Byte, Unit};
 use lazy_static::lazy_static;
 use regex::RegexSet;
@@ -49,7 +49,7 @@ mod remote;
 pub use self::remote::{RemoteConfig, HYPERVISOR_NAME_REMOTE};
 
 mod rate_limiter;
-pub use self::rate_limiter::RateLimiterConfig;
+pub use self::rate_limiter::{RateLimiterConfig, DEFAULT_RATE_LIMITER_REFILL_TIME};
 
 /// Virtual PCI block device driver.
 pub const VIRTIO_BLK_PCI: &str = "virtio-blk-pci";
@@ -189,6 +189,13 @@ pub struct BlockDeviceInfo {
     /// increases the initial max rate
     #[serde(default)]
     pub disk_rate_limiter_ops_one_time_burst: Option<u64>,
+
+    /// virtio queue size. Size: byte
+    #[serde(default)]
+    pub queue_size: u32,
+    /// block device multi-queue
+    #[serde(default)]
+    pub num_queues: usize,
 }
 
 impl BlockDeviceInfo {
@@ -213,12 +220,21 @@ impl BlockDeviceInfo {
                 default::DEFAULT_BLOCK_DEVICE_AIO_THREADS,
             ];
             if !VALID_BLOCK_DEVICE_AIO.contains(&self.block_device_aio.as_str()) {
-                return Err(eother!(
+                return Err(std::io::Error::other(format!(
                     "{} is unsupported block device AIO mode.",
-                    self.block_device_aio
-                ));
+                    self.block_device_aio,
+                )));
             }
         }
+
+        if self.num_queues == 0 {
+            self.num_queues = default::DEFAULT_BLOCK_DEVICE_NUM_QUEUES as usize;
+        }
+
+        if self.queue_size == 0 {
+            self.queue_size = default::DEFAULT_BLOCK_DEVICE_QUEUE_SIZE;
+        }
+
         if self.memory_offset == 0 {
             self.memory_offset = default::DEFAULT_BLOCK_NVDIMM_MEM_OFFSET;
         }
@@ -248,10 +264,10 @@ impl BlockDeviceInfo {
             VIRTIO_SCSI,
         ];
         if !l.contains(&self.block_device_driver.as_str()) {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "{} is unsupported block device type.",
-                self.block_device_driver
-            ));
+                self.block_device_driver,
+            )));
         }
         validate_path!(
             self.vhost_user_store_path,
@@ -327,7 +343,9 @@ impl BootInfo {
         validate_path!(self.initrd, "guest initrd image file {} is invalid: {}")?;
         validate_path!(self.firmware, "firmware image file {} is invalid: {}")?;
         if !self.image.is_empty() && !self.initrd.is_empty() {
-            return Err(eother!("Can not configure both initrd and image for boot"));
+            return Err(std::io::Error::other(
+                "Can not configure both initrd and image for boot",
+            ));
         }
 
         let l = [
@@ -338,10 +356,10 @@ impl BootInfo {
             VIRTIO_SCSI,
         ];
         if !l.contains(&self.vm_rootfs_driver.as_str()) {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "{} is unsupported block device type.",
-                self.vm_rootfs_driver
-            ));
+                self.vm_rootfs_driver,
+            )));
         }
 
         Ok(())
@@ -356,6 +374,71 @@ impl BootInfo {
             p.push(self.kernel_params.clone());
         }
         self.kernel_params = p.join(KERNEL_PARAM_DELIMITER);
+    }
+
+    /// Replace kernel parameters with the same key.
+    ///
+    /// For each parameter in the new_params string, if a parameter with the same key
+    /// already exists in kernel_params, it will be removed before adding the new one.
+    /// This allows selective parameter override from annotations without replacing
+    /// the entire kernel command line.
+    pub fn replace_kernel_params(&mut self, new_params: &str) {
+        if new_params.is_empty() {
+            return;
+        }
+
+        // Parse existing kernel parameters into a map
+        let mut existing_params: Vec<(String, String)> = Vec::new();
+        for param in self.kernel_params.split(KERNEL_PARAM_DELIMITER) {
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
+            }
+            // Split by '=' to get key and value
+            if let Some(eq_pos) = param.find('=') {
+                let key = param[..eq_pos].to_string();
+                let value = param[eq_pos + 1..].to_string();
+                existing_params.push((key, value));
+            } else {
+                // Parameter without value (like "quiet")
+                existing_params.push((param.to_string(), String::new()));
+            }
+        }
+
+        // Parse new parameters and collect keys to replace
+        let mut new_param_keys: Vec<String> = Vec::new();
+        let mut new_param_list: Vec<String> = Vec::new();
+        for param in new_params.split(KERNEL_PARAM_DELIMITER) {
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
+            }
+            if let Some(eq_pos) = param.find('=') {
+                let key = param[..eq_pos].to_string();
+                new_param_keys.push(key);
+            } else {
+                new_param_keys.push(param.to_string());
+            }
+            new_param_list.push(param.to_string());
+        }
+
+        // Remove existing parameters that will be replaced
+        existing_params.retain(|(key, _)| !new_param_keys.contains(key));
+
+        // Reconstruct kernel_params: existing params + new params
+        let mut all_params: Vec<String> = existing_params
+            .iter()
+            .map(|(key, value)| {
+                if value.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{key}={value}")
+                }
+            })
+            .collect();
+        all_params.extend(new_param_list);
+
+        self.kernel_params = all_params.join(KERNEL_PARAM_DELIMITER);
     }
 
     /// Validate guest kernel image annotation.
@@ -427,11 +510,10 @@ impl CpuInfo {
     /// Validate the configuration information.
     pub fn validate(&self) -> Result<()> {
         if self.default_vcpus > self.default_maxvcpus as f32 {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "The default_vcpus({}) is greater than default_maxvcpus({})",
-                self.default_vcpus,
-                self.default_maxvcpus
-            ));
+                self.default_vcpus, self.default_maxvcpus,
+            )));
         }
         Ok(())
     }
@@ -569,15 +651,15 @@ impl DeviceInfo {
     /// Validate the configuration information.
     pub fn validate(&self) -> Result<()> {
         if self.default_bridges > MAX_BRIDGE_SIZE {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "The configured PCI bridges {} are too many",
-                self.default_bridges
-            ));
+                self.default_bridges,
+            )));
         }
         // Root Port and Switch Port cannot be set simultaneously
         if self.pcie_root_port > 0 && self.pcie_switch_port > 0 {
-            return Err(eother!(
-                "Root Port and Switch Port set at the same time is forbidden."
+            return Err(std::io::Error::other(
+                "Root Port and Switch Port set at the same time is forbidden.",
             ));
         }
 
@@ -819,10 +901,14 @@ impl MemoryInfo {
             "Memory backend file {} is invalid: {}"
         )?;
         if self.default_memory == 0 {
-            return Err(eother!("Configured memory size for guest VM is zero"));
+            return Err(std::io::Error::other(
+                "Configured memory size for guest VM is zero",
+            ));
         }
         if self.memory_slots == 0 {
-            return Err(eother!("Configured memory slots for guest VM are zero"));
+            return Err(std::io::Error::other(
+                "Configured memory slots for guest VM are zero",
+            ));
         }
 
         Ok(())
@@ -878,6 +964,26 @@ impl NetworkInfo {
     }
 }
 
+/// Configuration information for rootless user.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RootlessUser {
+    /// The UID of the rootless user.
+    #[serde(default)]
+    pub uid: u32,
+
+    /// The GID of the rootless user.
+    #[serde(default)]
+    pub gid: u32,
+
+    /// The supplementary groups of the rootless user.
+    #[serde(default)]
+    pub groups: Vec<u32>,
+
+    /// The username of the rootless user.
+    #[serde(default)]
+    pub user_name: String,
+}
+
 /// Configuration information for security settings.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SecurityInfo {
@@ -888,6 +994,14 @@ pub struct SecurityInfo {
     /// Refer to the documentation for limitations of this mode.
     #[serde(default)]
     pub rootless: bool,
+
+    /// Configuration information for rootless user.
+    ///
+    /// This field must be set if the `rootless` configuration above is enabled.
+    /// It contains the UID, GID, supplementary groups, and the user name of the non-root user
+    /// that will be used to run the VMM process.
+    #[serde(default)]
+    pub rootless_user: Option<RootlessUser>,
 
     /// Disables `seccomp` for the guest VM.
     #[serde(default)]
@@ -1100,14 +1214,14 @@ impl SharedFsInfo {
                 if self.msize_9p < default::MIN_SHARED_9PFS_SIZE_MB
                     || self.msize_9p > default::MAX_SHARED_9PFS_SIZE_MB
                 {
-                    return Err(eother!(
+                    return Err(std::io::Error::other(format!(
                         "Invalid 9p configuration msize 0x{:x}, min value is 0x{:x}, max value is 0x{:x}",
                         self.msize_9p,default::MIN_SHARED_9PFS_SIZE_MB, default::MAX_SHARED_9PFS_SIZE_MB
-                    ));
+                    )));
                 }
                 Ok(())
             }
-            Some(v) => Err(eother!("Invalid shared_fs type {}", v)),
+            Some(v) => Err(std::io::Error::other(format!("Invalid shared_fs type {v}"))),
         }
     }
 
@@ -1161,16 +1275,16 @@ impl SharedFsInfo {
         let l = ["never", "auto", "always"];
 
         if !l.contains(&self.virtio_fs_cache.as_str()) {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "Invalid virtio-fs cache mode: {}",
-                &self.virtio_fs_cache
-            ));
+                &self.virtio_fs_cache,
+            )));
         }
         if self.virtio_fs_is_dax && self.virtio_fs_cache_size == 0 {
-            return Err(eother!(
+            return Err(std::io::Error::other(format!(
                 "Invalid virtio-fs DAX window size: {}",
-                &self.virtio_fs_cache_size
-            ));
+                &self.virtio_fs_cache_size,
+            )));
         }
         Ok(())
     }
@@ -1194,6 +1308,52 @@ pub struct RemoteInfo {
     /// Specifies the GPU model, e.g., "tesla", "h100", "a100", "radeon", etc.
     #[serde(default)]
     pub default_gpu_model: String,
+}
+
+/// Configuration information for vm template.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct VmTemplateInfo {
+    /// Indicate whether the VM is being created as a template VM.
+    #[serde(default)]
+    pub boot_to_be_template: bool,
+
+    /// Indicate whether the VM should be created from an existing template VM.
+    #[serde(default)]
+    pub boot_from_template: bool,
+
+    /// memory_path is the memory file path of VM memory.
+    #[serde(default)]
+    pub memory_path: String,
+
+    /// device_state_path is the VM device state file path.
+    #[serde(default)]
+    pub device_state_path: String,
+}
+
+impl VmTemplateInfo {
+    /// Adjust the configuration information after loading from configuration file.
+    pub fn adjust_config(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Validate the configuration information.
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Configuration information for VM factory (templating, caches, etc.).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Factory {
+    /// Enable VM templating support.
+    /// When enabled, new VMs may be created from a template to speed up creation.
+    #[serde(default, rename = "enable_template")]
+    pub enable_template: bool,
+
+    /// Specifies the path of template.
+    /// Example: "/run/vc/vm/template"
+    #[serde(default)]
+    pub template_path: String,
 }
 
 /// Common configuration information for hypervisors.
@@ -1286,6 +1446,14 @@ pub struct Hypervisor {
     #[serde(default, flatten)]
     pub remote_info: RemoteInfo,
 
+    /// vm template configuration information.
+    #[serde(default, flatten)]
+    pub vm_template: VmTemplateInfo,
+
+    /// VM factory configuration information.
+    #[serde(default)]
+    pub factory: Factory,
+
     /// A sandbox annotation used to specify the host path to the `prefetch_files.list`
     /// for the container image being used. The runtime will pass this path to the
     /// Hypervisor to search for the corresponding prefetch list file.
@@ -1359,12 +1527,15 @@ impl ConfigOps for Hypervisor {
                 hv.network_info.adjust_config()?;
                 hv.security_info.adjust_config()?;
                 hv.shared_fs.adjust_config()?;
+                hv.vm_template.adjust_config()?;
                 resolve_path!(
                     hv.prefetch_list_path,
                     "prefetch_list_path `{}` is invalid: {}"
                 )?;
             } else {
-                return Err(eother!("Can not find plugin for hypervisor {}", hypervisor));
+                return Err(std::io::Error::other(format!(
+                    "Can not find plugin for hypervisor {hypervisor}",
+                )));
             }
         }
 
@@ -1396,6 +1567,7 @@ impl ConfigOps for Hypervisor {
                 hv.network_info.validate()?;
                 hv.security_info.validate()?;
                 hv.shared_fs.validate()?;
+                hv.vm_template.validate()?;
                 validate_path!(hv.path, "Hypervisor binary path `{}` is invalid: {}")?;
                 validate_path!(
                     hv.ctlpath,
@@ -1407,7 +1579,9 @@ impl ConfigOps for Hypervisor {
                     "prefetch_files.list path `{}` is invalid: {}"
                 )?;
             } else {
-                return Err(eother!("Can not find plugin for hypervisor {}", hypervisor));
+                return Err(std::io::Error::other(format!(
+                    "Can not find plugin for hypervisor {hypervisor}",
+                )));
             }
         }
 

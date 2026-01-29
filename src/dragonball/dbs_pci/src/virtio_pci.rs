@@ -410,7 +410,7 @@ where
         let msix_res = device_resource
             .get_pci_msix_irqs()
             .ok_or(VirtioPciDeviceError::InvalidMsixResource)?;
-        info!("{:?}: virtio pci device msix_res: {:?}", dev_id, msix_res);
+        info!("{dev_id:?}: virtio pci device msix_res: {msix_res:?}");
 
         let msix_state = MsixState::new(msix_res.1 as u16);
 
@@ -553,7 +553,7 @@ where
             let addr =
                 IoEventAddress::Mmio(notify_base + i as u64 * u64::from(NOTIFY_OFF_MULTIPLIER));
             if let Err(e) = self.vm_fd.register_ioevent(&q.eventfd, &addr, NoDatamatch) {
-                error!("failed to register ioevent: {:?}", e);
+                error!("failed to register ioevent: {e:?}");
                 return Err(std::io::Error::from_raw_os_error(e.errno()));
             }
         }
@@ -669,7 +669,7 @@ where
         Ok(())
     }
 
-    pub fn device(&self) -> MutexGuard<Box<dyn VirtioDevice<AS, Q, R>>> {
+    pub fn device(&self) -> MutexGuard<'_, Box<dyn VirtioDevice<AS, Q, R>>> {
         self.device.lock().expect("Poisoned lock of device")
     }
 
@@ -677,21 +677,21 @@ where
         self.device.clone()
     }
 
-    pub fn common_config(&self) -> MutexGuard<VirtioPciCommonConfig> {
+    pub fn common_config(&self) -> MutexGuard<'_, VirtioPciCommonConfig> {
         self.common_config
             .lock()
             .expect("Poisoned lock of common_config")
     }
 
-    pub fn state(&self) -> MutexGuard<VirtioPciDeviceState<AS, Q>> {
+    pub fn state(&self) -> MutexGuard<'_, VirtioPciDeviceState<AS, Q>> {
         self.state.lock().expect("Poisoned lock of state")
     }
 
-    pub fn msix_state(&self) -> MutexGuard<MsixState> {
+    pub fn msix_state(&self) -> MutexGuard<'_, MsixState> {
         self.msix_state.lock().expect("Poisoned lock of msix_state")
     }
 
-    pub fn intr_mgr(&self) -> MutexGuard<DeviceInterruptManager<Arc<KvmIrqManager>>> {
+    pub fn intr_mgr(&self) -> MutexGuard<'_, DeviceInterruptManager<Arc<KvmIrqManager>>> {
         // Safe to unwrap() because we don't expect poisoned lock here.
         self.intr_mgr.lock().expect("Poisoned lock of intr_mgr")
     }
@@ -806,7 +806,7 @@ impl<
             .activate(device_config)
             .map(|_| self.device_activated.store(true, Ordering::SeqCst))
             .map_err(|e| {
-                error!("device activate error: {:?}", e);
+                error!("device activate error: {e:?}");
                 e
             })?;
 
@@ -885,7 +885,7 @@ impl<
             .device()
             .set_resource(self.vm_fd.clone(), self.device_resource.clone())
             .map_err(|e| {
-                error!("Failed to assign device resource to virtio device: {}", e);
+                error!("Failed to assign device resource to virtio device: {e}");
                 VirtioPciDeviceError::SetResource(e)
             })?;
 
@@ -954,7 +954,7 @@ impl<
             {
                 let mut device = self.device();
                 if let Err(e) = device.read_config(o - DEVICE_CONFIG_BAR_OFFSET, data) {
-                    warn!("device read config err: {}", e);
+                    warn!("device read config err: {e}");
                 }
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -1004,7 +1004,7 @@ impl<
             {
                 let mut device = self.device();
                 if let Err(e) = device.write_config(o - DEVICE_CONFIG_BAR_OFFSET, data) {
-                    warn!("pci device write config err: {}", e);
+                    warn!("pci device write config err: {e}");
                 }
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -1051,7 +1051,7 @@ impl<
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
             let mut device = self.device();
             if let Err(e) = device.reset() {
-                error!("Attempt to reset device when not implemented or reset error in underlying device, err: {:?}", e);
+                error!("Attempt to reset device when not implemented or reset error in underlying device, err: {e:?}");
                 let mut config = self.common_config();
                 config.driver_status = DEVICE_FAILED as u8;
             } else {
@@ -1097,13 +1097,13 @@ impl<
             if reg_in_offset == 2 && data.len() == 2 {
                 if let Err(e) = msix_state.set_msg_ctl(LittleEndian::read_u16(data), &mut intr_mgr)
                 {
-                    error!("Failed to set MSI-X message control, err: {:?}", e);
+                    error!("Failed to set MSI-X message control, err: {e:?}");
                 }
             } else if reg_in_offset == 0 && data.len() == 4 {
                 if let Err(e) = msix_state
                     .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16, &mut intr_mgr)
                 {
-                    error!("Failed to set MSI-X message control, err: {:?}", e);
+                    error!("Failed to set MSI-X message control, err: {e:?}");
                 }
             }
         }
@@ -1159,11 +1159,12 @@ impl<
 #[cfg(test)]
 pub(crate) mod tests {
     #[cfg(target_arch = "aarch64")]
-    use arch::aarch64::gic::create_gic;
+    use dbs_arch::gic::create_gic;
     use dbs_device::resources::MsiIrqType;
     use dbs_interrupt::kvm::KvmIrqManager;
     use dbs_utils::epoll_manager::EpollManager;
     use kvm_ioctls::Kvm;
+    use test_utils::skip_if_kvm_unaccessable;
     use virtio_queue::QueueSync;
     use vm_memory::{GuestMemoryMmap, GuestRegionMmap, GuestUsize, MmapRegion};
 
@@ -1496,6 +1497,7 @@ pub(crate) mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn test_virtio_pci_device_activate() {
+        skip_if_kvm_unaccessable!();
         let mut d: VirtioPciDevice<_, _, _> = get_pci_device();
         assert_eq!(d.state().queues.len(), 2);
         assert!(!d.state().check_queues_valid());
@@ -1554,6 +1556,7 @@ pub(crate) mod tests {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn test_bus_device_reset() {
+        skip_if_kvm_unaccessable!();
         let mut d: VirtioPciDevice<_, _, _> = get_pci_device();
 
         assert_eq!(d.state().queues.len(), 2);
@@ -1578,6 +1581,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_pci_device_resources() {
+        skip_if_kvm_unaccessable!();
         let d: VirtioPciDevice<_, _, _> = get_pci_device();
 
         let resources = d.get_assigned_resources();
@@ -1595,6 +1599,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_virtio_pci_register_ioevent() {
+        skip_if_kvm_unaccessable!();
         let d: VirtioPciDevice<_, _, _> = get_pci_device();
         d.register_ioevent().unwrap();
         assert!(d.ioevent_registered.load(Ordering::SeqCst));
@@ -1616,6 +1621,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_read_bar() {
+        skip_if_kvm_unaccessable!();
         let d: VirtioPciDevice<_, _, _> = get_pci_device();
         let origin_data = vec![1u8];
         // driver status

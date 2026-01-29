@@ -5,15 +5,20 @@
 
 use super::inner::CloudHypervisorInner;
 use crate::ch::utils::get_api_socket_path;
+use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
 use crate::kernel_param::KernelParams;
 use crate::selinux;
+use crate::utils::create_dir_all_with_inherit_owner;
+use crate::utils::set_groups;
+use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
 use crate::VM_ROOTFS_DRIVER_PMEM;
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
+use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
 use ch_config::{
     ch_api::{
         cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_resize,
@@ -27,14 +32,19 @@ use futures::future::join_all;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
+use kata_types::config::hypervisor::RootlessUser;
+use kata_types::rootless::is_rootless;
 use lazy_static::lazy_static;
 use nix::sched::{setns, CloneFlags};
-use serde::{Deserialize, Serialize};
+use nix::unistd::setgid;
+use nix::unistd::setuid;
+use nix::unistd::Gid;
+use nix::unistd::Uid;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::fs::create_dir_all;
+use std::fs::remove_dir_all;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -66,14 +76,6 @@ enum CloudHypervisorLogLevel {
     Info,
     Warn,
     Error,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct VmmPingResponse {
-    pub build_version: String,
-    pub version: String,
-    pub pid: i64,
-    pub features: Vec<String>,
 }
 
 #[derive(thiserror::Error, Debug, PartialEq)]
@@ -195,7 +197,8 @@ impl CloudHypervisorInner {
 
         let sandbox_path = get_sandbox_path(&self.id);
 
-        std::fs::create_dir_all(sandbox_path.clone()).context("failed to create sandbox path")?;
+        create_dir_all_with_inherit_owner(sandbox_path.clone(), 0o750)
+            .context("failed to create sandbox path")?;
 
         let vsock_socket_path = get_vsock_path(&self.id)?;
 
@@ -214,8 +217,8 @@ impl CloudHypervisorInner {
             cfg: self.config.clone(),
             guest_protection_to_use: self.guest_protection_to_use.clone(),
             shared_fs_devices,
-            network_devices,
             host_devices,
+            ..Default::default()
         };
 
         let cfg = VmConfig::try_from(named_cfg)?;
@@ -233,6 +236,28 @@ impl CloudHypervisorInner {
 
         if let Some(detail) = response {
             debug!(sl!(), "vm boot response: {:?}", detail);
+        }
+
+        if let Some(network_devices) = network_devices {
+            for net in network_devices {
+                let vm_fds = net.fds.clone().unwrap_or_default();
+                let response = cloud_hypervisor_vm_netdev_add_with_fds(
+                    socket.try_clone().context("failed to clone socket")?,
+                    net,
+                    vm_fds.clone(),
+                )
+                .await
+                .context("failed to add vm netdev with fds")?;
+
+                if let Some(detail) = response {
+                    debug!(sl!(), "vm netdev add response: {:?}", detail);
+                }
+
+                for fd in vm_fds {
+                    // Explicitly close the fd now that it has been sent to CLH.
+                    nix::unistd::close(fd).context("failed to close netdev fd")?;
+                }
+            }
         }
 
         let response =
@@ -292,10 +317,7 @@ impl CloudHypervisorInner {
     async fn cloud_hypervisor_check_running(&mut self) -> Result<()> {
         let timeout_secs = self.timeout_secs;
 
-        let timeout_msg = format!(
-            "API socket connect timed out after {} seconds",
-            timeout_secs
-        );
+        let timeout_msg = format!("API socket connect timed out after {timeout_secs} seconds");
 
         let join_handle = self.cloud_hypervisor_ping_until_ready(CH_POLL_TIME_MS);
 
@@ -369,6 +391,20 @@ impl CloudHypervisorInner {
             );
         }
 
+        let user: Option<RootlessUser> = if is_rootless() {
+            Some(
+                self.config
+                    .security_info
+                    .rootless_user
+                    .clone()
+                    .ok_or_else(|| {
+                        anyhow!("rootless user must be specified for rootless cloud-hypervisor")
+                    })?,
+            )
+        } else {
+            None
+        };
+
         unsafe {
             let selinux_label = self.config.security_info.selinux_label.clone();
             let _pre = cmd.pre_exec(move || {
@@ -389,13 +425,23 @@ impl CloudHypervisorInner {
                         );
                     }
                 }
+                if let Some(user) = &user {
+                    let groups = user.groups.clone();
+                    let gid = Gid::from_raw(user.gid);
+                    let uid = Uid::from_raw(user.uid);
+
+                    let _ = set_groups(&groups);
+                    let _ = setgid(gid).context("setgid failed");
+                    let _ = setuid(uid).context("setuid failed");
+                }
+
                 Ok(())
             });
         }
 
         debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
 
-        let child = cmd.spawn().context(format!("{} spawn failed", CH_NAME))?;
+        let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
 
         // Save process PID
         self.pid = child.id();
@@ -456,7 +502,7 @@ impl CloudHypervisorInner {
 
         for result in results {
             if let Err(e) = result {
-                eprintln!("wait task error: {:#?}", e);
+                eprintln!("wait task error: {e:#?}");
 
                 wait_errors.push(e);
             }
@@ -474,12 +520,12 @@ impl CloudHypervisorInner {
         let mut child = self
             .process
             .take()
-            .ok_or(format!("{} not running", CH_NAME))
+            .ok_or(format!("{CH_NAME} not running"))
             .map_err(|e| anyhow!(e))?;
 
         let _pid = child
             .id()
-            .ok_or(format!("{} missing PID", CH_NAME))
+            .ok_or(format!("{CH_NAME} missing PID"))
             .map_err(|e| anyhow!(e))?;
 
         // Note that this kills _and_ waits for the process!
@@ -621,11 +667,11 @@ impl CloudHypervisorInner {
         self.run_dir = get_sandbox_path(&self.id);
         self.vm_path = self.run_dir.to_string();
 
-        create_dir_all(&self.run_dir)
+        create_dir_all_with_inherit_owner(&self.run_dir, 0o750)
             .with_context(|| anyhow!("failed to create sandbox directory {}", self.run_dir))?;
 
         if !self.jailer_root.is_empty() {
-            create_dir_all(self.jailer_root.as_str())
+            create_dir_all_with_inherit_owner(self.jailer_root.as_str(), 0o750)
                 .map_err(|e| anyhow!("Failed to create dir {} err : {:?}", self.jailer_root, e))?;
         }
 
@@ -684,7 +730,7 @@ impl CloudHypervisorInner {
 
         let vsock_path = get_vsock_path(&self.id)?;
 
-        let uri = format!("{}://{}", HYBRID_VSOCK_SCHEME, vsock_path);
+        let uri = format!("{HYBRID_VSOCK_SCHEME}://{vsock_path}");
 
         Ok(uri)
     }
@@ -704,7 +750,9 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
-        Ok(())
+        info!(sl!(), "CloudHypervisor::cleanup()");
+        remove_dir_all(get_rootless_symlink_sandbox_path(self.id.as_str()))?;
+        vm_cleanup(&self.config, self.vm_path.as_str())
     }
 
     pub(crate) async fn resize_vcpu(
@@ -769,7 +817,7 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
         if let Some(pid) = self.pid {
-            let ns_path = format!("/proc/{}/ns", pid);
+            let ns_path = format!("/proc/{pid}/ns");
             Ok(ns_path)
         } else {
             Err(anyhow!("could not get ns path"))
@@ -783,7 +831,7 @@ impl CloudHypervisorInner {
     pub(crate) async fn get_jailer_root(&self) -> Result<String> {
         let root_path = get_jailer_root(&self.id);
 
-        std::fs::create_dir_all(&root_path)?;
+        create_dir_all_with_inherit_owner(&root_path, 0o750)?;
 
         Ok(root_path)
     }
@@ -869,7 +917,7 @@ impl CloudHypervisorInner {
             bytes_to_megs(guest_mem_block_size)
         );
 
-        let is_unaligned = new_hotplugged_mem % guest_mem_block_size != 0;
+        let is_unaligned = !new_hotplugged_mem.is_multiple_of(guest_mem_block_size);
         if is_unaligned {
             new_hotplugged_mem = ch_config::convert::checked_next_multiple_of(
                 new_hotplugged_mem,
@@ -990,7 +1038,7 @@ async fn cloud_hypervisor_log_output(
 // For performance, the line is scanned exactly once and all log levels
 // are search for.
 fn parse_ch_log_level(line: &str) -> CloudHypervisorLogLevel {
-    for (i, c) in line.chars().enumerate() {
+    for (i, c) in line.char_indices() {
         if c == 'I' && line[i..].starts_with("INFO:") {
             return CloudHypervisorLogLevel::Info;
         } else if c == 'D' && line[i..].starts_with("DEBG:") {
@@ -1136,7 +1184,10 @@ mod tests {
         // available_guest_protection() requires super user privs.
         skip_if_not_root!();
 
-        let sev_snp_details = SevSnpDetails { cbitpos: 42 };
+        let sev_snp_details = SevSnpDetails {
+            cbitpos: 42,
+            phys_addr_reduction: 42,
+        };
 
         #[derive(Debug)]
         struct TestData {
@@ -1172,7 +1223,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             set_fake_guest_protection(d.value.clone());
 
@@ -1181,10 +1232,10 @@ mod tests {
                     .await
                     .unwrap();
 
-            let msg = format!("{}: actual result: {:?}", msg, result);
+            let msg = format!("{msg}: actual result: {result:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
             assert_result!(d.result, result, msg);
@@ -1214,9 +1265,9 @@ mod tests {
                 .unwrap();
 
         if std::env::var("DEBUG").is_ok() {
-            let msg = format!("have_tdx: {:?}, protection: {:?}", have_tdx, protection);
+            let msg = format!("have_tdx: {have_tdx:?}, protection: {protection:?}");
 
-            eprintln!("DEBUG: {}", msg);
+            eprintln!("DEBUG: {msg}");
         }
 
         if have_tdx {
@@ -1285,7 +1336,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             set_fake_guest_protection(d.available_protection.clone());
 
@@ -1305,10 +1356,10 @@ mod tests {
 
             let result = ch.handle_guest_protection().await;
 
-            let msg = format!("{}: actual result: {:?}", msg, result);
+            let msg = format!("{msg}: actual result: {result:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
             if d.result.is_ok() && result.is_ok() {
@@ -1319,8 +1370,7 @@ mod tests {
 
             assert_eq!(
                 ch.guest_protection_to_use, d.guest_protection_to_use,
-                "{}",
-                msg
+                "{msg}"
             );
         }
 
@@ -1357,7 +1407,7 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let mut ch = CloudHypervisorInner::default();
 
@@ -1374,10 +1424,10 @@ mod tests {
 
                 let result = ch.get_kernel_params().await;
 
-                let msg = format!("{}: actual result: {:?}", msg, result);
+                let msg = format!("{msg}: actual result: {result:?}");
 
                 if std::env::var("DEBUG").is_ok() {
-                    eprintln!("DEBUG: {}", msg);
+                    eprintln!("DEBUG: {msg}");
                 }
 
                 if d.fails {
@@ -1493,17 +1543,17 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test[{}]: {:?}", i, d);
+            let msg = format!("test[{i}]: {d:?}");
 
             let level = parse_ch_log_level(d.line);
 
-            let msg = format!("{}: actual level: {:?}", msg, level);
+            let msg = format!("{msg}: actual level: {level:?}");
 
             if std::env::var("DEBUG").is_ok() {
-                eprintln!("DEBUG: {}", msg);
+                eprintln!("DEBUG: {msg}");
             }
 
-            assert_eq!(d.level, level, "{}", msg);
+            assert_eq!(d.level, level, "{msg}");
         }
     }
 
@@ -1545,14 +1595,14 @@ mod tests {
         ];
 
         for (i, d) in tests.iter().enumerate() {
-            let msg = format!("test: [{}]: {:?}", i, d);
+            let msg = format!("test: [{i}]: {d:?}");
 
             if std::env::var("DEBUG").is_ok() {
                 println!("DEBUG: {msg}");
             }
 
             let result = get_ch_vcpu_tids(d.proc_path);
-            let msg = format!("{}, result: {:?}", msg, result);
+            let msg = format!("{msg}, result: {result:?}");
 
             let expected_error = format!("{}", d.result.as_ref().unwrap_err());
             let actual_error = format!("{}", result.unwrap_err());

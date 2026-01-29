@@ -125,7 +125,7 @@ const GROUP_FILE_WHITEOUT_TAR_PATH: &str = "etc/.wh.group";
 pub const WHITEOUT_MARKER: &str = "WHITEOUT";
 
 impl Container {
-    pub async fn new(config: &Config, image: &str) -> Result<Self> {
+    pub async fn new(config: &Config, image: &str, is_pause_container: bool) -> Result<Self> {
         info!("============================================");
         info!("Pulling manifest and config for {image}");
         let image_string = image.to_string();
@@ -154,53 +154,50 @@ impl Container {
             }
         };
 
-        debug!("digest_hash: {:?}", digest_hash);
+        debug!("Container:new: digest_hash: {:?}", digest_hash);
         debug!(
-            "manifest: {}",
+            "Container:new: manifest: {}",
             serde_json::to_string_pretty(&manifest).unwrap()
         );
-        debug!("config_layer string: {config_layer_str}");
+        debug!("Container:new: config_layer string: {config_layer_str}");
         let config_layer: DockerConfigLayer = serde_json::from_str(&config_layer_str).unwrap();
-        debug!("config_layer: {:?}", &config_layer);
+        debug!("Container:new: config_layer: {:?}", &config_layer);
 
         let mut passwd = String::new();
         let mut group = String::new();
 
         // Nydus/guest_pull doesn't make available passwd/group files from layers properly.
         // See issue https://github.com/kata-containers/kata-containers/issues/11162
-        if config.settings.cluster_config.guest_pull {
+        let v1_policy = config.settings.cluster_config.pause_container_id_policy == "v1";
+        if config.settings.cluster_config.guest_pull && (v1_policy || !is_pause_container) {
             info!("Guest pull is enabled, skipping passwd/group file parsing");
-            return Ok(Container {
-                image: image_string,
-                config_layer,
-                passwd,
-                group,
-            });
-        }
+        } else {
+            let image_layers = get_image_layers(
+                &config.layers_cache,
+                &mut client,
+                &reference,
+                &manifest,
+                &config_layer,
+            )
+            .await
+            .unwrap();
 
-        let image_layers = get_image_layers(
-            &config.layers_cache,
-            &mut client,
-            &reference,
-            &manifest,
-            &config_layer,
-        )
-        .await
-        .unwrap();
+            // Find the last layer with an /etc/* file, respecting whiteouts.
+            info!("Parsing users and groups in image layers");
+            for layer in &image_layers {
+                if layer.passwd == WHITEOUT_MARKER {
+                    passwd = String::new();
+                } else if !layer.passwd.is_empty() {
+                    passwd = layer.passwd.clone();
+                    debug!("Container:new: Found in image layer passwd = \n{passwd}");
+                }
 
-        // Find the last layer with an /etc/* file, respecting whiteouts.
-        info!("Parsing users and groups in image layers");
-        for layer in &image_layers {
-            if layer.passwd == WHITEOUT_MARKER {
-                passwd = String::new();
-            } else if !layer.passwd.is_empty() {
-                passwd = layer.passwd.clone();
-            }
-
-            if layer.group == WHITEOUT_MARKER {
-                group = String::new();
-            } else if !layer.group.is_empty() {
-                group = layer.group.clone();
+                if layer.group == WHITEOUT_MARKER {
+                    group = String::new();
+                } else if !layer.group.is_empty() {
+                    group = layer.group.clone();
+                    debug!("Container:new: Found in image layer group = \n{group}");
+                }
             }
         }
 
@@ -221,6 +218,10 @@ impl Container {
         match parse_passwd_file(&self.passwd) {
             Ok(records) => {
                 if let Some(record) = records.iter().find(|&r| r.uid == uid) {
+                    debug!(
+                        "parse_passwd_file: found GID = {} for UID = {uid} in image layer",
+                        record.gid
+                    );
                     Ok(record.gid)
                 } else {
                     Err(anyhow!("Failed to find uid {} in /etc/passwd", uid))
@@ -244,6 +245,10 @@ impl Container {
         match parse_passwd_file(&self.passwd) {
             Ok(records) => {
                 if let Some(record) = records.iter().find(|&r| r.user == user) {
+                    debug!(
+                        "parse_passwd_file: found GID = {} for user = {user} in image layer",
+                        record.gid
+                    );
                     Ok((record.uid, record.gid))
                 } else {
                     Err(anyhow!("Failed to find user {} in /etc/passwd", user))
@@ -279,6 +284,10 @@ impl Container {
                         if u == &user && &record.name != u {
                             // The second condition works around containerd bug
                             // https://github.com/containerd/containerd/issues/11937.
+                            debug!(
+                                "get_additional_groups_from_uid: found AdditionalGID = {} for user = {user} in image layer",
+                                record.gid
+                            );
                             groups.push(record.gid);
                         }
                     });
@@ -299,14 +308,17 @@ impl Container {
             // If the user is not a number, interpret it as a user name.
             Err(outer_e) => {
                 debug!(
-                    "Failed to parse {} as u32, using it as a user name - error {outer_e}",
+                    "parse_user_string: failed to parse {} as u32, using it as a user name - error {outer_e}",
                     user
                 );
                 match self.get_uid_gid_from_passwd_user(user.to_string().clone()) {
-                    Ok((uid, _)) => uid,
+                    Ok((uid, _)) => {
+                        debug!("parse_user_string: parsed user = {user} to uid = {uid}");
+                        uid
+                    }
                     Err(err) => {
                         warn!(
-                            "could not resolve named user {}, defaulting to uid 0: {}",
+                            "parse_user_string: could not resolve named user {}, defaulting to uid 0: {}",
                             user, err
                         );
                         0
@@ -323,8 +335,11 @@ impl Container {
         yaml_has_command: bool,
         yaml_has_args: bool,
     ) {
-        debug!("Getting process field from docker config layer...");
         let docker_config = &self.config_layer.config;
+        debug!(
+            "Container::get_process: getting process field for docker config with User = {:?}",
+            &docker_config.User
+        );
 
         /*
          * The user field may:
@@ -339,29 +354,59 @@ impl Container {
         if let Some(image_user) = &docker_config.User {
             if !image_user.is_empty() {
                 if image_user.contains(':') {
-                    debug!("Splitting Docker config user = {:?}", image_user);
+                    debug!(
+                        "Container::get_process: splitting Docker config user = {:?}",
+                        image_user
+                    );
                     let user: Vec<&str> = image_user.split(':').collect();
                     let parts_count = user.len();
                     if parts_count != 2 {
                         warn!(
-                            "Failed to split user, expected two parts, got {}, using uid = gid = 0",
+                            "Container::get_process: failed to split user, expected two parts, got {}, using uid = gid = 0",
                             parts_count
                         );
                     } else {
-                        debug!("Parsing uid from user[0] = {}", &user[0]);
+                        debug!(
+                            "Container::get_process: parsing uid from user[0] = {}",
+                            &user[0]
+                        );
                         process.User.UID = self.parse_user_string(user[0]);
 
                         debug!(
-                            "Overriding OCI container GID with UID:GID mapping from /etc/passwd"
+                            "Container::get_process: overriding OCI container GID with UID:GID mapping from /etc/passwd"
                         );
                     }
                 } else {
-                    debug!("Parsing uid from image_user = {}", image_user);
+                    debug!(
+                        "Container::get_process: parsing uid from image_user = {}",
+                        image_user
+                    );
                     process.User.UID = self.parse_user_string(image_user);
 
-                    debug!("Using UID:GID mapping from /etc/passwd");
+                    debug!("Container::get_process: Using UID:GID mapping from /etc/passwd");
                 }
-                process.User.GID = self.get_gid_from_passwd_uid(process.User.UID).unwrap_or(0);
+
+                match self.get_gid_from_passwd_uid(process.User.UID) {
+                    Ok(gid) => {
+                        process.User.GID = gid;
+                        debug!(
+                            "Container::get_process: set GID = {gid} from container image for UID = {}",
+                            process.User.UID
+                        );
+
+                        process.User.AdditionalGids.insert(gid);
+                        debug!(
+                            "get_container_process: inserted GID = {gid} into AdditionalGids: User = {:?}",
+                            &process.User
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Container::get_process: no GID for UID = {} in container image, error {e}",
+                            process.User.UID
+                        );
+                    }
+                }
             }
         }
 
@@ -381,12 +426,18 @@ impl Container {
         }
 
         let policy_args = &mut process.Args;
-        debug!("Already existing policy args: {:?}", policy_args);
+        debug!(
+            "Container::get_process: already existing policy args: {:?}",
+            policy_args
+        );
 
         if let Some(entry_points) = &docker_config.Entrypoint {
-            debug!("Image Entrypoint: {:?}", entry_points);
+            debug!(
+                "Container::get_process: image Entrypoint: {:?}",
+                entry_points
+            );
             if !yaml_has_command {
-                debug!("Inserting Entrypoint into policy args");
+                debug!("Container::get_process: inserting Entrypoint into policy args");
 
                 let mut reversed_entry_points = entry_points.clone();
                 reversed_entry_points.reverse();
@@ -395,29 +446,38 @@ impl Container {
                     policy_args.insert(0, entry_point.clone());
                 }
             } else {
-                debug!("Ignoring image Entrypoint because YAML specified the container command");
+                debug!("Container::get_process: ignoring image Entrypoint because YAML specified the container command");
             }
         } else {
-            debug!("No image Entrypoint");
+            debug!("Container::get_process: no image Entrypoint");
         }
 
-        debug!("Updated policy args: {:?}", policy_args);
+        debug!(
+            "Container::get_process: updated policy args: {:?}",
+            policy_args
+        );
 
         if yaml_has_command {
-            debug!("Ignoring image Cmd because YAML specified the container command");
+            debug!("Container::get_process: ignoring image Cmd because YAML specified the container command");
         } else if yaml_has_args {
-            debug!("Ignoring image Cmd because YAML specified the container args");
+            debug!("Container::get_process: ignoring image Cmd because YAML specified the container args");
         } else if let Some(commands) = &docker_config.Cmd {
-            debug!("Adding to policy args the image Cmd: {:?}", commands);
+            debug!(
+                "container::get_process: adding to policy args the image Cmd: {:?}",
+                commands
+            );
 
             for cmd in commands {
                 policy_args.push(cmd.clone());
             }
         } else {
-            debug!("Image Cmd field is not present");
+            debug!("Container::get_process: image Cmd field is not present");
         }
 
-        debug!("Updated policy args: {:?}", policy_args);
+        debug!(
+            "Container::get_process: updated policy args: {:?}",
+            policy_args
+        );
 
         if let Some(working_dir) = &docker_config.WorkingDir {
             if !working_dir.is_empty() {
@@ -425,7 +485,7 @@ impl Container {
             }
         }
 
-        debug!("get_process succeeded.");
+        debug!("Container::get_process: succeeded.");
     }
 }
 
@@ -475,7 +535,7 @@ async fn get_users_from_layer(
     diff_id: &str,
 ) -> Result<ImageLayer> {
     if let Some(layer) = layers_cache.get_layer(diff_id) {
-        info!("Using cache file");
+        info!("get_users_from_layer: using cache file");
         return Ok(layer);
     }
 
@@ -525,7 +585,10 @@ async fn create_decompressed_layer_file(
     decompressed_path: &Path,
     compressed_path: &Path,
 ) -> Result<()> {
-    info!("Pulling layer {:?}", layer_digest);
+    info!(
+        "create_decompressed_layer_file: pulling layer {:?}",
+        layer_digest
+    );
     let mut file = tokio::fs::File::create(&compressed_path)
         .await
         .map_err(|e| anyhow!(e))?;
@@ -535,7 +598,7 @@ async fn create_decompressed_layer_file(
         .map_err(|e| anyhow!(e))?;
     file.flush().await.map_err(|e| anyhow!(e))?;
 
-    info!("Decompressing layer");
+    info!("create_decompressed_layer_file: decompressing layer");
     let compressed_file = std::fs::File::open(compressed_path).map_err(|e| anyhow!(e))?;
     let mut decompressed_file = std::fs::OpenOptions::new()
         .read(true)
@@ -589,11 +652,16 @@ pub fn get_users_from_decompressed_layer(path: &Path) -> Result<(String, String)
     Ok((passwd, group))
 }
 
-pub async fn get_container(config: &Config, image: &str) -> Result<Container> {
+pub async fn get_container(
+    config: &Config,
+    image: &str,
+    is_pause_container: bool,
+) -> Result<Container> {
     if let Some(socket_path) = &config.containerd_socket_path {
-        return Container::new_containerd_pull(config, image, socket_path).await;
+        return Container::new_containerd_pull(config, image, socket_path, is_pause_container)
+            .await;
     }
-    Container::new(config, image).await
+    Container::new(config, image, is_pause_container).await
 }
 
 fn build_auth(reference: &Reference) -> RegistryAuth {
@@ -631,7 +699,7 @@ fn build_auth(reference: &Reference) -> RegistryAuth {
                     &stderr, &stdout);
             }
         }
-        Err(e) => panic!("Error handling docker configuration file: {}", e),
+        Err(e) => panic!("Error handling docker configuration file: {e}"),
     }
 
     RegistryAuth::Anonymous

@@ -14,7 +14,6 @@ use super::default::{
     DEFAULT_AGENT_DIAL_TIMEOUT_MS, DEFAULT_AGENT_LOG_PORT, DEFAULT_AGENT_VSOCK_PORT,
     DEFAULT_PASSFD_LISTENER_PORT,
 };
-use crate::eother;
 
 /// agent name of Kata agent.
 pub const AGENT_NAME_KATA: &str = "kata";
@@ -148,6 +147,10 @@ pub struct Agent {
     /// Memory agent configuration
     #[serde(default)]
     pub mem_agent: MemAgent,
+
+    /// Agent policy
+    #[serde(default)]
+    pub policy: String,
 }
 
 fn deserialize_secs_to_millis<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
@@ -176,6 +179,7 @@ impl std::default::Default for Agent {
             kernel_modules: Default::default(),
             container_pipe_size: 0,
             mem_agent: MemAgent::default(),
+            policy: Default::default(),
         }
     }
 }
@@ -219,7 +223,7 @@ fn default_health_check_timeout() -> u32 {
 impl Agent {
     fn validate(&self) -> Result<()> {
         if self.dial_timeout_ms == 0 {
-            return Err(eother!("dial_timeout_ms couldn't be 0."));
+            return Err(std::io::Error::other("dial_timeout_ms couldn't be 0."));
         }
 
         Ok(())

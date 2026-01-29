@@ -37,6 +37,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	pkgDevice "github.com/kata-containers/kata-containers/src/runtime/pkg/device"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/device/drivers"
 	hv "github.com/kata-containers/kata-containers/src/runtime/pkg/hypervisors"
@@ -141,6 +142,8 @@ const (
 	qemuStopSandboxTimeoutSecs = 15
 
 	qomPathPrefix = "/machine/peripheral/"
+
+	indepIOThreadsPrefix = "indep_iothread"
 )
 
 // agnostic list of kernel parameters
@@ -172,6 +175,10 @@ func (l qmpLogger) Warningf(format string, v ...interface{}) {
 
 func (l qmpLogger) Errorf(format string, v ...interface{}) {
 	l.logger.Errorf(format, v...)
+}
+
+func (l qmpLogger) Debugf(format string, v ...interface{}) {
+	l.logger.Debugf(format, v...)
 }
 
 // Logger returns a logrus logger appropriate for logging qemu messages
@@ -497,6 +504,26 @@ func (q *qemu) setupFileBackedMem(knobs *govmmQemu.Knobs, memory *govmmQemu.Memo
 	memory.Path = target
 }
 
+func (q *qemu) setupIoThread(ioThread *govmmQemu.IOThread) []govmmQemu.IOThread {
+
+	var tmp_threads []govmmQemu.IOThread
+
+	// Add virtio-scsi IOThreads for QEMU
+	if ioThread != nil {
+		tmp_threads = append(tmp_threads, *ioThread)
+	}
+
+	// Add Independent IOThreads for QEMU
+	if q.config.IndepIOThreads > 0 {
+		for i := uint32(0); i < q.config.IndepIOThreads; i++ {
+			id := fmt.Sprintf("%s_%d", indepIOThreadsPrefix, i)
+			tmp_threads = append(tmp_threads, govmmQemu.IOThread{ID: id})
+		}
+	}
+
+	return tmp_threads
+}
+
 func (q *qemu) setConfig(config *HypervisorConfig) error {
 	q.config = *config
 
@@ -633,6 +660,7 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		return err
 	}
 
+	// Note: Only virtio-SCSI device driver use this ioThread args.
 	devices, ioThread, kernel, err := q.buildDevices(ctx, kernelPath)
 	if err != nil {
 		return err
@@ -701,9 +729,9 @@ func (q *qemu) CreateVM(ctx context.Context, id string, network Network, hypervi
 		return err
 	}
 
-	if ioThread != nil {
-		qemuConfig.IOThreads = []govmmQemu.IOThread{*ioThread}
-	}
+	// Setup iothread for devices.
+	qemuConfig.IOThreads = q.setupIoThread(ioThread)
+
 	// Add RNG device to hypervisor
 	// Skip for s390x (as CPACF is used) or when Confidential Guest is enabled
 	if machine.Type != QemuCCWVirtio && !q.config.ConfidentialGuest {
@@ -826,7 +854,7 @@ func (q *qemu) createPCIeTopology(qemuConfig *govmmQemu.Config, hypervisorConfig
 		// In the case of IOMMUFD the device.HostPath will look like
 		// /dev/vfio/devices/vfio0
 		// (1) Check if we have the new IOMMUFD or old container based VFIO
-		if strings.HasPrefix(dev.HostPath, drivers.IommufdDevPath) {
+		if strings.HasPrefix(dev.HostPath, pkgDevice.IommufdDevPath) {
 			q.Logger().Infof("### IOMMUFD Path: %s", dev.HostPath)
 			vfioDevices, err = drivers.GetDeviceFromVFIODev(dev)
 			if err != nil {
@@ -1634,7 +1662,13 @@ func (q *qemu) hotplugAddBlockDevice(ctx context.Context, drive *config.BlockDri
 
 		queues := int(q.config.NumVCPUs())
 
-		if err = q.qmpMonitorCh.qmp.ExecutePCIDeviceAdd(q.qmpMonitorCh.ctx, drive.ID, devID, driver, addr, bridge.ID, romFile, queues, true, defaultDisableModern); err != nil {
+		// Make Independent IOThread 0 as the virtio-blk default.
+		var iothreadID string
+		if q.config.EnableIOThreads && q.config.IndepIOThreads > 0 {
+			iothreadID = fmt.Sprintf("%s_%d", indepIOThreadsPrefix, 0)
+		}
+
+		if err = q.qmpMonitorCh.qmp.ExecutePCIDeviceAdd(q.qmpMonitorCh.ctx, drive.ID, devID, driver, addr, bridge.ID, romFile, queues, true, defaultDisableModern, iothreadID); err != nil {
 			return err
 		}
 	case q.config.BlockDeviceDriver == config.VirtioBlockCCW:
@@ -1847,7 +1881,7 @@ func (q *qemu) executePCIVFIODeviceAdd(device *config.VFIODev, addr string, brid
 func (q *qemu) executeVFIODeviceAdd(device *config.VFIODev) error {
 	switch device.Type {
 	case config.VFIOPCIDeviceNormalType:
-		return q.qmpMonitorCh.qmp.ExecuteVFIODeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.BDF, device.Bus, romFile)
+		return q.qmpMonitorCh.qmp.ExecuteVFIODeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.BDF, device.Bus, romFile, device.IOMMUFDID())
 	case config.VFIOPCIDeviceMediatedType:
 		return q.qmpMonitorCh.qmp.ExecutePCIVFIOMediatedDeviceAdd(q.qmpMonitorCh.ctx, device.ID, device.SysfsDev, "", device.Bus, romFile)
 	case config.VFIOAPDeviceMediatedType:

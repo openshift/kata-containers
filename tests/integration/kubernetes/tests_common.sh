@@ -11,7 +11,6 @@
 # This contains variables and functions common to all e2e tests.
 
 # Variables used by the kubernetes tests
-export docker_images_nginx_version="1.15-alpine"
 export container_images_agnhost_name="registry.k8s.io/e2e-test-images/agnhost"
 export container_images_agnhost_version="2.21"
 
@@ -51,19 +50,14 @@ KATA_HOST_OS="${KATA_HOST_OS:-}"
 setup_common() {
 	node=$(get_one_kata_node)
 	[[ -n "${node}" ]]
-	node_start_time=$(exec_host "${node}" date +\"%Y-%m-%d %H:%M:%S\")
-	# If node_start_time is empty, try again 3 times with a 5 seconds sleep between each try.
-	count=0
-	while [[ -z "${node_start_time}" ]] && [[ "${count}" -lt 3 ]]; do
-		echo "node_start_time is empty, trying again..."
-		sleep 5
-		node_start_time=$(exec_host "${node}" date +\"%Y-%m-%d %H:%M:%S\")
-		count=$((count + 1))
-	done
-	[[ -n "${node_start_time}" ]]
+
+	node_start_time=$(measure_node_time "${node}")
+
 	export node node_start_time
 
 	k8s_delete_all_pods_if_any_exists || true
+
+	get_pod_config_dir
 }
 
 get_pod_config_dir() {
@@ -85,11 +79,31 @@ auto_generate_policy_enabled() {
 
 is_coco_platform() {
 	case "${KATA_HYPERVISOR}" in
-		"qemu-tdx"|"qemu-snp"|"qemu-coco-dev")
+		"qemu-tdx"|"qemu-snp"|"qemu-coco-dev"|"qemu-coco-dev-runtime-rs"|"qemu-nvidia-gpu-tdx"|"qemu-nvidia-gpu-snp")
 			return 0
 			;;
 		*)
 			return 1
+	esac
+}
+
+is_nvidia_gpu_platform() {
+	case "${KATA_HYPERVISOR}" in
+		qemu-nvidia-gpu*)
+			return 0
+			;;
+		*)
+			return 1
+	esac
+}
+
+is_aks_cluster() {
+	case "${KATA_HYPERVISOR}" in
+		"qemu-tdx"|"qemu-snp"|qemu-nvidia-gpu*)
+			return 1
+			;;
+		*)
+			return 0
 	esac
 }
 
@@ -125,11 +139,52 @@ adapt_common_policy_settings_for_non_coco() {
 	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
 }
 
+# adapt common policy settings for AKS Hosts
+adapt_common_policy_settings_for_aks() {
+	info "Adapting common policy settings for AKS Hosts"
+
+	jq '.pause_container.Process.User.UID = 0' "${settings_dir}/genpolicy-settings.json" > temp.json
+	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+
+	jq '.pause_container.Process.User.GID = 0' "${settings_dir}/genpolicy-settings.json" > temp.json
+	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+
+	jq '.cluster_config.pause_container_image = "mcr.microsoft.com/oss/v2/kubernetes/pause:3.6"' "${settings_dir}/genpolicy-settings.json" > temp.json
+	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+
+	jq '.cluster_config.pause_container_id_policy = "v2"' "${settings_dir}/genpolicy-settings.json" > temp.json
+	sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+}
+
+# adapt common policy settings for CBL-Mariner Hosts
+adapt_common_policy_settings_for_cbl_mariner() {
+	local settings_dir=$1
+
+	info "Adapting common policy settings for KATA_HOST_OS=cbl-mariner"
+	jq '.kata_config.oci_version = "1.2.0"' "${settings_dir}/genpolicy-settings.json" > temp.json && sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+}
+
+# Adapt common policy settings for NVIDIA GPU platforms (CI runners use containerd 2.x).
+adapt_common_policy_settings_for_nvidia_gpu() {
+	local settings_dir=$1
+
+	info "Adapting common policy settings for NVIDIA GPU platform (${KATA_HYPERVISOR})"
+	jq '.kata_config.oci_version = "1.2.1"' "${settings_dir}/genpolicy-settings.json" > temp.json && sudo mv temp.json "${settings_dir}/genpolicy-settings.json"
+}
+
 # adapt common policy settings for various platforms
 adapt_common_policy_settings() {
 	local settings_dir=$1
 
 	is_coco_platform || adapt_common_policy_settings_for_non_coco "${settings_dir}"
+	is_aks_cluster && adapt_common_policy_settings_for_aks "${settings_dir}"
+	is_nvidia_gpu_platform && adapt_common_policy_settings_for_nvidia_gpu "${settings_dir}"
+
+	case "${KATA_HOST_OS}" in
+		"cbl-mariner")
+			adapt_common_policy_settings_for_cbl_mariner "${settings_dir}"
+			;;
+	esac
 }
 
 # If auto-generated policy testing is enabled, make a copy of the genpolicy settings,
@@ -156,6 +211,7 @@ create_tmp_policy_settings_dir() {
 	tmp_settings_dir=$(mktemp -d --tmpdir="${common_settings_dir}" genpolicy.XXXXXXXXXX)
 	cp "${common_settings_dir}/rules.rego" "${tmp_settings_dir}"
 	cp "${common_settings_dir}/genpolicy-settings.json" "${tmp_settings_dir}"
+	cp "${common_settings_dir}/default-initdata.toml" "${tmp_settings_dir}"
 
 	echo "${tmp_settings_dir}"
 }
@@ -174,6 +230,17 @@ delete_tmp_policy_settings_dir() {
 
 # Execute genpolicy to auto-generate policy for a test YAML file.
 auto_generate_policy() {
+	declare -r settings_dir="$1"
+	declare -r yaml_file="$2"
+	declare -r config_map_yaml_file="${3:-""}"
+	declare additional_flags="${4:-""}"
+
+	additional_flags="${additional_flags} --initdata-path=${settings_dir}/default-initdata.toml"
+
+	auto_generate_policy_no_added_flags "${settings_dir}" "${yaml_file}" "${config_map_yaml_file}" "${additional_flags}"
+}
+
+auto_generate_policy_no_added_flags() {
 	declare -r settings_dir="$1"
 	declare -r yaml_file="$2"
 	declare -r config_map_yaml_file="${3:-""}"
@@ -272,7 +339,7 @@ hard_coded_policy_tests_enabled() {
 	# CI is testing hard-coded policies just on a the platforms listed here. Outside of CI,
 	# users can enable testing of the same policies (plus the auto-generated policies) by
 	# specifying AUTO_GENERATE_POLICY=yes.
-	local -r enabled_hypervisors=("qemu-coco-dev" "qemu-snp" "qemu-tdx")
+	local -r enabled_hypervisors=("qemu-coco-dev" "qemu-snp" "qemu-tdx" "qemu-coco-dev-runtime-rs")
 	for enabled_hypervisor in "${enabled_hypervisors[@]}"
 	do
 		if [[ "${enabled_hypervisor}" == "${KATA_HYPERVISOR}" ]]; then
@@ -297,10 +364,10 @@ encode_policy_in_init_data() {
   local POLICY
 
   # if input is a file, read its contents
-  if [[ -f "$input" ]]; then
-    POLICY="$(< "$input")"
+  if [[ -f "${input}" ]]; then
+    POLICY="$(< "${input}")"
   else
-    POLICY="$input"
+    POLICY="${input}"
   fi
 
   cat <<EOF | gzip -c | base64 -w0
@@ -309,7 +376,7 @@ algorithm = "sha256"
 
 [data]
 "policy.rego" = '''
-$POLICY
+${POLICY}
 '''
 EOF
 }
@@ -325,7 +392,7 @@ add_allow_all_policy_to_yaml() {
 	# By default was changing only the first object.
 	# With yq>4 we need to make it explicit during the read and write.
 	local resource_kind
-	resource_kind=$(yq .kind "${yaml_file}" | head -1)
+	resource_kind=$(yq eval 'select(documentIndex == 0) | .kind' "${yaml_file}")
 
 	case "${resource_kind}" in
 	Pod)
@@ -347,7 +414,7 @@ add_allow_all_policy_to_yaml() {
 		;;
 
 	ConfigMap|LimitRange|Namespace|PersistentVolume|PersistentVolumeClaim|RuntimeClass|Secret|Service)
-		die "Policy is not required for ${resource_kind} from ${yaml_file}"
+		info "Policy is not required for ${resource_kind} from ${yaml_file}"
 		;;
 
 	*)
@@ -409,11 +476,34 @@ teardown_common() {
 	kubectl describe pods
 	k8s_delete_all_pods_if_any_exists || true
 
+	local node_end_time
+	node_end_time=$(measure_node_time "${node}")
+
+	echo "Journal LOG starts at ${node_start_time:-}, ends at ${node_end_time:-}"
+
 	# Print the node journal since the test start time if a bats test is not completed
 	if [[ -n "${node_start_time}" && -z "${BATS_TEST_COMPLETED}" ]]; then
 		echo "DEBUG: system logs of node '${node}' since test start time (${node_start_time})"
 		exec_host "${node}" journalctl -x -t "kata" --since '"'"${node_start_time}"'"' || true
 	fi
+}
+
+measure_node_time() {
+	local node="$1"
+	[[ -n "${node}" ]]
+
+	local node_time
+	node_time=$(exec_host "${node}" date +\"%Y-%m-%d %H:%M:%S\")
+	local count=0
+	while [[ -z "${node_time}" ]] && [[ "${count}" -lt 3 ]]; do
+		echo "node_time is empty, trying again..."
+		sleep 2
+		node_time=$(exec_host "${node}" date +\"%Y-%m-%d %H:%M:%S\")
+		count=$((count + 1))
+	done
+	[[ -n "${node_time}" ]]
+
+	printf '%s\n' "${node_time}"
 }
 
 # Execute a command in a pod and grep kubectl's output.
@@ -486,10 +576,16 @@ container_exec_with_retries() {
 	for _ in {1..10}; do
 		if [[ -n "${container_name}" ]]; then
 			bats_unbuffered_info "Executing in pod ${pod_name}, container ${container_name}: $*"
-			cmd_out=$(kubectl exec "${pod_name}" -c "${container_name}" -- "$@") || (bats_unbuffered_info "kubectl exec failed" ; cmd_out="")
+			if ! cmd_out=$(kubectl exec "${pod_name}" -c "${container_name}" -- "$@"); then
+				bats_unbuffered_info "kubectl exec failed"
+				cmd_out=""
+			fi
 		else
 			bats_unbuffered_info "Executing in pod ${pod_name}: $*"
-			cmd_out=$(kubectl exec "${pod_name}" -- "$@") || (bats_unbuffered_info "kubectl exec failed" ; cmd_out="")
+			if ! cmd_out=$(kubectl exec "${pod_name}" -- "$@"); then
+				bats_unbuffered_info "kubectl exec failed"
+				cmd_out=""
+			fi
 		fi
 
 		if [[ -n "${cmd_out}" ]]; then
@@ -502,4 +598,27 @@ container_exec_with_retries() {
 	done
 
 	echo "${cmd_out}"
+}
+
+set_nginx_image() {
+	input_yaml=$1
+	output_yaml=$2
+
+	ensure_yq
+	nginx_registry=$(get_from_kata_deps ".docker_images.nginx.registry")
+	nginx_digest=$(get_from_kata_deps ".docker_images.nginx.digest")
+	nginx_image="${nginx_registry}@${nginx_digest}"
+
+	NGINX_IMAGE="${nginx_image}" envsubst < "${input_yaml}" > "${output_yaml}"
+}
+
+print_node_journal_since_test_start() {
+	local node="${1}"
+	local node_start_time="${2:-}"
+	local BATS_TEST_COMPLETED="${3:-}"
+
+	if [[ -n "${node_start_time:-}" && -z "${BATS_TEST_COMPLETED:-}" ]]; then
+		echo "DEBUG: system logs of node '${node}' since test start time (${node_start_time})"
+		exec_host "${node}" journalctl -x -t "kata" --since '"'"${node_start_time}"'"' || true
+	fi
 }
