@@ -10,8 +10,9 @@ source "${BATS_TEST_DIRNAME}/../../common.bash"
 
 load "${BATS_TEST_DIRNAME}/confidential_kbs.sh"
 
-SUPPORTED_TEE_HYPERVISORS=("qemu-snp" "qemu-tdx" "qemu-se" "qemu-se-runtime-rs")
-SUPPORTED_NON_TEE_HYPERVISORS=("qemu-coco-dev")
+SUPPORTED_GPU_TEE_HYPERVISORS=("qemu-nvidia-gpu-snp" "qemu-nvidia-gpu-tdx")
+SUPPORTED_TEE_HYPERVISORS=("qemu-snp" "qemu-tdx" "qemu-se" "qemu-se-runtime-rs" "${SUPPORTED_GPU_TEE_HYPERVISORS[@]}")
+SUPPORTED_NON_TEE_HYPERVISORS=("qemu-coco-dev" "qemu-coco-dev-runtime-rs")
 
 function setup_unencrypted_confidential_pod() {
 	get_pod_config_dir
@@ -67,7 +68,21 @@ function check_hypervisor_for_confidential_tests_tee_only() {
 	local kata_hypervisor="${1}"
 	# This check must be done with "<SPACE>${KATA_HYPERVISOR}<SPACE>" to avoid
 	# having substrings, like qemu, being matched with qemu-$something.
+	# shellcheck disable=SC2076 # intentionally use literal string matching
 	if [[ " ${SUPPORTED_TEE_HYPERVISORS[*]} " =~ " ${kata_hypervisor} " ]]; then
+		return 0
+	fi
+
+	return 1
+}
+
+# This function verifies whether the input hypervisor supports confidential GPU tests
+function check_hypervisor_for_confidential_gpu_tests() {
+	local kata_hypervisor="${1}"
+	# This check must be done with "<SPACE>${kata_hypervisor}<SPACE>" to avoid
+	# having substrings being matched incorrectly.
+	# shellcheck disable=SC2076 # intentionally use literal string matching
+	if [[ " ${SUPPORTED_GPU_TEE_HYPERVISORS[*]} " =~ " ${kata_hypervisor} " ]]; then
 		return 0
 	fi
 
@@ -86,6 +101,15 @@ function is_confidential_runtime_class() {
 # Common check for confidential hardware tests.
 function is_confidential_hardware() {
 	if check_hypervisor_for_confidential_tests_tee_only "${KATA_HYPERVISOR}"; then
+		return 0
+	fi
+
+	return 1
+}
+
+# Common check for confidential GPU hardware tests.
+function is_confidential_gpu_hardware() {
+	if check_hypervisor_for_confidential_gpu_tests "${KATA_HYPERVISOR}"; then
 		return 0
 	fi
 
@@ -211,6 +235,79 @@ function create_coco_pod_yaml_with_annotations() {
 	if [ -n "$node" ]; then
 		set_node "${kata_pod}" "$node"
 	fi
+}
+
+function get_initdata_with_cdh_image_section() {
+	CDH_IMAGE_SECTION=${1:-""}
+
+	CC_KBS_ADDRESS=$(kbs_k8s_svc_http_addr)
+
+	 initdata_annotation=$(gzip -c << EOF | base64 -w0
+version = "0.1.0"
+algorithm = "sha256"
+[data]
+"aa.toml" = '''
+[token_configs]
+[token_configs.kbs]
+url = "${CC_KBS_ADDRESS}"
+'''
+
+"cdh.toml" = '''
+[kbc]
+name = "cc_kbc"
+url = "${CC_KBS_ADDRESS}"
+
+${CDH_IMAGE_SECTION}
+'''
+
+"policy.rego" = '''
+# Copyright (c) 2023 Microsoft Corporation
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+package agent_policy
+
+default AddARPNeighborsRequest := true
+default AddSwapRequest := true
+default CloseStdinRequest := true
+default CopyFileRequest := true
+default CreateContainerRequest := true
+default CreateSandboxRequest := true
+default DestroySandboxRequest := true
+default ExecProcessRequest := true
+default GetMetricsRequest := true
+default GetOOMEventRequest := true
+default GuestDetailsRequest := true
+default ListInterfacesRequest := true
+default ListRoutesRequest := true
+default MemHotplugByProbeRequest := true
+default OnlineCPUMemRequest := true
+default PauseContainerRequest := true
+default PullImageRequest := true
+default ReadStreamRequest := true
+default RemoveContainerRequest := true
+default RemoveStaleVirtiofsShareMountsRequest := true
+default ReseedRandomDevRequest := true
+default ResumeContainerRequest := true
+default SetGuestDateTimeRequest := true
+default SetPolicyRequest := true
+default SignalProcessRequest := true
+default StartContainerRequest := true
+default StartTracingRequest := true
+default StatsContainerRequest := true
+default StopTracingRequest := true
+default TtyWinResizeRequest := true
+default UpdateContainerRequest := true
+default UpdateEphemeralMountsRequest := true
+default UpdateInterfaceRequest := true
+default UpdateRoutesRequest := true
+default WaitProcessRequest := true
+default WriteStreamRequest := true
+'''
+EOF
+    )
+    echo "${initdata_annotation}"
 }
 
 confidential_teardown_common() {

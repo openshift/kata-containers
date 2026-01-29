@@ -316,7 +316,7 @@ pub struct BlockDeviceMgr {
 
 impl BlockDeviceMgr {
     /// returns a front-to-back iterator.
-    pub fn iter(&self) -> vec_deque::Iter<BlockDeviceInfo> {
+    pub fn iter(&self) -> vec_deque::Iter<'_, BlockDeviceInfo> {
         self.info_list.iter()
     }
 
@@ -593,13 +593,13 @@ impl BlockDeviceMgr {
                 UpcallClientResponse::DevMgr(response) => {
                     if let DevMgrResponse::Other(resp) = response {
                         if let Err(e) = result_sender.send(Some(resp.result)) {
-                            log::error!("send upcall result failed, due to {:?}!", e);
+                            log::error!("send upcall result failed, due to {e:?}!");
                         }
                     }
                 }
                 UpcallClientResponse::UpcallReset => {
                     if let Err(e) = result_sender.send(None) {
-                        log::error!("send upcall result failed, due to {:?}!", e);
+                        log::error!("send upcall result failed, due to {e:?}!");
                     }
                 }
                 #[allow(unreachable_patterns)]
@@ -772,7 +772,7 @@ impl BlockDeviceMgr {
             let cmdline = kernel_config.kernel_cmdline_mut();
             if let Some(ref uuid) = self.part_uuid {
                 cmdline
-                    .insert("root", &format!("PART_UUID={}", uuid))
+                    .insert("root", &format!("PART_UUID={uuid}"))
                     .map_err(DeviceMgrError::Cmdline)?;
             } else {
                 cmdline
@@ -978,7 +978,7 @@ impl Default for BlockDeviceMgr {
 
 #[cfg(test)]
 mod tests {
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn test_add_non_root_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file = TempFile::new().unwrap();
         let dummy_path = dummy_file.as_path().to_owned();
         let dummy_id = String::from("1");
@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_update_blk_device_ratelimiters() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         //Init vm for test.
         let mut vm = create_vm_for_test();
         let device_op_ctx = DeviceOpContext::new(
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn test_add_one_root_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file = TempFile::new().unwrap();
         let dummy_path = dummy_file.as_path().to_owned();
         let dummy_block_device = BlockDeviceConfigInfo {
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_add_two_root_block_devices_configs() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device_1 = BlockDeviceConfigInfo {
@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     // Test BlockDevicesConfigs::add when you first add the root device and then the other devices.
     fn test_add_root_block_device_first() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {
@@ -1359,7 +1359,7 @@ mod tests {
     #[test]
     // Test BlockDevicesConfigs::add when you add other devices first and then the root device.
     fn test_root_block_device_add_last() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {
@@ -1459,7 +1459,7 @@ mod tests {
 
     #[test]
     fn test_block_device_update() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let dummy_file_1 = TempFile::new().unwrap();
         let dummy_path_1 = dummy_file_1.as_path().to_owned();
         let root_block_device = BlockDeviceConfigInfo {

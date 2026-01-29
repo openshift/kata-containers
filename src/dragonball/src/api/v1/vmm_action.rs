@@ -336,7 +336,7 @@ impl VmmService {
                 panic!("The channel's sending half was disconnected. Cannot receive data.");
             }
         };
-        debug!("receive vmm action: {:?}", request);
+        debug!("receive vmm action: {request:?}");
 
         let response = match request {
             VmmAction::ConfigureBootSource(boot_source_body) => {
@@ -421,7 +421,7 @@ impl VmmService {
             VmmAction::RemoveHostDevice(hostdev_cfg) => self.remove_vfio_device(vmm, &hostdev_cfg),
         };
 
-        debug!("send vmm response: {:?}", response);
+        debug!("send vmm response: {response:?}");
         self.send_response(response)
     }
 
@@ -479,14 +479,13 @@ impl VmmService {
         use self::StartMicroVmError::MicroVMAlreadyRunning;
         use self::VmmActionError::StartMicroVm;
 
-        let vmm_seccomp_filter = vmm.vmm_seccomp_filter();
-        let vcpu_seccomp_filter = vmm.vcpu_seccomp_filter();
+        let seccomp_filters = vmm.seccomp_filters();
         let vm = vmm.get_vm_mut().ok_or(VmmActionError::InvalidVMID)?;
         if vm.is_vm_initialized() {
             return Err(StartMicroVm(MicroVMAlreadyRunning));
         }
 
-        vm.start_microvm(event_mgr, vmm_seccomp_filter, vcpu_seccomp_filter)
+        vm.start_microvm(event_mgr, seccomp_filters)
             .map(|_| VmmData::Empty)
             .map_err(StartMicroVm)
     }
@@ -560,7 +559,7 @@ impl VmmService {
         }
         if max_vcpu_from_topo != max_vcpu_count {
             max_vcpu_count = max_vcpu_from_topo;
-            info!("Since max_vcpu_count is not equal to cpu topo information, we have changed the max vcpu count to {}", max_vcpu_from_topo);
+            info!("Since max_vcpu_count is not equal to cpu topo information, we have changed the max vcpu count to {max_vcpu_from_topo}");
         }
         config.max_vcpu_count = max_vcpu_count;
 
@@ -569,7 +568,9 @@ impl VmmService {
 
         let mem_size_mib_value = machine_config.mem_size_mib;
         // Support 1TB memory at most, 2MB aligned for huge page.
-        if mem_size_mib_value == 0 || mem_size_mib_value > 0x10_0000 || mem_size_mib_value % 2 != 0
+        if mem_size_mib_value == 0
+            || mem_size_mib_value > 0x10_0000
+            || !mem_size_mib_value.is_multiple_of(2)
         {
             return Err(MachineConfig(InvalidMemorySize(mem_size_mib_value)));
         }
@@ -641,7 +642,7 @@ impl VmmService {
 
         info!("add_vsock_device: {:?}", config);
         let ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             VmmActionError::Vsock(VsockDeviceError::UpdateNotAllowedPostBoot)
         })?;
 
@@ -714,9 +715,9 @@ impl VmmService {
             VfioDeviceError::InvalidVMID,
         ))?;
 
-        info!("prepare_remove_block_device: {:?}", blockdev_id);
+        info!("prepare_remove_block_device: {blockdev_id:?}");
         let ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             if let StartMicroVmError::MicroVMAlreadyRunning = e {
                 VmmActionError::HostDeviceConfig(VfioDeviceError::UpdateNotAllowedPostBoot)
             } else if let StartMicroVmError::UpcallServerNotReady = e {
@@ -858,7 +859,7 @@ impl VmmService {
         }
 
         let ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             VmmActionError::FsDevice(FsDeviceError::UpdateNotAllowedPostBoot)
         })?;
         FsDeviceMgr::insert_device(vm.device_manager_mut(), ctx, config)
@@ -907,10 +908,10 @@ impl VmmService {
         let vm = vmm.get_vm_mut().ok_or(VmmActionError::HostDeviceConfig(
             VfioDeviceError::InvalidVMID,
         ))?;
-        info!("add_vfio_device: {:?}", config);
+        info!("add_vfio_device: {config:?}");
 
         let mut ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             if let StartMicroVmError::MicroVMAlreadyRunning = e {
                 VmmActionError::HostDeviceConfig(VfioDeviceError::UpdateNotAllowedPostBoot)
             } else if let StartMicroVmError::UpcallServerNotReady = e {
@@ -937,9 +938,9 @@ impl VmmService {
             VfioDeviceError::InvalidVMID,
         ))?;
 
-        info!("prepare_remove_vfio_device: {:?}", hostdev_id);
+        info!("prepare_remove_vfio_device: {hostdev_id:?}");
         let ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             if let StartMicroVmError::MicroVMAlreadyRunning = e {
                 VmmActionError::HostDeviceConfig(VfioDeviceError::UpdateNotAllowedPostBoot)
             } else if let StartMicroVmError::UpcallServerNotReady = e {
@@ -966,9 +967,9 @@ impl VmmService {
             VfioDeviceError::InvalidVMID,
         ))?;
 
-        info!("remove_vfio_device: {:?}", hostdev_id);
+        info!("remove_vfio_device: {hostdev_id:?}");
         let mut ctx = vm.create_device_op_context(None).map_err(|e| {
-            info!("create device op context error: {:?}", e);
+            info!("create device op context error: {e:?}");
             if let StartMicroVmError::MicroVMAlreadyRunning = e {
                 VmmActionError::HostDeviceConfig(VfioDeviceError::UpdateNotAllowedPostBoot)
             } else if let StartMicroVmError::UpcallServerNotReady = e {
@@ -1120,7 +1121,7 @@ mod tests {
 
     use crossbeam_channel::unbounded;
     use dbs_utils::epoll_manager::EpollManager;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -1166,7 +1167,7 @@ mod tests {
 
     #[test]
     fn test_vmm_action_receive_unknown() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let (_to_vmm, from_api) = unbounded();
         let (to_api, _from_vmm) = unbounded();
@@ -1196,7 +1197,7 @@ mod tests {
 
     #[test]
     fn test_vmm_action_config_boot_source() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let kernel_file = TempFile::new().unwrap();
 
@@ -1261,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_vmm_action_set_vm_configuration() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state
@@ -1465,7 +1466,7 @@ mod tests {
 
     #[test]
     fn test_vmm_action_start_microvm() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state (running)
@@ -1511,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_vmm_action_shutdown_microvm() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // success
@@ -1532,7 +1533,7 @@ mod tests {
     #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     #[test]
     fn test_vmm_action_insert_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let dummy_file = TempFile::new().unwrap();
         let dummy_path = dummy_file.as_path().to_owned();
@@ -1590,7 +1591,7 @@ mod tests {
     #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     #[test]
     fn test_vmm_action_update_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid id
@@ -1623,7 +1624,7 @@ mod tests {
     #[cfg(any(feature = "virtio-blk", feature = "vhost-user-blk"))]
     #[test]
     fn test_vmm_action_remove_block_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state
@@ -1672,7 +1673,7 @@ mod tests {
     #[cfg(feature = "virtio-fs")]
     #[test]
     fn test_vmm_action_insert_fs_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state
@@ -1712,7 +1713,7 @@ mod tests {
     #[cfg(feature = "virtio-fs")]
     #[test]
     fn test_vmm_action_manipulate_fs_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state
@@ -1744,7 +1745,7 @@ mod tests {
                         ))
                     ));
                     let err_string = format!("{}", result.unwrap_err());
-                    println!("{}", err_string);
+                    println!("{err_string}");
                     let expected_err = String::from(
                         "virtio-fs device error: \
                     Fs device attach a backend fs failed",
@@ -1761,7 +1762,7 @@ mod tests {
     #[cfg(feature = "virtio-net")]
     #[test]
     fn test_vmm_action_insert_network_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // hotplug unready
@@ -1801,7 +1802,7 @@ mod tests {
     #[cfg(feature = "virtio-net")]
     #[test]
     fn test_vmm_action_update_network_interface() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid id
@@ -1837,7 +1838,7 @@ mod tests {
     #[cfg(feature = "virtio-vsock")]
     #[test]
     fn test_vmm_action_insert_vsock_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // invalid state
@@ -1897,7 +1898,7 @@ mod tests {
     #[cfg(feature = "virtio-mem")]
     #[test]
     fn test_vmm_action_insert_mem_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // hotplug unready
@@ -1937,7 +1938,7 @@ mod tests {
     #[cfg(feature = "virtio-balloon")]
     #[test]
     fn test_vmm_action_insert_balloon_device() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         let tests = &mut [
             // hotplug unready

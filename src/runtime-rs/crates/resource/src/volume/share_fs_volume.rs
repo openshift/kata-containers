@@ -32,7 +32,7 @@ use tokio::{
 use walkdir::WalkDir;
 
 use super::Volume;
-use crate::share_fs::KATA_GUEST_SHARE_DIR;
+use crate::share_fs::kata_guest_share_dir;
 use crate::share_fs::{MountedInfo, ShareFs, ShareFsVolumeConfig};
 use kata_types::{
     k8s::{is_configmap, is_downward_api, is_projected, is_secret},
@@ -236,7 +236,7 @@ impl FsWatcher {
                             }
                         }
                     }
-                    Err(e) => eprintln!("inotify error: {}", e),
+                    Err(e) => eprintln!("inotify error: {e}"),
                 }
 
                 // handle events to be synchronized
@@ -265,7 +265,7 @@ impl FsWatcher {
                                 &dst,
                                 e
                             );
-                            eprintln!("sync host/guest files failed: {}", e);
+                            eprintln!("sync host/guest files failed: {e}");
                         }
                         *need_sync.lock().await = false;
                         last_event_time = None;
@@ -330,9 +330,6 @@ impl VolumeManager {
                 state.guest_path,
                 state.ref_count,
             );
-
-            // Return guest path
-            return Ok(state.guest_path.clone());
         }
 
         // Create a new volume state
@@ -598,16 +595,15 @@ impl ShareFsVolume {
     ) -> Result<()> {
         // Read file metadata
         let file_metadata = std::fs::metadata(src)
-            .with_context(|| format!("Failed to read metadata from file: {:?}", src))?;
+            .with_context(|| format!("Failed to read metadata from file: {src:?}"))?;
 
         // Open file
-        let mut file =
-            File::open(src).with_context(|| format!("Failed to open file: {:?}", src))?;
+        let mut file = File::open(src).with_context(|| format!("Failed to open file: {src:?}"))?;
 
         // Open read file contents to buffer
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)
-            .with_context(|| format!("Failed to read file: {:?}", src))?;
+            .with_context(|| format!("Failed to read file: {src:?}"))?;
 
         // Create gRPC request
         let r = agent::CopyFileRequest {
@@ -624,10 +620,7 @@ impl ShareFsVolume {
 
         // Issue gRPC request to agent
         agent.copy_file(r).await.with_context(|| {
-            format!(
-                "copy file request failed: src: {:?}, dest: {:?}",
-                src, guest_path
-            )
+            format!("copy file request failed: src: {src:?}, dest: {guest_path:?}")
         })?;
         Ok(())
     }
@@ -639,7 +632,7 @@ impl ShareFsVolume {
     ) -> Result<()> {
         // create directory
         let dir_metadata =
-            std::fs::metadata(src).context(format!("read metadata from directory: {:?}", src))?;
+            std::fs::metadata(src).context(format!("read metadata from directory: {src:?}"))?;
 
         // ttRPC request for creating directory
         let dir_request = agent::CopyFileRequest {
@@ -664,13 +657,13 @@ impl ShareFsVolume {
         agent
             .copy_file(dir_request)
             .await
-            .context(format!("create directory in sandbox: {:?}", guest_path))?;
+            .context(format!("create directory in sandbox: {guest_path:?}"))?;
 
         // recursively copy files from this directory
         // similar to `scp -r $source_dir $target_dir`
         copy_dir_recursively(src, guest_path, agent)
             .await
-            .context(format!("failed to copy directory contents: {:?}", src))?;
+            .context(format!("failed to copy directory contents: {src:?}"))?;
 
         Ok(())
     }
@@ -792,12 +785,12 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
     while let Some((current_src, current_dest)) = queue.pop_front() {
         let mut entries = tokio::fs::read_dir(&current_src)
             .await
-            .context(format!("read directory: {:?}", current_src))?;
+            .context(format!("read directory: {current_src:?}"))?;
 
         while let Some(entry) = entries
             .next_entry()
             .await
-            .context(format!("read directory entry in {:?}", current_src))?
+            .context(format!("read directory entry in {current_src:?}"))?
         {
             let entry_path = entry.path();
             let file_name = entry_path
@@ -806,12 +799,12 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                 .to_string_lossy()
                 .to_string();
 
-            let dest_path = format!("{}/{}", current_dest, file_name);
+            let dest_path = format!("{current_dest}/{file_name}");
 
             let metadata = entry
                 .metadata()
                 .await
-                .context(format!("read metadata for {:?}", entry_path))?;
+                .context(format!("read metadata for {entry_path:?}"))?;
 
             if metadata.is_symlink() {
                 // handle symlinks
@@ -821,8 +814,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                     tokio::task::spawn_blocking(move || std::fs::read_link(&entry_path_clone))
                         .await
                         .context(format!(
-                            "failed to spawn blocking task for symlink: {:?}",
-                            entry_path_err
+                            "failed to spawn blocking task for symlink: {entry_path_err:?}"
                         ))??;
 
                 let link_target_str = link_target.to_string_lossy().into_owned();
@@ -843,8 +835,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                 );
 
                 agent.copy_file(symlink_request).await.context(format!(
-                    "failed to create symlink: {:?} -> {:?}",
-                    dest_path, link_target_str
+                    "failed to create symlink: {dest_path:?} -> {link_target_str:?}"
                 ))?;
             } else if metadata.is_dir() {
                 // handle directory
@@ -867,7 +858,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                 agent
                     .copy_file(dir_request)
                     .await
-                    .context(format!("Failed to create subdirectory: {:?}", dest_path))?;
+                    .context(format!("Failed to create subdirectory: {dest_path:?}"))?;
 
                 // push back the sub-dir into queue to handle it in time
                 queue.push_back((entry_path, dest_path));
@@ -875,12 +866,12 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                 // async read file
                 let mut file = tokio::fs::File::open(&entry_path)
                     .await
-                    .context(format!("open file: {:?}", entry_path))?;
+                    .context(format!("open file: {entry_path:?}"))?;
 
                 let mut buffer = Vec::new();
                 file.read_to_end(&mut buffer)
                     .await
-                    .context(format!("read file: {:?}", entry_path))?;
+                    .context(format!("read file: {entry_path:?}"))?;
 
                 let file_request = agent::CopyFileRequest {
                     path: dest_path.clone(),
@@ -896,7 +887,7 @@ async fn copy_dir_recursively<P: AsRef<Path>>(
                 agent
                     .copy_file(file_request)
                     .await
-                    .context(format!("copy file: {:?} -> {:?}", entry_path, dest_path))?;
+                    .context(format!("copy file: {entry_path:?} -> {dest_path:?}"))?;
             }
         }
     }
@@ -938,7 +929,7 @@ fn is_host_device(dest: &str) -> bool {
 // Agent will support this kind of bind mount.
 fn is_system_mount(src: &str) -> bool {
     for p in SYS_MOUNT_PREFIX {
-        let sub_dir_p = format!("{}/", p);
+        let sub_dir_p = format!("{p}/");
         if src == p || src.contains(sub_dir_p.as_str()) {
             return true;
         }
@@ -957,7 +948,7 @@ pub fn generate_mount_path(id: &str, file_name: &str) -> String {
     let uid_vec: Vec<&str> = uid.splitn(2, '-').collect();
     uid = String::from(uid_vec[0]);
 
-    format!("{}-{}-{}", nid, uid, file_name)
+    format!("{nid}-{uid}-{file_name}")
 }
 
 /// This function is used to check whether a given volume is a watchable volume.
@@ -988,7 +979,10 @@ fn generate_guest_path(cid: &str, mount_destination: &Path) -> Result<String> {
 
     Ok(format!(
         "{}{}-{}-{}",
-        KATA_GUEST_SHARE_DIR, cid, hex_str, dest_base
+        kata_guest_share_dir(),
+        cid,
+        hex_str,
+        dest_base
     ))
 }
 

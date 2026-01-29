@@ -19,6 +19,7 @@ pub struct Settings {
     pub pause_container: policy::KataSpec,
     pub other_container: policy::KataSpec,
     pub volumes: Volumes,
+    pub device_annotations: policy::DeviceAnnotations,
     pub kata_config: KataConfig,
     pub cluster_config: policy::ClusterConfig,
     pub request_defaults: policy::RequestDefaults,
@@ -87,8 +88,7 @@ impl Settings {
             Self::validate_settings(&settings);
             settings
         } else {
-            panic!("Cannot open file {}. Please copy it to the current directory or specify the path to it using the -j parameter.",
-                json_settings_path);
+            panic!("Cannot open file {json_settings_path}. Please copy it to the current directory or specify the path to it using the -j parameter.");
         }
     }
 

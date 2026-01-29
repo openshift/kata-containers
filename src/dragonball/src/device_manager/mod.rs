@@ -462,7 +462,7 @@ impl DeviceOpContext {
             dev_info.insert(
                 (
                     DeviceType::Virtio(dev_type),
-                    format!("virtio-{}@0x{:08x?}", dev_type, mmio_base),
+                    format!("virtio-{dev_type}@0x{mmio_base:08x?}"),
                 ),
                 MMIODeviceInfo::new(mmio_base, mmio_size, vec![irq], device_id),
             );
@@ -1533,7 +1533,7 @@ mod tests {
 
     use dbs_address_space::{AddressSpaceLayout, AddressSpaceRegion, AddressSpaceRegionType};
     use kvm_ioctls::Kvm;
-    use test_utils::skip_if_not_root;
+    use test_utils::skip_if_kvm_unaccessable;
     #[cfg(feature = "virtio-fs")]
     use vm_memory::MmapRegion;
     use vm_memory::{GuestAddress, GuestUsize};
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_create_device_manager() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         let mgr = DeviceManager::new_test_mgr();
         let _ = mgr.io_manager();
     }
@@ -1638,7 +1638,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_create_devices() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
         use crate::vm::VmConfigInfo;
 
         let epoll_manager = EpollManager::default();
@@ -1702,7 +1702,7 @@ mod tests {
     #[cfg(feature = "virtio-fs")]
     #[test]
     fn test_handler_insert_region() {
-        skip_if_not_root!();
+        skip_if_kvm_unaccessable!();
 
         use dbs_virtio_devices::VirtioRegionHandler;
         use lazy_static::__Deref;

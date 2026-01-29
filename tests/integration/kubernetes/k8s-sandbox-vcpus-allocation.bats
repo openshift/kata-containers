@@ -10,18 +10,21 @@ load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	[ "${KATA_HYPERVISOR}" == "dragonball" ] || [ "${KATA_HYPERVISOR}" == "cloud-hypervisor" ] && \
-		skip "runtime-rs is still using the old vcpus allocation algorithm, skipping the test see https://github.com/kata-containers/kata-containers/issues/8660"
 	[ "$(uname -m)" == "aarch64" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10928"
+	[[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && skip "Requires CPU hotplug which disabled by static_sandbox_resource_mgmt"
 
-	setup_common
-	get_pod_config_dir
+	setup_common || die "setup_common failed"
+
 	pods=( "vcpus-less-than-one-with-no-limits" "vcpus-less-than-one-with-limits" "vcpus-more-than-one-with-limits" )
 	expected_vcpus=( 1 1 2 )
 
 	yaml_file="${pod_config_dir}/pod-sandbox-vcpus-allocation.yaml"
 	set_node "$yaml_file" "$node"
-	add_allow_all_policy_to_yaml "${yaml_file}"
+
+	# Add policy to yaml
+	policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
+	add_requests_to_policy_settings "${policy_settings_dir}" "ReadStreamRequest"
+	auto_generate_policy "${policy_settings_dir}" "${yaml_file}"
 }
 
 @test "Check the number vcpus are correctly allocated to the sandbox" {
@@ -47,13 +50,13 @@ setup() {
 }
 
 teardown() {
-	[ "${KATA_HYPERVISOR}" == "dragonball" ] || [ "${KATA_HYPERVISOR}" == "cloud-hypervisor" ] && \
-		skip "runtime-rs is still using the old vcpus allocation algorithm, skipping the test see https://github.com/kata-containers/kata-containers/issues/8660"
 	[ "$(uname -m)" == "aarch64" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10928"
+	[[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && skip "Requires CPU hotplug which disabled by static_sandbox_resource_mgmt"
 
 	for pod in "${pods[@]}"; do
 		kubectl logs ${pod}
 	done
 
 	teardown_common "${node}" "${node_start_time:-}"
+	delete_tmp_policy_settings_dir "${policy_settings_dir}"
 }

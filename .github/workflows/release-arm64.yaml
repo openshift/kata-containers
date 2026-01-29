@@ -8,6 +8,8 @@ on:
     secrets:
       QUAY_DEPLOYER_PASSWORD:
         required: true
+      KBUILD_SIGN_PIN:
+        required: true
 
 permissions: {}
 
@@ -19,6 +21,7 @@ jobs:
       stage: release
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
+      KBUILD_SIGN_PIN: ${{ secrets.KBUILD_SIGN_PIN }}
     permissions:
       contents: read
       packages: write
@@ -26,11 +29,12 @@ jobs:
       attestations: write
 
   kata-deploy:
+    name: kata-deploy
     needs: build-kata-static-tarball-arm64
     permissions:
       contents: read
       packages: write
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Login to Kata Containers ghcr.io
         uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0

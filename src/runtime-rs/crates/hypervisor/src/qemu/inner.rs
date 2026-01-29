@@ -3,28 +3,41 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use super::cmdline_generator::{get_network_device, QemuCmdLine, QMP_SOCKET_FILE};
+use super::cmdline_generator::{get_network_device, QemuCmdLine};
 use super::qmp::Qmp;
 use crate::device::topology::PCIePort;
+use crate::qemu::qmp::get_qmp_socket_path;
 use crate::{
     device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
     HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
 };
 
-use crate::utils::{bytes_to_megs, enter_netns, megs_to_bytes};
+use crate::utils::{
+    bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
+    set_groups, vm_cleanup,
+};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::netns::NetnsGuard;
+use kata_types::build_path;
+use kata_types::config::hypervisor::RootlessUser;
+use kata_types::rootless::is_rootless;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
     config::KATA_PATH,
 };
+use nix::unistd::{setgid, setuid, Gid, Uid};
 use persist::sandbox_persist::Persist;
+use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::time::sleep;
+use tokio::time::Instant;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, ChildStderr, Command},
@@ -82,8 +95,8 @@ impl QemuInner {
             }
         }
 
-        let vm_path = [KATA_PATH, self.id.as_str()].join("/");
-        std::fs::create_dir_all(vm_path)?;
+        let vm_path = Path::new(build_path(KATA_PATH).as_str()).join(self.id.as_str());
+        create_dir_all_with_inherit_owner(vm_path, 0o750)?;
 
         Ok(())
     }
@@ -124,13 +137,14 @@ impl QemuInner {
                             &block_dev.config.path_on_host,
                             block_dev.config.is_readonly,
                         )?,
-                        "ccw" | "blk" => cmdline.add_block_device(
+                        "ccw" | "blk" | "scsi" => cmdline.add_block_device(
                             block_dev.device_id.as_str(),
                             &block_dev.config.path_on_host,
                             block_dev
                                 .config
                                 .is_direct
                                 .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
+                            block_dev.config.driver_option.as_str() == "scsi",
                         )?,
                         unsupported => {
                             info!(sl!(), "unsupported block device driver: {}", unsupported)
@@ -151,12 +165,14 @@ impl QemuInner {
                         if sev_snp_cfg.is_snp {
                             cmdline.add_sev_snp_protection_device(
                                 sev_snp_cfg.cbitpos,
+                                sev_snp_cfg.phys_addr_reduction,
                                 &sev_snp_cfg.firmware,
                                 &sev_snp_cfg.host_data,
                             )
                         } else {
                             cmdline.add_sev_protection_device(
                                 sev_snp_cfg.cbitpos,
+                                sev_snp_cfg.phys_addr_reduction,
                                 &sev_snp_cfg.firmware,
                             )
                         }
@@ -208,6 +224,20 @@ impl QemuInner {
 
         info!(sl!(), "qemu cmd: {:?}", command);
 
+        let user: Option<RootlessUser> = if is_rootless() {
+            Some(
+                self.config
+                    .security_info
+                    .rootless_user
+                    .clone()
+                    .ok_or_else(|| {
+                        std::io::Error::other("rootless user must be specified for rootless qemu")
+                    })?,
+            )
+        } else {
+            None
+        };
+
         // we need move the qemu process into Network Namespace and set SELinux label.
         unsafe {
             let selinux_label = self.config.security_info.selinux_label.clone();
@@ -225,6 +255,16 @@ impl QemuInner {
                         );
                     }
                 }
+                if let Some(user) = &user {
+                    let groups = user.groups.clone();
+                    let gid = Gid::from_raw(user.gid);
+                    let uid = Uid::from_raw(user.uid);
+
+                    let _ = set_groups(&groups);
+                    let _ = setgid(gid).context("setgid failed");
+                    let _ = setuid(uid).context("setuid failed");
+                }
+
                 Ok(())
             });
         }
@@ -242,7 +282,9 @@ impl QemuInner {
 
         tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
-        match Qmp::new(QMP_SOCKET_FILE) {
+        let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
+
+        match Qmp::new(&qmp_socket_path) {
             Ok(qmp) => self.qmp = Some(qmp),
             Err(e) => {
                 error!(sl!(), "couldn't initialise QMP: {:?}", e);
@@ -250,13 +292,111 @@ impl QemuInner {
             }
         }
 
-        //When hypervisor debug is enabled, output the kernel boot messages for debugging.
+        // Start the virtual machine by restoring it from a VM template if enabled.
+        if self.config.vm_template.boot_from_template {
+            self.boot_from_template()
+                .await
+                .context("boot from template")?;
+            self.resume_vm().context("resume vm")?;
+        }
+
+        // When hypervisor debug is enabled, output the kernel boot messages for debugging.
         if self.config.debug_info.enable_debug {
             let stream = UnixStream::connect(console_socket_path.as_os_str()).await?;
             tokio::spawn(log_qemu_console(stream));
         }
 
         Ok(())
+    }
+
+    async fn boot_from_template(&mut self) -> Result<()> {
+        let qmp = self
+            .qmp
+            .as_mut()
+            .context("failed to get QMP connection for boot from template")?;
+
+        qmp.set_ignore_shared_memory_capability()
+            .context("failed to set ignore shared memory capability")?;
+
+        let uri = format!("exec:cat {}", self.config.vm_template.device_state_path);
+
+        qmp.execute_migration_incoming(&uri)
+            .context("failed to execute migration incoming")?;
+
+        self.wait_for_migration()
+            .await
+            .context("failed to wait for migration")?;
+
+        info!(sl!(), "migration complete");
+
+        Ok(())
+    }
+
+    pub async fn wait_for_migration(&mut self) -> Result<()> {
+        // Ensure QMP is connected.
+        if self.qmp.is_none() {
+            return Err(anyhow!("QMP is not connected"));
+        }
+
+        let qmp = self
+            .qmp
+            .as_mut()
+            .context("failed to get QMP connection for boot from template")?;
+
+        // Helper to migrate_completed migration state from `query-migrate`.
+        let migrate_completed = |st: Option<MigrationStatus>| -> Result<bool> {
+            match st {
+                Some(MigrationStatus::completed) => Ok(true), // done
+                Some(MigrationStatus::failed) | Some(MigrationStatus::cancelled) => {
+                    Err(anyhow!("migration ended early: {:?}", st))
+                }
+                _ => Ok(false), // still running / unknown
+            }
+        };
+
+        // If already finished, just return Ok(()).
+        let mi = qmp.execute_query_migrate().await?;
+        match migrate_completed(mi.status) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                info!(sl!(), "migration not yet completed, entering wait loop");
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Overall timeout for migration.
+        // Regarding why the timeout is set to 280ms and whether it should be adjusted, we need more empirical data.
+        // For now, we will keep using the previous configuration.
+        let timeout = Duration::from_millis(280);
+
+        // Polling interval: start small, then back off to reduce load.
+        let poll_interval = Duration::from_millis(20);
+
+        // Deadline with a timeout.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("timeout overflow"))?;
+
+        loop {
+            // Query migration status via QMP.
+            let mi = qmp.execute_query_migrate().await?;
+            match migrate_completed(mi.status) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    info!(sl!(), "migration still not completed, continuing wait loop");
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Stop waiting once we hit the timeout.
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(anyhow!("wait_for_migration timeout after {:?}", timeout));
+            }
+
+            // Sleep until next tick, but never beyond deadline
+            sleep(poll_interval.min(deadline - now)).await;
+        }
     }
 
     pub(crate) async fn stop_vm(&mut self) -> Result<()> {
@@ -291,18 +431,36 @@ impl QemuInner {
         }
     }
 
-    pub(crate) fn pause_vm(&self) -> Result<()> {
-        info!(sl!(), "Pausing QEMU VM");
-        todo!()
+    pub(crate) fn pause_vm(&mut self) -> Result<()> {
+        let qmp = self.qmp.as_mut().ok_or(anyhow!("qmp not initialized"))?;
+        qmp.qmp_stop().context("pause vm")
     }
 
-    pub(crate) fn resume_vm(&self) -> Result<()> {
-        info!(sl!(), "Resuming QEMU VM");
-        todo!()
+    pub(crate) fn resume_vm(&mut self) -> Result<()> {
+        let qmp = self.qmp.as_mut().ok_or(anyhow!("qmp not initialized"))?;
+        qmp.qmp_cont().context("resume vm")
     }
 
-    pub(crate) async fn save_vm(&self) -> Result<()> {
-        todo!()
+    pub(crate) async fn save_vm(&mut self) -> Result<()> {
+        let qmp = self.qmp.as_mut().ok_or(anyhow!("QMP not initialized"))?;
+
+        if self.config.vm_template.boot_to_be_template {
+            qmp.set_ignore_shared_memory_capability()
+                .context("failed to set ignore shared memory capability")?;
+        }
+
+        let uri = format!("exec:cat >{}", self.config.vm_template.device_state_path);
+
+        qmp.execute_migration(&uri)
+            .context("failed to execute migration")?;
+
+        self.wait_for_migration()
+            .await
+            .context("failed to wait for migration")?;
+
+        info!(sl!(), "migration finished successfully");
+
+        Ok(())
     }
 
     pub(crate) async fn get_agent_socket(&self) -> Result<String> {
@@ -312,7 +470,7 @@ impl QemuInner {
             None => return Err(anyhow!("uninitialized agent vsock".to_owned())),
         };
 
-        Ok(format!("{}://{}", VSOCK_SCHEME, guest_cid))
+        Ok(format!("{VSOCK_SCHEME}://{guest_cid}"))
     }
 
     pub(crate) async fn disconnect(&mut self) {
@@ -358,9 +516,8 @@ impl QemuInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "QemuInner::cleanup()");
-        let vm_path = [KATA_PATH, self.id.as_str()].join("/");
-        std::fs::remove_dir_all(vm_path)?;
-        Ok(())
+        let vm_path = [build_path(KATA_PATH).as_str(), self.id.as_str()].join("/");
+        vm_cleanup(&self.config, vm_path.as_str())
     }
 
     pub(crate) async fn resize_vcpu(
@@ -417,7 +574,9 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_jailer_root(&self) -> Result<String> {
-        Ok("".into())
+        let root_path = get_jailer_root(self.id.as_str());
+        create_dir_all_with_inherit_owner(&root_path, 0o750)?;
+        Ok(root_path)
     }
 
     pub(crate) async fn capabilities(&self) -> Result<Capabilities> {
@@ -499,15 +658,15 @@ impl QemuInner {
             }
         };
 
-        let coldplugged_mem = megs_to_bytes(self.config.memory_info.default_memory);
+        let coldplugged_mem_mb = self.config.memory_info.default_memory;
+        let coldplugged_mem = megs_to_bytes(coldplugged_mem_mb);
         let new_total_mem = megs_to_bytes(new_total_mem_mb);
 
         if new_total_mem < coldplugged_mem {
-            return Err(anyhow!(
-                "asked to resize to {} M but that is less than cold-plugged memory size ({})",
-                new_total_mem_mb,
-                bytes_to_megs(coldplugged_mem)
-            ));
+            warn!(sl!(), "asked to resize to {} M but that is less than cold-plugged memory size ({}), nothing to do",new_total_mem_mb,
+                bytes_to_megs(coldplugged_mem));
+
+            return Ok((coldplugged_mem_mb, MemoryConfig::default()));
         }
 
         let guest_mem_block_size = qmp.guest_memory_block_size();
@@ -521,7 +680,7 @@ impl QemuInner {
             bytes_to_megs(new_hotplugged_mem)
         );
 
-        let is_unaligned = new_hotplugged_mem % guest_mem_block_size != 0;
+        let is_unaligned = !new_hotplugged_mem.is_multiple_of(guest_mem_block_size);
         if is_unaligned {
             new_hotplugged_mem = ch_config::convert::checked_next_multiple_of(
                 new_hotplugged_mem,
@@ -716,6 +875,7 @@ impl QemuInner {
 
                 primary_device.guest_pci_path = qmp.hotplug_vfio_device(
                     &primary_device.hostdev_id,
+                    &primary_device.sysfs_path,
                     &primary_device.bus_slot_func,
                     &vfiodev.driver_type,
                     &vfiodev.bus,

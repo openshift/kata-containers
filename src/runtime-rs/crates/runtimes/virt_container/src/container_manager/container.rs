@@ -18,11 +18,11 @@ use common::{
 };
 use kata_sys_util::k8s::update_ephemeral_storage_type;
 use kata_types::{
-    annotations::{BUNDLE_PATH_KEY, CONTAINER_TYPE_KEY},
+    annotations::{BUNDLE_PATH_KEY, CONTAINER_TYPE_KEY, KATA_ANNO_CFG_HYPERVISOR_INIT_DATA},
     container::{update_ocispec_annotations, POD_CONTAINER, POD_SANDBOX},
     k8s::{self, container_type},
 };
-use oci_spec::runtime::{self as oci, LinuxDeviceCgroup};
+use oci_spec::runtime as oci;
 
 use oci::{LinuxResources, Process as OCIProcess};
 use resource::{
@@ -34,7 +34,7 @@ use super::{
     process::{Process, ProcessWatcher},
     ContainerInner,
 };
-use crate::container_manager::logger_with_process;
+use crate::container_manager::{is_termination_signal, logger_with_process};
 
 pub struct Exec {
     pub(crate) process: Process,
@@ -123,14 +123,18 @@ impl Container {
         };
 
         let bund_path_anno = (BUNDLE_PATH_KEY.to_string(), config.bundle.clone());
-        let updated_annotations =
-            update_ocispec_annotations(&annotations, &[], &[pod_type_anno, bund_path_anno]);
+        let updated_annotations = update_ocispec_annotations(
+            &annotations,
+            &[KATA_ANNO_CFG_HYPERVISOR_INIT_DATA],
+            &[pod_type_anno, bund_path_anno],
+        );
         spec.set_annotations(Some(updated_annotations.clone()));
 
         amend_spec(
             &mut spec,
             toml_config.runtime.disable_guest_seccomp,
             disable_guest_selinux,
+            toml_config.runtime.disable_guest_empty_dir,
         )
         .context("amend spec")?;
 
@@ -148,7 +152,7 @@ impl Container {
                 root,
                 &config.bundle,
                 &config.rootfs_mounts,
-                &annotations,
+                &updated_annotations,
             )
             .await
             .context("handler rootfs")?;
@@ -212,6 +216,12 @@ impl Container {
             .await?;
         if let Some(linux) = &mut spec.linux_mut() {
             linux.set_resources(resources);
+
+            // In certain scenarios, particularly under CoCo/Agent Policy enforcement,
+            // the value of `Linux.Resources.Devices` should be empty.
+            if let Some(resource) = linux.resources_mut() {
+                resource.set_devices(None);
+            }
         }
 
         let container_name = k8s::container_name(&spec);
@@ -239,6 +249,12 @@ impl Container {
                 .passfd_io_init(hvsock_uds_path, *passfd_port)
                 .await?;
         }
+
+        info!(
+            sl!(),
+            "OCI Spec {:?} within CreateContainerRequest.",
+            spec.clone()
+        );
 
         // create container
         let r = agent::CreateContainerRequest {
@@ -414,6 +430,31 @@ impl Container {
         all: bool,
     ) -> Result<()> {
         let mut inner = self.inner.write().await;
+
+        // Check if process is already stopped before signaling.
+        // For SIGKILL/SIGTERM, if the process is already stopped, return success immediately.
+        // This is critical for proper cleanup when VM dies - the wait thread sets status to
+        // Stopped even on error, so subsequent Kill() calls will see it as already stopped.
+        let is_term_signal = is_termination_signal(signal);
+        let process_status = if container_process.exec_id.is_empty() {
+            inner.init_process.get_status().await
+        } else if let Some(exec) = inner.exec_processes.get(&container_process.exec_id) {
+            exec.process.get_status().await
+        } else {
+            ProcessStatus::Unknown
+        };
+
+        if is_term_signal && process_status == ProcessStatus::Stopped {
+            info!(
+                self.logger,
+                "process has already stopped, skipping signal";
+                "container" => &self.container_id.container_id,
+                "process" => ?container_process,
+                "signal" => signal
+            );
+            return Ok(());
+        }
+
         inner.signal_process(container_process, signal, all).await
     }
 
@@ -606,6 +647,7 @@ fn amend_spec(
     spec: &mut oci::Spec,
     disable_guest_seccomp: bool,
     disable_guest_selinux: bool,
+    disable_guest_empty_dir: bool,
 ) -> Result<()> {
     // Only the StartContainer hook needs to be reserved for execution in the guest
     if let Some(hooks) = spec.hooks().as_ref() {
@@ -615,35 +657,11 @@ fn amend_spec(
     }
 
     // special process K8s ephemeral volumes.
-    update_ephemeral_storage_type(spec);
+    update_ephemeral_storage_type(spec, disable_guest_empty_dir);
 
     if let Some(linux) = &mut spec.linux_mut() {
         if disable_guest_seccomp {
             linux.set_seccomp(None);
-        }
-
-        // In certain scenarios, particularly under CoCo/Agent Policy enforcement, the default initial value of `Linux.Resources.Devices`
-        // is considered non-compliant, leading to container creation failures. To address this issue and ensure consistency with the behavior
-        // in `runtime-go`, the default value of `Linux.Resources.Devices` from the OCI Spec should be removed.
-        if let Some(resources) = linux.resources_mut() {
-            if let Some(devices) = resources.devices_mut().take() {
-                let cleaned_devices: Vec<LinuxDeviceCgroup> = devices
-                    .into_iter()
-                    .filter(|device| {
-                        !(!device.allow()
-                            && device.typ().is_none()
-                            && device.major().is_none()
-                            && device.minor().is_none()
-                            && device.access().as_deref() == Some("rwm"))
-                    })
-                    .collect();
-
-                resources.set_devices(if cleaned_devices.is_empty() {
-                    None
-                } else {
-                    Some(cleaned_devices)
-                });
-            }
         }
 
         // Host pidns path does not make sense in kata. Let's just align it with
@@ -712,11 +730,11 @@ mod tests {
         assert!(spec.linux().as_ref().unwrap().seccomp().is_some());
 
         // disable_guest_seccomp = false
-        amend_spec(&mut spec, false, false).unwrap();
+        amend_spec(&mut spec, false, false, false).unwrap();
         assert!(spec.linux().as_ref().unwrap().seccomp().is_some());
 
         // disable_guest_seccomp = true
-        amend_spec(&mut spec, true, false).unwrap();
+        amend_spec(&mut spec, true, false, false).unwrap();
         assert!(spec.linux().as_ref().unwrap().seccomp().is_none());
     }
 
@@ -739,12 +757,12 @@ mod tests {
             .unwrap();
 
         // disable_guest_selinux = false, selinux labels are left alone
-        amend_spec(&mut spec, false, false).unwrap();
+        amend_spec(&mut spec, false, false, false).unwrap();
         assert!(spec.process().as_ref().unwrap().selinux_label() == &Some("xxx".to_owned()));
         assert!(spec.linux().as_ref().unwrap().mount_label() == &Some("yyy".to_owned()));
 
         // disable_guest_selinux = true, selinux labels are reset
-        amend_spec(&mut spec, false, true).unwrap();
+        amend_spec(&mut spec, false, true, false).unwrap();
         assert!(spec.process().as_ref().unwrap().selinux_label().is_none());
         assert!(spec.linux().as_ref().unwrap().mount_label().is_none());
     }

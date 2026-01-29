@@ -609,8 +609,11 @@ type HypervisorConfig struct {
 	DisableBlockDeviceUse bool
 
 	// EnableIOThreads enables IO to be processed in a separate thread.
-	// Supported currently for virtio-scsi driver.
+	// Supported currently for virtio-scsi driver and virtio-blk(based on IndepIOThreads) driver.
 	EnableIOThreads bool
+
+	// Independent IOThreads enables IO to be processed in a separate thread.
+	IndepIOThreads uint32
 
 	// Debug changes the default hypervisor and kernel parameters to
 	// enable debug output where available.
@@ -709,6 +712,10 @@ type HypervisorConfig struct {
 	DefaultGPUs uint32
 	// DefaultGPUModel specifies GPU model like tesla, h100, readeon etc.
 	DefaultGPUModel string
+
+	// MeasurementAlgo is the algorithm for measurement
+	// This is only relevant for Arm CCA cca-guest objects
+	MeasurementAlgo string
 }
 
 // vcpu mapping from vcpu number to thread number
@@ -1087,6 +1094,10 @@ const (
 	// https://www.kernel.org/doc/html/latest/virt/kvm/s390-pv.html
 	// Exclude from lint checking for it won't be used on arm64 code
 	seProtection
+
+	// Arm Realm Management Extension (Arm Confidential Computing Architecture)
+	// https://www.arm.com/architecture/security-features/arm-confidential-compute-architecture
+	ccaProtection
 )
 
 var guestProtectionStr = [...]string{
@@ -1096,6 +1107,7 @@ var guestProtectionStr = [...]string{
 	sevProtection:  "sev",
 	snpProtection:  "snp",
 	tdxProtection:  "tdx",
+	ccaProtection:  "cca",
 }
 
 func (gp guestProtection) String() string {
