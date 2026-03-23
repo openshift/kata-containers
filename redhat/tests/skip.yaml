@@ -1,0 +1,66 @@
+# Tests to skip when running on OpenShift with sandboxed-containers.
+# Each entry should include a reason explaining why the test is skipped.
+#
+# Format:
+#   - name: <test-file-name-without-.bats>
+#     reason: "<explanation>"
+
+skip:
+  - name: k8s-footloose
+    reason: "requires nested containers, not supported on OpenShift"
+  - name: k8s-confidential
+    reason: "requires confidential computing hardware not available in CI"
+  - name: k8s-confidential-attestation
+    reason: "requires confidential computing hardware and KBS setup"
+  - name: k8s-guest-pull-image-encrypted
+    reason: "requires KBS and confidential computing setup"
+  - name: k8s-guest-pull-image-authenticated
+    reason: "requires KBS and confidential computing setup"
+  - name: k8s-guest-pull-image-signature
+    reason: "requires KBS and confidential computing setup"
+  - name: k8s-guest-pull-image
+    reason: "requires nydus snapshotter, not available on OpenShift"
+  - name: k8s-initdata
+    reason: "requires confidential computing setup"
+  - name: k8s-measured-rootfs
+    reason: "requires confidential computing setup"
+  - name: k8s-sealed-secret
+    reason: "requires confidential computing setup"
+  - name: k8s-policy-hard-coded
+    reason: "relies on containerd-specific policy paths"
+  - name: k8s-policy-deployment
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-deployment-sc
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-job
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-logs
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-pod
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-pvc
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-policy-rc
+    reason: "requires auto-generated policy tooling not available in CI"
+  - name: k8s-ip6tables
+    reason: "requires IPv6 networking configuration not guaranteed in CI"
+  - name: k8s-seccomp
+    reason: "seccomp profiles path differs on OpenShift nodes"
+  - name: k8s-block-volume
+    reason: "skips internally, requires specific PV/block storage setup"
+  - name: k8s-credentials-secrets
+    reason: "skips internally, requires exec_host with katacontainers.io/kata-runtime label"
+  - name: k8s-file-volume
+    reason: "skips internally, requires exec_host with katacontainers.io/kata-runtime label"
+  - name: k8s-liveness-probes
+    reason: "requires node labeled katacontainers.io/kata-runtime=true"
+  - name: k8s-nvidia-nim
+    reason: "assumes Debian/apt, requires NVIDIA GPU hardware"
+  - name: k8s-parallel
+    reason: "skips internally, requires exec_host with katacontainers.io/kata-runtime label"
+  - name: k8s-pid-ns
+    reason: "grep for /pause fails, OpenShift uses different pause process"
+  - name: k8s-sandbox-vcpus-allocation
+    reason: "requires node labeled katacontainers.io/kata-runtime=true"
+  - name: k8s-volume
+    reason: "skips internally, requires specific volume/storage setup"
