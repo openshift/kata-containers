@@ -1392,7 +1392,7 @@ strip_cap_prefix(s) := result if {
 }
 
 check_directory_traversal(i_path) if {
-    not regex.match("(^|/)..($|/)", i_path)
+    not regex.match("(^|/)\\.\\.($|/)", i_path)
 }
 
 allow_sandbox_storages(i_storages) if {
