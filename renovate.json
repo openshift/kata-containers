@@ -10,6 +10,9 @@
             "**/vendor/**"
         ]
     },
+    "github-actions": {
+        "enabled": false
+    },
     "gomod": {
         "enabled": false
     },
