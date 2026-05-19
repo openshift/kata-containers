@@ -4,10 +4,8 @@
         "https://github.com/konflux-ci/mintmaker/blob/main/config/renovate/renovate.json?raw=true"
     ],
     "dockerfile": {
-        "ignorePaths": [
-            "**/tools/**",
-            "**/tests/**",
-            "**/vendor/**"
+        "includePaths": [
+            "Dockerfile.monitor"
         ]
     },
     "github-actions": {
