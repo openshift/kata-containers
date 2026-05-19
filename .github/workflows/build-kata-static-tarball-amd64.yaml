@@ -76,7 +76,7 @@ jobs:
           username: ${{ vars.QUAY_DEPLOYER_USERNAME }}
           password: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0 # This is needed in order to keep the commit ids history
@@ -181,7 +181,7 @@ jobs:
           username: ${{ vars.QUAY_DEPLOYER_USERNAME }}
           password: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0 # This is needed in order to keep the commit ids history
@@ -276,7 +276,7 @@ jobs:
           username: ${{ vars.QUAY_DEPLOYER_USERNAME }}
           password: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0 # This is needed in order to keep the commit ids history
@@ -330,7 +330,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0
@@ -386,7 +386,7 @@ jobs:
           username: ${{ vars.QUAY_DEPLOYER_USERNAME }}
           password: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0 # This is needed in order to keep the commit ids history
@@ -431,7 +431,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ inputs.commit-hash }}
           fetch-depth: 0
