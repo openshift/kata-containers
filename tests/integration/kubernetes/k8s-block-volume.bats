@@ -10,8 +10,6 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	[ "$(uname -m)" == "s390x" ] && [ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "See: https://github.com/kata-containers/kata-containers/pull/12105#issuecomment-3551916090"
-	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ]  && skip "See: https://github.com/kata-containers/kata-containers/pull/12105#issuecomment-3551916090"
 	( [ "${KATA_HYPERVISOR}" == "fc" ] || [ "${KATA_HYPERVISOR}" == "stratovirt" ] ) && skip "See: https://github.com/kata-containers/kata-containers/issues/10873"
 
 	setup_common || die "setup_common failed"
@@ -22,23 +20,22 @@ setup() {
 	volume_claim="block-loop-pvc"
 	ctr_dev_path="/dev/xda"
 	vol_capacity="500M"
+}
 
+@test "Block Storage Support" {
 	# Create Loop Device
 	tmp_disk_image=$(exec_host "$node" mktemp --tmpdir disk.XXXXXX.img)
 	exec_host "$node" truncate "$tmp_disk_image" --size "$vol_capacity"
 	loop_dev=$(exec_host "$node" sudo losetup -f)
 	exec_host "$node" sudo losetup "$loop_dev" "$tmp_disk_image"
-}
 
-@test "Block Storage Support" {
 	# Create Storage Class
 	kubectl create -f volume/local-storage.yaml
 
 	# Create Persistent Volume
 	tmp_pv_yaml=$(mktemp --tmpdir block_persistent_vol.XXXXX.yaml)
 	sed -e "s|LOOP_DEVICE|${loop_dev}|" volume/block-loop-pv.yaml > "$tmp_pv_yaml"
-    node_name="$(kubectl get node -o name)"
-	sed -i "s|HOSTNAME|${node_name##node/}|" "$tmp_pv_yaml"
+	sed -i "s|HOSTNAME|${node}|" "$tmp_pv_yaml"
 	sed -i "s|CAPACITY|${vol_capacity}|" "$tmp_pv_yaml"
 	kubectl create -f "$tmp_pv_yaml"
 	cmd="kubectl get pv/${volume_name} | grep Available"
@@ -93,8 +90,6 @@ setup() {
 }
 
 teardown() {
-	[ "$(uname -m)" == "s390x" ] && [ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "See: https://github.com/kata-containers/kata-containers/pull/12105#issuecomment-3551916090"
-	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ]  && skip "See: https://github.com/kata-containers/kata-containers/pull/12105#issuecomment-3551916090"
 	( [ "${KATA_HYPERVISOR}" == "fc" ] || [ "${KATA_HYPERVISOR}" == "stratovirt" ] ) && skip "See: https://github.com/kata-containers/kata-containers/issues/10873"
 
 	 # Debugging information

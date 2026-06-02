@@ -114,7 +114,7 @@ impl DragonballInner {
                     .context("add vhost-user-net device")?;
                 Ok(DeviceType::VhostUserNetwork(dev))
             }
-            DeviceType::Vsock(_) | DeviceType::Protection(_) | DeviceType::PortDevice(_) => todo!(),
+            _ => Err(anyhow!("unsupported device {:?}", device)),
         }
     }
 
@@ -171,9 +171,9 @@ impl DragonballInner {
 
         info!(
             sl!(),
-            "insert host device. 
-            host device id: {:?}, 
-            bus_slot_func: {:?}, 
+            "insert host device.
+            host device id: {:?},
+            bus_slot_func: {:?},
             vendor/device id: {:?}",
             primary_device.hostdev_id,
             primary_device.bus_slot_func,

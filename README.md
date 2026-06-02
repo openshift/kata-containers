@@ -74,7 +74,7 @@ See the [official documentation](docs) including:
 - [Developer guide](docs/Developer-Guide.md)
 - [Design documents](docs/design)
   - [Architecture overview](docs/design/architecture)
-  - [Architecture 3.0 overview](docs/design/architecture_3.0/)
+  - [Architecture 4.0 overview](docs/design/architecture_4.0/)
 
 ## Configuration
 
@@ -139,7 +139,6 @@ The table below lists the remaining parts of the project:
 | [`agent-ctl`](src/tools/agent-ctl) | utility | Tool that provides low-level access for testing the agent. |
 | [`kata-ctl`](src/tools/kata-ctl) | utility | Tool that provides advanced commands and debug facilities. |
 | [`trace-forwarder`](src/tools/trace-forwarder) | utility | Agent tracing helper. |
-| [`runk`](src/tools/runk) | utility | Standard OCI container runtime based on the agent. |
 | [`ci`](.github/workflows) | CI | Continuous Integration configuration files and scripts. |
 | [`ocp-ci`](ci/openshift-ci/README.md) | CI | Continuous Integration configuration for the OpenShift pipelines. |
 | [`katacontainers.io`](https://github.com/kata-containers/www.katacontainers.io) | Source for the [`katacontainers.io`](https://www.katacontainers.io) site. |
@@ -153,10 +152,6 @@ Kata Containers is now
 ## General tests
 
 See the [tests documentation](tests/README.md).
-
-## Metrics tests
-
-See the [metrics documentation](tests/metrics/README.md).
 
 ## Glossary of Terms
 

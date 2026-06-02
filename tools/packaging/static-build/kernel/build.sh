@@ -18,7 +18,6 @@ repo_root_dir="${repo_root_dir:-}"
 
 [[ -n "${repo_root_dir}" ]] || die "repo_root_dir is not set"
 readonly kernel_builder="${repo_root_dir}/tools/packaging/kernel/build-kernel.sh"
-readonly initramfs_builder="${repo_root_dir}/tools/packaging/static-build/initramfs/build.sh"
 
 BUILDX=
 PLATFORM=
@@ -27,15 +26,12 @@ DESTDIR=${DESTDIR:-${PWD}}
 PREFIX=${PREFIX:-/opt/kata}
 container_image="${KERNEL_CONTAINER_BUILDER:-$(get_kernel_image_name)}"
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
+CONFIDENTIAL_GUEST=${CONFIDENTIAL_GUEST:-no}
 KBUILD_SIGN_PIN="${KBUILD_SIGN_PIN:-}"
 kernel_builder_args="-a ${ARCH:-} $*"
 KERNEL_DEBUG_ENABLED=${KERNEL_DEBUG_ENABLED:-"no"}
 
-if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
-	info "build initramfs for cc kernel"
-	"${initramfs_builder}"
-	# Turn on the flag to build the kernel with support to
-	# measured rootfs.
+if [[ "${MEASURED_ROOTFS}" == "yes" ]] || [[ "${CONFIDENTIAL_GUEST}" == "yes" ]]; then
 	kernel_builder_args+=" -m"
 fi
 
@@ -81,6 +77,7 @@ container_build+=" --build-arg ARCH=${ARCH:-}"
 
 "${container_engine}" run --rm -i -v "${repo_root_dir}:${repo_root_dir}" \
 	-w "${PWD}" \
+	--env KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED}" \
 	--user "$(id -u)":"$(id -g)" \
 	"${container_image}" \
 	bash -c "${kernel_builder} ${kernel_builder_args} build"
@@ -88,6 +85,7 @@ container_build+=" --build-arg ARCH=${ARCH:-}"
 "${container_engine}" run --rm -i -v "${repo_root_dir}:${repo_root_dir}" \
 	-w "${PWD}" \
 	--env DESTDIR="${DESTDIR}" --env PREFIX="${PREFIX}" \
+	--env KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED}" \
 	--user "$(id -u)":"$(id -g)" \
 	"${container_image}" \
 	bash -c "${kernel_builder} ${kernel_builder_args} install"

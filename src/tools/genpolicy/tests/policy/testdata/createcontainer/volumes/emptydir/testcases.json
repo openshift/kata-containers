@@ -6,7 +6,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -67,8 +67,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test2",
@@ -77,8 +77,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test3",
@@ -87,8 +87,8 @@
               "rprivate",
               "ro"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -159,55 +159,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }
@@ -219,7 +223,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -280,8 +284,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume-fake$",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -352,55 +356,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/invalid-mount",
+          "options": [],
+          "source": "invalid-source",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/invalid-mount",
+          "options": [],
+          "source": "invalid-source",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/invalid-mount",
+          "options": [],
+          "source": "invalid-source",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/invalid-mount",
+          "options": [],
+          "source": "invalid-source",
+          "shared": true
         }
       ]
     }
@@ -412,7 +420,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -473,8 +481,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test4",
@@ -483,8 +491,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -555,55 +563,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }
@@ -615,7 +627,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -671,7 +683,8 @@
         "Mounts": [
           {
             "destination": "/mnt/test",
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -742,55 +755,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }
@@ -802,7 +819,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -863,8 +880,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test",
@@ -873,8 +890,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -945,7 +962,7 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
@@ -959,7 +976,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -1020,8 +1037,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test",
@@ -1030,8 +1047,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -1102,7 +1119,7 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
@@ -1116,7 +1133,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -1177,8 +1194,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test2",
@@ -1187,8 +1204,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test3",
@@ -1197,8 +1214,8 @@
               "rprivate",
               "ro"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test4",
@@ -1207,8 +1224,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           },
           {
             "destination": "/mnt/test5",
@@ -1217,8 +1234,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -1289,55 +1306,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }
@@ -1349,7 +1370,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -1410,8 +1431,8 @@
               "rshared",
               "ro"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "local"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -1482,55 +1503,67 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [
+            "invalid_option=true"
+          ],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [
+            "invalid_option=true"
+          ],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [
+            "invalid_option=true"
+          ],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "ext4",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [
+            "invalid_option=true"
+          ],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }
@@ -1542,7 +1575,7 @@
     "request": {
       "OCI": {
         "Annotations": {
-          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/bundle-id",
+          "io.katacontainers.pkg.oci.bundle_path": "/run/containerd/io.containerd.runtime.v2.task/k8s.io/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "io.katacontainers.pkg.oci.container_type": "pod_container",
           "io.kubernetes.cri.container-name": "dummy",
           "io.kubernetes.cri.container-type": "container",
@@ -1603,8 +1636,8 @@
               "rprivate",
               "rw"
             ],
-            "source": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-            "type_": "someweirdfstype"
+            "source": "",
+            "type_": "bind"
           }
         ],
         "Process": {
@@ -1675,55 +1708,59 @@
           }
         },
         "Root": {
-          "Path": "/run/kata-containers/bundle-id/rootfs",
+          "Path": "/run/kata-containers/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/rootfs",
           "Readonly": false
         },
         "Version": "1.1.0"
       },
       "storages": [
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "invalid_fstype",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+          "options": [],
+          "source": "00/00",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "invalid_fstype",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDEvMDE=",
+          "options": [],
+          "source": "01/01",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "invalid_fstype",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDIvMDI=",
+          "options": [],
+          "source": "02/02",
+          "shared": true
         },
         {
-          "driver": "local",
-          "driver_options": [],
-          "fs_group": null,
-          "fstype": "local",
-          "mount_point": "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000/rootfs/local/test-volume2",
-          "options": [
-            "mode=0777"
+          "driver": "blk",
+          "driver_options": [
+            "encryption_key=ephemeral"
           ],
-          "source": "local"
+          "fs_group": null,
+          "fstype": "invalid_fstype",
+          "mount_point": "/run/kata-containers/sandbox/storage/MDMvMDM=",
+          "options": [],
+          "source": "03/03",
+          "shared": true
         }
       ]
     }

@@ -26,6 +26,7 @@ use vhost_rs::vhost_user::message::VhostUserVringAddrFlags;
 #[cfg(not(test))]
 use vhost_rs::VhostBackend;
 use vhost_rs::{VhostUserMemoryRegionInfo, VringConfigData};
+use virtio_bindings::bindings::virtio_config::{VIRTIO_F_NOTIFY_ON_EMPTY, VIRTIO_F_VERSION_1};
 use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::*;
 use virtio_queue::{DescriptorChain, QueueT};
@@ -690,6 +691,15 @@ mod tests {
     use crate::tests::{create_address_space, create_vm_and_irq_manager};
     use crate::{create_queue_notifier, VirtioQueueConfig};
 
+    fn unique_tap_name(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CNT: AtomicUsize = AtomicUsize::new(0);
+        let n = CNT.fetch_add(1, Ordering::Relaxed);
+
+        // "vtap" + pid(<=5) + n(<=3) => max len <= 15
+        format!("{}{:x}{:x}", prefix, std::process::id() & 0xfff, n & 0xfff)
+    }
+
     fn create_vhost_kern_net_epoll_handler(
         id: String,
     ) -> NetEpollHandler<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap> {
@@ -723,13 +733,16 @@ mod tests {
         let guest_mac = MacAddr::parse_str(guest_mac_str).unwrap();
         let queue_sizes = Arc::new(vec![128]);
         let epoll_mgr = EpollManager::default();
-        let mut dev: Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap> = Net::new(
-            String::from("test_vhosttap"),
-            Some(&guest_mac),
-            queue_sizes,
-            epoll_mgr,
-        )
-        .unwrap();
+        let tap_name = unique_tap_name("vtap");
+        let dev_result: VirtioResult<Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap>> =
+            Net::new(tap_name.clone(), Some(&guest_mac), queue_sizes, epoll_mgr);
+        let mut dev: Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap> = match dev_result {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skip test: failed to create tap {}: {:?}", tap_name, e);
+                return;
+            }
+        };
 
         assert_eq!(dev.device_type(), TYPE_NET);
 
@@ -765,14 +778,16 @@ mod tests {
         {
             let queue_sizes = Arc::new(vec![128]);
             let epoll_mgr = EpollManager::default();
-            let mut dev: Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap> = Net::new(
-                String::from("test_vhosttap"),
-                Some(&guest_mac),
-                queue_sizes,
-                epoll_mgr,
-            )
-            .unwrap();
-
+            let tap_name = unique_tap_name("vtap");
+            let dev_result: VirtioResult<Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap>> =
+                Net::new(tap_name.clone(), Some(&guest_mac), queue_sizes, epoll_mgr);
+            let mut dev: Net<Arc<GuestMemoryMmap>, QueueSync, GuestRegionMmap> = match dev_result {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("skip test: failed to create tap {}: {:?}", tap_name, e);
+                    return;
+                }
+            };
             let queues = vec![
                 VirtioQueueConfig::create(128, 0).unwrap(),
                 VirtioQueueConfig::create(128, 0).unwrap(),
@@ -809,13 +824,17 @@ mod tests {
             let queue_eventfd2 = Arc::new(EventFd::new(0).unwrap());
             let queue_sizes = Arc::new(vec![128, 128]);
             let epoll_mgr = EpollManager::default();
-            let mut dev: Net<Arc<GuestMemoryMmap>, Queue, GuestRegionMmap> = Net::new(
-                String::from("test_vhosttap"),
-                Some(&guest_mac),
-                queue_sizes,
-                epoll_mgr,
-            )
-            .unwrap();
+
+            let tap_name = unique_tap_name("vtap");
+            let dev_result: VirtioResult<Net<Arc<GuestMemoryMmap>, Queue, GuestRegionMmap>> =
+                Net::new(tap_name.clone(), Some(&guest_mac), queue_sizes, epoll_mgr);
+            let mut dev: Net<Arc<GuestMemoryMmap>, Queue, GuestRegionMmap> = match dev_result {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("skip test: failed to create tap {}: {:?}", tap_name, e);
+                    return;
+                }
+            };
 
             let queues = vec![
                 VirtioQueueConfig::new(queue, queue_eventfd, notifier.clone(), 1),

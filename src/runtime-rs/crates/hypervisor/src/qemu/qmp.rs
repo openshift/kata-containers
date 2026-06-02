@@ -4,17 +4,19 @@
 //
 
 use crate::device::pci_path::PciPath;
-use crate::qemu::cmdline_generator::{DeviceVirtioNet, Netdev, QMP_SOCKET_FILE};
+use crate::qemu::cmdline_generator::{CcwSubChannel, DeviceVirtioNet, Netdev, QMP_SOCKET_FILE};
 use crate::utils::get_jailer_root;
+use crate::BlockDeviceFormat;
 use crate::VcpuThreadIds;
 
 use anyhow::{anyhow, Context, Result};
-use kata_types::config::hypervisor::VIRTIO_SCSI;
+use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_SCSI};
 use kata_types::rootless::is_rootless;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use qapi_qmp::{
     self as qmp, BlockdevAioOptions, BlockdevOptions, BlockdevOptionsBase,
-    BlockdevOptionsGenericFormat, BlockdevOptionsRaw, BlockdevRef, MigrationInfo, PciDeviceInfo,
+    BlockdevOptionsGenericCOWFormat, BlockdevOptionsGenericFormat, BlockdevOptionsRaw, BlockdevRef,
+    MigrationInfo, PciDeviceInfo,
 };
 use qapi_qmp::{migrate, migrate_incoming, migrate_set_capabilities};
 use qapi_qmp::{MigrationCapability, MigrationCapabilityStatus};
@@ -28,8 +30,14 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use qapi_spec::Dictionary;
+use std::thread;
+use std::time::Instant;
+
 /// default qmp connection read timeout
 const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
+const DEFAULT_QMP_INIT_READ_TIMEOUT: u64 = 5000;
+const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
+const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
 
 pub struct Qmp {
     qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
@@ -45,6 +53,11 @@ pub struct Qmp {
     // blocks seem ever to be onlined in the guest by kata-agent.
     // Store as u64 to keep up the convention of bytes being represented as u64.
     guest_memory_block_size: u64,
+
+    // CCW subchannel for s390x device address management.
+    // Transferred from QemuCmdLine after boot so that hotplug allocations
+    // continue from where boot-time allocations left off.
+    ccw_subchannel: Option<CcwSubChannel>,
 }
 
 // We have to implement Debug since the Hypervisor trait requires it and Qmp
@@ -58,29 +71,48 @@ impl Debug for Qmp {
 
 impl Qmp {
     pub fn new(qmp_sock_path: &str) -> Result<Self> {
-        let stream = UnixStream::connect(qmp_sock_path)?;
+        let try_new_once_fn = || -> Result<Qmp> {
+            let stream = UnixStream::connect(qmp_sock_path)?;
 
-        // Set the read timeout to protect runtime-rs from blocking forever
-        // trying to set up QMP connection if qemu fails to launch.  The exact
-        // value is a matter of judegement.  Setting it too long would risk
-        // being ineffective since container runtime would timeout first anyway
-        // (containerd's task creation timeout is 2 s by default).  OTOH
-        // setting it too short would risk interfering with a normal launch,
-        // perhaps just seeing some delay due to a heavily loaded host.
-        stream.set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_INIT_READ_TIMEOUT)))
+                .context("set qmp read timeout")?;
 
-        let mut qmp = Qmp {
-            qmp: qapi::Qmp::new(qapi::Stream::new(
-                BufReader::new(stream.try_clone()?),
-                stream,
-            )),
-            guest_memory_block_size: 0,
+            let mut qmp = Qmp {
+                qmp: qapi::Qmp::new(qapi::Stream::new(
+                    BufReader::new(stream.try_clone()?),
+                    stream,
+                )),
+                guest_memory_block_size: 0,
+                ccw_subchannel: None,
+            };
+
+            let info = qmp.qmp.handshake().context("qmp handshake failed")?;
+            info!(sl!(), "QMP initialized: {:#?}", info);
+
+            Ok(qmp)
         };
 
-        let info = qmp.qmp.handshake()?;
-        info!(sl!(), "QMP initialized: {:#?}", info);
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS);
+        let mut last_err: Option<anyhow::Error> = None;
 
-        Ok(qmp)
+        while Instant::now() < deadline {
+            match try_new_once_fn() {
+                Ok(qmp) => return Ok(qmp),
+                Err(e) => {
+                    debug!(sl!(), "QMP not ready yet: {}", e);
+                    last_err = Some(e);
+                    thread::sleep(Duration::from_millis(DEFAULT_QMP_RETRY_SLEEP_MS));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow!("QMP init timed out")))
+            .with_context(|| format!("timed out waiting for QMP ready: {}", qmp_sock_path))
+    }
+
+    pub fn set_ccw_subchannel(&mut self, subchannel: CcwSubChannel) {
+        self.ccw_subchannel = Some(subchannel);
     }
 
     pub fn set_ignore_shared_memory_capability(&mut self) -> Result<()> {
@@ -135,29 +167,52 @@ impl Qmp {
             }
             let core_id = match vcpu.props.core_id {
                 Some(id) => id,
-                None => continue,
+                None => {
+                    warn!(sl!(), "hotpluggable vcpu has no core_id, skipping");
+                    continue;
+                }
             };
             if vcpu.qom_path.is_some() {
                 info!(sl!(), "hotpluggable vcpu {} hotplugged already", core_id);
                 continue;
             }
-            let socket_id = match vcpu.props.socket_id {
-                Some(id) => id,
-                None => continue,
-            };
-            let thread_id = match vcpu.props.thread_id {
-                Some(id) => id,
-                None => continue,
-            };
-
+            let driver = &vcpu.type_;
             let mut cpu_args = Dictionary::new();
-            cpu_args.insert("socket-id".to_owned(), socket_id.into());
             cpu_args.insert("core-id".to_owned(), core_id.into());
-            cpu_args.insert("thread-id".to_owned(), thread_id.into());
+            if !is_flat_cpu_topology(driver) {
+                match (vcpu.props.socket_id, vcpu.props.thread_id) {
+                    (Some(socket_id), Some(thread_id)) => {
+                        cpu_args.insert("socket-id".to_owned(), socket_id.into());
+                        cpu_args.insert("thread-id".to_owned(), thread_id.into());
+                    }
+                    (None, None) => {
+                        warn!(sl!(), "hotpluggable vcpu {} has no socket_id and thread_id for driver {}, skipping", core_id, driver);
+                        continue;
+                    }
+                    (None, _) => {
+                        warn!(
+                            sl!(),
+                            "hotpluggable vcpu {} has no socket_id for driver {}, skipping",
+                            core_id,
+                            driver
+                        );
+                        continue;
+                    }
+                    (_, None) => {
+                        warn!(
+                            sl!(),
+                            "hotpluggable vcpu {} has no thread_id for driver {}, skipping",
+                            core_id,
+                            driver
+                        );
+                        continue;
+                    }
+                }
+            }
             self.qmp.execute(&qmp::device_add {
                 bus: None,
                 id: Some(vcpu_id_from_core_id(core_id)),
-                driver: hotpluggable_cpus[0].type_.clone(),
+                driver: driver.clone(),
                 arguments: cpu_args,
             })?;
 
@@ -432,14 +487,44 @@ impl Qmp {
         netdev: &Netdev,
         virtio_net_device: &DeviceVirtioNet,
     ) -> Result<()> {
-        debug!(
-            sl!(),
-            "hotplug_network_device(): PCI before {}: {:#?}",
-            virtio_net_device.get_netdev_id(),
-            self.qmp.execute(&qapi_qmp::query_pci {})?
-        );
+        let use_ccw_bus = crate::utils::uses_native_ccw_bus();
+        let netdev_id = netdev.get_id().clone();
 
-        let (bus, slot) = self.find_free_slot()?;
+        let mut netdev_frontend_args = Dictionary::new();
+        netdev_frontend_args.insert(
+            "netdev".to_owned(),
+            virtio_net_device.get_netdev_id().clone().into(),
+        );
+        netdev_frontend_args.insert("mac".to_owned(), virtio_net_device.get_mac_addr().into());
+        netdev_frontend_args.insert("mq".to_owned(), true.into());
+
+        let frontend_id = format!("frontend-{}", virtio_net_device.get_netdev_id());
+
+        let bus = if use_ccw_bus {
+            let subchannel = self.ccw_subchannel.as_mut().ok_or_else(|| {
+                anyhow!("CCW subchannel not available for virtio-net-ccw hotplug")
+            })?;
+            let slot = subchannel
+                .add_device(&frontend_id)
+                .map_err(|e| anyhow!("CCW subchannel add_device failed: {:?}", e))?;
+            let devno = subchannel.address_format_ccw(slot);
+            netdev_frontend_args.insert("devno".to_owned(), devno.into());
+            None
+        } else {
+            let (bus, slot) = self.find_free_slot()?;
+            netdev_frontend_args.insert("addr".to_owned(), format!("{slot:02}").into());
+            // As the golang runtime documents the vectors computation, it's
+            // 2N+2 vectors, N for tx queues, N for rx queues, 1 for config,
+            // and one for possible control vq.  PCI-specific (MSI-X).
+            netdev_frontend_args.insert(
+                "vectors".to_owned(),
+                (2 * virtio_net_device.get_num_queues() + 2).into(),
+            );
+            if virtio_net_device.get_disable_modern() {
+                netdev_frontend_args.insert("disable-modern".to_owned(), true.into());
+            }
+            Some(bus)
+        };
 
         let mut fd_names = vec![];
         for (idx, fd) in netdev.get_fds().iter().enumerate() {
@@ -457,7 +542,7 @@ impl Qmp {
 
         self.qmp
             .execute(&qapi_qmp::netdev_add(qapi_qmp::Netdev::tap {
-                id: netdev.get_id().clone(),
+                id: netdev_id.clone(),
                 tap: qapi_qmp::NetdevTapOptions {
                     br: None,
                     downscript: None,
@@ -485,38 +570,48 @@ impl Qmp {
                     vhostforce: None,
                     vnet_hdr: None,
                 },
-            }))?;
+            }))
+            .map_err(|e| {
+                if use_ccw_bus {
+                    if let Some(subchannel) = self.ccw_subchannel.as_mut() {
+                        let _ = subchannel.remove_device(&frontend_id);
+                    }
+                }
 
-        let mut netdev_frontend_args = Dictionary::new();
-        netdev_frontend_args.insert(
-            "netdev".to_owned(),
-            virtio_net_device.get_netdev_id().clone().into(),
-        );
-        netdev_frontend_args.insert("addr".to_owned(), format!("{slot:02}").into());
-        netdev_frontend_args.insert("mac".to_owned(), virtio_net_device.get_mac_addr().into());
-        netdev_frontend_args.insert("mq".to_owned(), true.into());
-        // As the golang runtime documents the vectors computation, it's
-        // 2N+2 vectors, N for tx queues, N for rx queues, 1 for config, and one for possible control vq
-        netdev_frontend_args.insert(
-            "vectors".to_owned(),
-            (2 * virtio_net_device.get_num_queues() + 2).into(),
-        );
-        if virtio_net_device.get_disable_modern() {
-            netdev_frontend_args.insert("disable-modern".to_owned(), true.into());
-        }
+                anyhow!(e)
+            })?;
 
-        self.qmp.execute(&qmp::device_add {
-            bus: Some(bus),
-            id: Some(format!("frontend-{}", virtio_net_device.get_netdev_id())),
+        let device_add_result = self.qmp.execute(&qmp::device_add {
+            bus,
+            id: Some(frontend_id.clone()),
             driver: virtio_net_device.get_device_driver().clone(),
             arguments: netdev_frontend_args,
-        })?;
+        });
+        if let Err(e) = device_add_result {
+            if use_ccw_bus {
+                if let Some(subchannel) = self.ccw_subchannel.as_mut() {
+                    let _ = subchannel.remove_device(&frontend_id);
+                }
+            }
+
+            if let Err(del_err) = self.qmp.execute(&qmp::netdev_del {
+                id: netdev_id.clone(),
+            }) {
+                warn!(
+                    sl!(),
+                    "hotplug_network_device(): netdev_del failed for {} after device_add error {:?}: {:?}",
+                    netdev_id,
+                    e,
+                    del_err
+                );
+            }
+
+            return Err(e.into());
+        }
 
         debug!(
             sl!(),
-            "hotplug_network_device(): PCI after {}: {:#?}",
-            virtio_net_device.get_netdev_id(),
-            self.qmp.execute(&qapi_qmp::query_pci {})?
+            "hotplug_network_device(): successfully added {}", frontend_id
         );
 
         Ok(())
@@ -573,6 +668,13 @@ impl Qmp {
     /// {"execute":"device_add","arguments":{"driver":"scsi-hd","drive":"virtio-scsi0","id":"scsi_device_0","bus":"virtio-scsi1.0"}}
     /// {"return": {}}
     ///
+    /// Hotplug virtio-blk-ccw block device on s390x
+    /// # virtio-blk-ccw0
+    /// {"execute":"blockdev_add", "arguments": {"file":"/path/to/block.image","format":"qcow2","id":"virtio-blk-ccw0"}}
+    /// {"return": {}}
+    /// {"execute":"device_add","arguments":{"driver":"virtio-blk-ccw","id":"virtio-blk-ccw0","drive":"virtio-blk-ccw0","devno":"fe.0.0005","share-rw":true}}
+    /// {"return": {}}
+    ///
     #[allow(clippy::too_many_arguments)]
     pub fn hotplug_block_device(
         &mut self,
@@ -583,6 +685,9 @@ impl Qmp {
         is_direct: Option<bool>,
         is_readonly: bool,
         no_drop: bool,
+        logical_block_size: u32,
+        physical_block_size: u32,
+        format: &BlockDeviceFormat,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = format!("drive-{index}");
@@ -631,27 +736,54 @@ impl Qmp {
             }
         };
 
-        let blockdev_options_raw = BlockdevOptions::raw {
-            base: BlockdevOptionsBase {
-                detect_zeroes: None,
-                cache: None,
-                discard: None,
-                force_share: None,
-                auto_read_only: None,
-                node_name: Some(node_name.clone()),
-                read_only: None,
-            },
-            raw: BlockdevOptionsRaw {
-                base: BlockdevOptionsGenericFormat {
-                    file: BlockdevRef::definition(Box::new(blockdev_file)),
+        let blockdev_options = match format {
+            BlockDeviceFormat::Raw => BlockdevOptions::raw {
+                base: BlockdevOptionsBase {
+                    detect_zeroes: None,
+                    cache: None,
+                    discard: None,
+                    force_share: if is_readonly { Some(true) } else { None },
+                    auto_read_only: None,
+                    node_name: Some(node_name.clone()),
+                    read_only: Some(is_readonly),
                 },
-                offset: None,
-                size: None,
+                raw: BlockdevOptionsRaw {
+                    base: BlockdevOptionsGenericFormat {
+                        file: BlockdevRef::definition(Box::new(blockdev_file)),
+                    },
+                    offset: None,
+                    size: None,
+                },
             },
+            BlockDeviceFormat::Vmdk => {
+                info!(
+                    sl!(),
+                    "hotplug_block_device: using VMDK format driver for {} (read_only={}, force_share=true)",
+                    path_on_host,
+                    is_readonly
+                );
+                BlockdevOptions::vmdk {
+                    base: BlockdevOptionsBase {
+                        detect_zeroes: None,
+                        cache: None,
+                        discard: None,
+                        force_share: Some(true),
+                        auto_read_only: None,
+                        node_name: Some(node_name.clone()),
+                        read_only: Some(is_readonly),
+                    },
+                    vmdk: BlockdevOptionsGenericCOWFormat {
+                        base: BlockdevOptionsGenericFormat {
+                            file: BlockdevRef::definition(Box::new(blockdev_file)),
+                        },
+                        backing: None,
+                    },
+                }
+            }
         };
 
         self.qmp
-            .execute(&qapi_qmp::blockdev_add(blockdev_options_raw))
+            .execute(&qapi_qmp::blockdev_add(blockdev_options))
             .map_err(|e| anyhow!("blockdev-add backend {:?}", e))
             .map(|_| ())?;
 
@@ -659,6 +791,13 @@ impl Qmp {
         // `device_add`
         let mut blkdev_add_args = Dictionary::new();
         blkdev_add_args.insert("drive".to_owned(), node_name.clone().into());
+
+        if logical_block_size > 0 {
+            blkdev_add_args.insert("logical_block_size".to_owned(), logical_block_size.into());
+        }
+        if physical_block_size > 0 {
+            blkdev_add_args.insert("physical_block_size".to_owned(), physical_block_size.into());
+        }
 
         if block_driver == VIRTIO_SCSI {
             // Helper closure to decode a flattened u16 SCSI index into an (ID, LUN) pair.
@@ -677,8 +816,18 @@ impl Qmp {
             // add SCSI frontend device
             blkdev_add_args.insert("scsi-id".to_string(), scsi_id.into());
             blkdev_add_args.insert("lun".to_string(), lun.into());
-            blkdev_add_args.insert("share-rw".to_string(), true.into());
+            if !is_readonly {
+                blkdev_add_args.insert("share-rw".to_string(), true.into());
+            }
 
+            info!(
+                sl!(),
+                "hotplug_block_device(): device_add arguments: bus: {}, id: {}, driver: {}, blkdev_add_args: {:#?}",
+                "scsi0.0",
+                node_name,
+                "scsi-hd",
+                blkdev_add_args
+            );
             self.qmp
                 .execute(&qmp::device_add {
                     bus: Some("scsi0.0".to_string()),
@@ -695,11 +844,63 @@ impl Qmp {
             );
 
             Ok((None, Some(scsi_addr)))
+        } else if block_driver == VIRTIO_BLK_CCW {
+            let subchannel = self.ccw_subchannel.as_mut().ok_or_else(|| {
+                anyhow!("CCW subchannel not available for virtio-blk-ccw hotplug")
+            })?;
+
+            let slot = subchannel
+                .add_device(&node_name)
+                .map_err(|e| anyhow!("CCW subchannel add_device failed: {:?}", e))?;
+            let devno = subchannel.address_format_ccw(slot);
+            let ccw_addr = subchannel.address_format_ccw_for_virt_server(slot);
+
+            blkdev_add_args.insert("devno".to_owned(), devno.clone().into());
+            if !is_readonly {
+                blkdev_add_args.insert("share-rw".to_string(), true.into());
+            }
+
+            info!(
+                sl!(),
+                "hotplug_block_device(): CCW device_add: id: {}, driver: {}, blkdev_add_args: {:#?}, ccw_addr: {}",
+                node_name,
+                block_driver,
+                blkdev_add_args,
+                ccw_addr
+            );
+            let device_add_result = self.qmp.execute(&qmp::device_add {
+                bus: None,
+                id: Some(node_name.clone()),
+                driver: block_driver.to_string(),
+                arguments: blkdev_add_args,
+            });
+            if let Err(e) = device_add_result {
+                // Roll back CCW subchannel state if QMP device_add fails
+                let _ = subchannel.remove_device(&node_name);
+                return Err(anyhow!("device_add {:?}", e));
+            }
+
+            info!(
+                sl!(),
+                "hotplug CCW block device return ccw address: {:?}", &ccw_addr
+            );
+
+            Ok((None, Some(ccw_addr)))
         } else {
             let (bus, slot) = self.find_free_slot()?;
             blkdev_add_args.insert("addr".to_owned(), format!("{slot:02}").into());
-            blkdev_add_args.insert("share-rw".to_string(), true.into());
+            if !is_readonly {
+                blkdev_add_args.insert("share-rw".to_string(), true.into());
+            }
 
+            info!(
+                sl!(),
+                "hotplug_block_device(): device_add arguments: bus: {}, id: {}, driver: {}, blkdev_add_args: {:#?}",
+                bus,
+                node_name,
+                block_driver,
+                blkdev_add_args
+            );
             self.qmp
                 .execute(&qmp::device_add {
                     bus: Some(bus),
@@ -874,6 +1075,12 @@ impl Qmp {
 
 fn vcpu_id_from_core_id(core_id: i64) -> String {
     format!("cpu-{core_id}")
+}
+
+/// Returns whether the CPU driver uses a flat topology.
+/// s390x and ppc64le use a flat CPU topology.
+fn is_flat_cpu_topology(driver: &str) -> bool {
+    matches!(driver, "host-s390x-cpu" | "host-powerpc64-cpu")
 }
 
 // The get_pci_path_by_qdev_id function searches a device list for a device matching a given qdev_id,

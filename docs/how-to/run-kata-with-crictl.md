@@ -8,7 +8,7 @@
 
 > **Note:** `cri-tools` is only used for debugging and validation purpose, and don't use it to run production workloads.
 
-> **Note:** For how to install and configure `cri-tools` with CRI runtimes like `containerd` or CRI-O, please also refer to other [howtos](./README.md).
+> **Note:** For how to install and configure `cri-tools` with CRI runtimes like `containerd` or CRI-O, please also refer to other [how-tos](./README.md).
 
 ## Use `crictl` run Pods in Kata containers
 
@@ -30,7 +30,7 @@ POD ID              CREATED             STATE               NAME                
 #### Create container in the pod sandbox with config file
 
 ```bash
-$ sudo crictl create 16a62b035940f container_config.json sandbox_config.json 
+$ sudo crictl create 16a62b035940f container_config.json sandbox_config.json
 e6ca0e0f7f532686236b8b1f549e4878e4fe32ea6b599a5d684faf168b429202
 ```
 
@@ -66,7 +66,7 @@ $ sudo crictl exec -it e6ca0e0f7f532 sh
 And run commands in it:
 
 ```
-/ # hostname 
+/ # hostname
 busybox_host
 / # id
 uid=0(root) gid=0(root)

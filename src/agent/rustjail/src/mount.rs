@@ -752,15 +752,6 @@ fn parse_mount(m: &Mount) -> (MsFlags, MsFlags, String) {
     (flags, pgflags, data.join(","))
 }
 
-// This function constructs a canonicalized path by combining the `rootfs` and `unsafe_path` elements.
-// The resulting path is guaranteed to be ("below" / "in a directory under") the `rootfs` directory.
-//
-// Parameters:
-//
-// - `rootfs` is the absolute path to the root of the containers root filesystem directory.
-// - `unsafe_path` is path inside a container. It is unsafe since it may try to "escape" from the containers
-//    rootfs by using one or more "../" path elements or is its a symlink to path.
-
 fn mount_from(
     cfd_log: RawFd,
     m: &Mount,
@@ -866,7 +857,7 @@ fn mount_from(
         dest.as_str(),
         Some(mount_typ.as_str()),
         flags,
-        Some(d.as_str()),
+        Some(d.as_str()).filter(|s| !s.is_empty()),
     )
     .inspect_err(|e| log_child!(cfd_log, "mount error: {:?}", e))?;
 
@@ -1371,7 +1362,7 @@ mod tests {
             .typ(oci::LinuxDeviceType::C)
             .major(0)
             .minor(0)
-            .file_mode(0660 as u32)
+            .file_mode(0o660_u32)
             .uid(unistd::getuid().as_raw())
             .gid(unistd::getgid().as_raw())
             .build()
@@ -1609,7 +1600,7 @@ mod tests {
             },
             TestData {
                 mountinfo_data: Some(
-                    "22 933 0:20 /foo\040-\040bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
+                    "22 933 0:20 /foo\x20-\x20bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
                 ),
                 result: Ok(vec![Info {
                     mount_point: "/sys".to_string(),

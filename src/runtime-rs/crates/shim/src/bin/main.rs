@@ -6,10 +6,15 @@
 
 use std::{
     ffi::{OsStr, OsString},
+    io::Write,
     path::PathBuf,
 };
 
 use anyhow::{anyhow, Context, Result};
+use containerd_shim_protos::{
+    protobuf::Message,
+    types::introspection::{RuntimeInfo, RuntimeVersion},
+};
 use nix::{
     mount::{mount, MsFlags},
     sched::{self, CloneFlags},
@@ -21,6 +26,10 @@ use shim::{config, Args, Error, ShimExecutor};
 const DEFAULT_TOKIO_RUNTIME_WORKER_THREADS: usize = 2;
 // env to config tokio runtime worker threads
 const ENV_TOKIO_RUNTIME_WORKER_THREADS: &str = "TOKIO_RUNTIME_WORKER_THREADS";
+// RUNTIME_ALLOW_MOUNTS are the custom mount types allowed by the runtime. These
+// types should not be handled by the mount manager.
+// To include prepare mount types, use "/*" suffix, such as "format/*"
+pub const RUNTIME_ALLOW_MOUNTS: &str = "containerd.io/runtime-allow-mounts";
 
 #[derive(Debug)]
 enum Action {
@@ -29,11 +38,13 @@ enum Action {
     Delete(Args),
     Help,
     Version,
+    Info,
 }
 
 fn parse_args(args: &[OsString]) -> Result<Action> {
     let mut help = false;
     let mut version = false;
+    let mut info = false;
     let mut shim_args = Args::default();
 
     // Crate `go_flag` is used to keep compatible with go/flag package.
@@ -46,6 +57,7 @@ fn parse_args(args: &[OsString]) -> Result<Action> {
         flags.add_flag("publish-binary", &mut shim_args.publish_binary);
         flags.add_flag("help", &mut help);
         flags.add_flag("version", &mut version);
+        flags.add_flag("info", &mut info);
     })
     .context(Error::ParseArgument(format!("{args:?}")))?;
 
@@ -53,6 +65,8 @@ fn parse_args(args: &[OsString]) -> Result<Action> {
         Ok(Action::Help)
     } else if version {
         Ok(Action::Version)
+    } else if info {
+        Ok(Action::Info)
     } else if rest_args.is_empty() {
         Ok(Action::Run(shim_args))
     } else if rest_args[0] == "start" {
@@ -83,6 +97,8 @@ fn show_help(cmd: &OsStr) {
         enable debug output in logs
   -id string
         id of the task
+  -info
+        output the runtime info as protobuf (for containerd v2.0+)
   -namespace string
         namespace that owns the shim
   -publish-binary string
@@ -112,6 +128,29 @@ fn show_version(err: Option<anyhow::Error>) {
     } else {
         println!("{data}")
     }
+}
+
+fn show_info() -> Result<()> {
+    let mut version = RuntimeVersion::new();
+    version.version = config::RUNTIME_VERSION.to_string();
+    version.revision = config::RUNTIME_GIT_COMMIT.to_string();
+
+    let mut info = RuntimeInfo::new();
+    info.name = config::CONTAINERD_RUNTIME_NAME.to_string();
+    info.version = Some(version).into();
+    info.annotations.insert(
+        RUNTIME_ALLOW_MOUNTS.to_string(),
+        "mkdir/*,format/*,erofs".to_string(),
+    );
+
+    let data = info
+        .write_to_bytes()
+        .context("failed to marshal RuntimeInfo")?;
+    std::io::stdout()
+        .write_all(&data)
+        .context("failed to write RuntimeInfo to stdout")?;
+
+    Ok(())
 }
 
 fn get_tokio_runtime() -> Result<tokio::runtime::Runtime> {
@@ -155,6 +194,7 @@ fn real_main() -> Result<()> {
         }
         Action::Help => show_help(&args[0]),
         Action::Version => show_version(None),
+        Action::Info => show_info().context("show info")?,
     }
     Ok(())
 }

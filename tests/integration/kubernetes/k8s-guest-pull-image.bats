@@ -8,12 +8,17 @@
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
+export SNAPSHOTTER="${SNAPSHOTTER:-}"
+export EXPERIMENTAL_FORCE_GUEST_PULL="${EXPERIMENTAL_FORCE_GUEST_PULL:-}"
+
 setup() {
     if ! is_confidential_runtime_class; then
         skip "Test not supported for ${KATA_HYPERVISOR}."
     fi
 
-    [ "${SNAPSHOTTER:-}" = "nydus" ] || skip "None snapshotter was found but this test requires one"
+    if [ "${SNAPSHOTTER}" != "nydus" ] && [ -z "${EXPERIMENTAL_FORCE_GUEST_PULL}" ]; then
+        skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
+    fi
 
     setup_common || die "setup_common failed"
     unencrypted_image="quay.io/prometheus/busybox:latest"
@@ -21,6 +26,7 @@ setup() {
     large_image="quay.io/confidential-containers/test-images:largeimage" # unpacked size: 2.15GB
     pod_config_template="${pod_config_dir}/pod-guest-pull-in-trusted-storage.yaml.in"
     storage_config_template="${pod_config_dir}/confidential/trusted-storage.yaml.in"
+    policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
 }
 
 @test "Test we can pull an unencrypted image outside the guest with runc and then inside the guest successfully" {
@@ -56,7 +62,7 @@ setup() {
     echo "Pod $kata_pod_with_nydus_config file:"
     cat $kata_pod_with_nydus_config
 
-    add_allow_all_policy_to_yaml "$kata_pod_with_nydus_config"
+    auto_generate_policy "${policy_settings_dir}" "${kata_pod_with_nydus_config}"
     k8s_create_pod "$kata_pod_with_nydus_config"
 }
 
@@ -81,21 +87,23 @@ setup() {
     echo "Pod $pod_config file:"
     cat $pod_config
 
+    auto_generate_policy "${policy_settings_dir}" "${pod_config}"
+
     # The pod should be failed because the unpacked image size is larger than the memory size in the guest.
     assert_pod_fail "$pod_config"
     assert_logs_contain "$node" kata "$node_start_time" "Failed to pull image"
 }
 
 @test "Test we can pull an image inside the guest using trusted storage" {
-	[ "$(uname -m)" == "s390x" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-snp" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
     # The image pulled in the guest will be downloaded and unpacked in the `/run/kata-containers/image` directory.
     # The tests will use `cryptsetup` to encrypt a block device and mount it at `/run/kata-containers/image`.
 
-    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXX")
+    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
-    LOCAL_DEVICE="$local_device" NODE_NAME="$node" envsubst < "$storage_config_template" > "$storage_config"
+    PV_NAME=trusted-block-pv PVC_NAME=trusted-pvc \
+        PV_STORAGE_CAPACITY=10Gi PVC_STORAGE_REQUEST=1Gi \
+        LOCAL_DEVICE="$local_device" NODE_NAME="$node" \
+        envsubst < "$storage_config_template" > "$storage_config"
 
     # For debug sake
     echo "Trusted storage $storage_config file:"
@@ -104,17 +112,21 @@ setup() {
     # Create persistent volume and persistent volume claim
     retry_kubectl_apply $storage_config
 
-    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXX")
+    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXXXXX.yaml")
     IMAGE="$image_pulled_time_less_than_default_time" NODE_NAME="$node" envsubst < "$pod_config_template" > "$pod_config"
 
-
-    # Set CreateContainerRequest timeout for qemu-coco-dev
-    if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]]; then
-        create_container_timeout=300
-        set_metadata_annotation "$pod_config" \
-            "io.katacontainers.config.runtime.create_container_timeout" \
-            "${create_container_timeout}"
+    # Set CreateContainerRequest timeout in the annotation to allow for enough time for guest-pull where
+    # the container remains in 'creating' state until the pull completes. Usually pulling this and the large image in
+    # below test takes 30-60 seconds, but we occasionally observe spikes on all our bare-metal runners.
+    create_container_timeout=300
+    # On AKS, so far, these spikes have not been observed. Issue 10299, as referenced in other parts of this test, tells us
+    # that we cannot modify the runtimeRequestTimeout on AKS. We hence set the timeout to the 120s default value.
+    if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [ "${KBS_INGRESS}" = "aks" ]; then
+        create_container_timeout=120
     fi
+    set_metadata_annotation "$pod_config" \
+        "io.katacontainers.config.runtime.create_container_timeout" \
+        "${create_container_timeout}"
 
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
@@ -125,20 +137,21 @@ setup() {
     echo "Pod $pod_config file:"
     cat $pod_config
 
-    add_allow_all_policy_to_yaml "$pod_config"
-    local wait_time=120
-    [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && wait_time=300
+    auto_generate_policy "${policy_settings_dir}" "${pod_config}"
+    local wait_time=300
+    if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [ "${KBS_INGRESS}" = "aks" ]; then
+        wait_time=120
+    fi
     k8s_create_pod "$pod_config" "$wait_time"
 }
 
 @test "Test we cannot pull a large image that pull time exceeds createcontainer timeout inside the guest" {
-	[ "$(uname -m)" == "s390x" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-snp" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-
-    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXX")
+    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
-    LOCAL_DEVICE="$local_device" NODE_NAME="$node" envsubst < "$storage_config_template" > "$storage_config"
+    PV_NAME=trusted-block-pv PVC_NAME=trusted-pvc \
+        PV_STORAGE_CAPACITY=10Gi PVC_STORAGE_REQUEST=1Gi \
+        LOCAL_DEVICE="$local_device" NODE_NAME="$node" \
+        envsubst < "$storage_config_template" > "$storage_config"
 
     # For debug sake
     echo "Trusted storage $storage_config file:"
@@ -147,7 +160,7 @@ setup() {
     # Create persistent volume and persistent volume claim
     retry_kubectl_apply $storage_config
 
-    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXX")
+    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXXXXX.yaml")
     IMAGE="$large_image" NODE_NAME="$node" envsubst < "$pod_config_template" > "$pod_config"
 
     # Set a short CreateContainerRequest timeout in the annotation to fail to pull image in guest
@@ -165,11 +178,16 @@ setup() {
     echo "Pod $pod_config file:"
     cat $pod_config
 
+    auto_generate_policy "${policy_settings_dir}" "${pod_config}"
+
     # The pod should be failed because the image is too large to be pulled in the timeout
-    assert_pod_fail "$pod_config"
+    local fail_timeout=120
+    # In this case, the host pulls first. Sometimes pull times spike, so allow longer to observe the failure
+    [[ -n "${EXPERIMENTAL_FORCE_GUEST_PULL}" ]] && fail_timeout=360
+    assert_pod_fail "$pod_config" "$fail_timeout"
 
     # runtime-rs has its dedicated error message, we need handle it separately.
-    if [ "${KATA_HYPERVISOR}" == "qemu-coco-dev-runtime-rs" ]; then
+    if [[ "${KATA_HYPERVISOR}" == *-runtime-rs ]]; then
         pod_name="large-image-pod"
         kubectl describe "pod/$pod_name" | grep "agent create container"
         kubectl describe "pod/$pod_name" | grep "timeout"
@@ -181,16 +199,15 @@ setup() {
 }
 
 @test "Test we can pull a large image inside the guest with large createcontainer timeout" {
-	[ "$(uname -m)" == "s390x" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-snp" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-    [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/10838"
-
     if [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && [ "${KBS_INGRESS}" = "aks" ]; then
         skip "skip this specific one due to issue https://github.com/kata-containers/kata-containers/issues/10299"
     fi
-    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXX")
+    storage_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${storage_config_template}").XXXXXX.yaml")
     local_device=$(create_loop_device)
-    LOCAL_DEVICE="$local_device" NODE_NAME="$node" envsubst < "$storage_config_template" > "$storage_config"
+    PV_NAME=trusted-block-pv PVC_NAME=trusted-pvc \
+        PV_STORAGE_CAPACITY=10Gi PVC_STORAGE_REQUEST=1Gi \
+        LOCAL_DEVICE="$local_device" NODE_NAME="$node" \
+        envsubst < "$storage_config_template" > "$storage_config"
 
     # For debug sake
     echo "Trusted storage $storage_config file:"
@@ -199,12 +216,12 @@ setup() {
     # Create persistent volume and persistent volume claim
     retry_kubectl_apply $storage_config
 
-    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXX")
+    pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXXXXX.yaml")
     IMAGE="$large_image" NODE_NAME="$node" envsubst < "$pod_config_template" > "$pod_config"
 
     # Set CreateContainerRequest timeout in the annotation to pull large image in guest
-    create_container_timeout=120
-    [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && create_container_timeout=600
+    # Bare-metal CI runners' kubelets are configured with an equivalent runtimeRequestTimeout of 600s
+    create_container_timeout=600
     set_metadata_annotation "$pod_config" \
         "io.katacontainers.config.runtime.create_container_timeout" \
         "${create_container_timeout}"
@@ -218,9 +235,8 @@ setup() {
     echo "Pod $pod_config file:"
     cat $pod_config
 
-    add_allow_all_policy_to_yaml "$pod_config"
-    local wait_time=120
-    [[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && wait_time=600
+    auto_generate_policy "${policy_settings_dir}" "${pod_config}"
+    local wait_time=600
     k8s_create_pod "$pod_config" "$wait_time"
 }
 
@@ -229,8 +245,11 @@ teardown() {
         skip "Test not supported for ${KATA_HYPERVISOR}."
     fi
 
-    [ "${SNAPSHOTTER:-}" = "nydus" ] || skip "None snapshotter was found but this test requires one"
+    if [ "${SNAPSHOTTER}" != "nydus" ] && [ -z "${EXPERIMENTAL_FORCE_GUEST_PULL}" ]; then
+        skip "Either SNAPSHOTTER=nydus or EXPERIMENTAL_FORCE_GUEST_PULL must be set for this test"
+    fi
 
+    delete_tmp_policy_settings_dir "${policy_settings_dir:-}"
     teardown_common "${node}" "${node_start_time:-}"
     kubectl delete --ignore-not-found pvc trusted-pvc
     kubectl delete --ignore-not-found pv trusted-block-pv

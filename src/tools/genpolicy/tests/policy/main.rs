@@ -291,6 +291,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_container_cgroup_mount_extras() {
+        runtests("createcontainer/cgroup_mount_extras").await;
+    }
+
+    #[tokio::test]
     async fn test_state_create_container() {
         runtests("state/createcontainer").await;
     }
@@ -338,5 +343,15 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_gpu_vfio_cdi() {
         runtests("createcontainer/gpu_vfio_cdi").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_ignored_fields() {
+        runtests("createcontainer/ignored_fields").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_env_vars() {
+        runtests("createcontainer/env_vars").await;
     }
 }

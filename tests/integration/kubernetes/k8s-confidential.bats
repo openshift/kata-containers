@@ -19,7 +19,6 @@ setup() {
 }
 
 @test "Test unencrypted confidential container launch success and verify that we are running in a secure enclave." {
-	[[ " ${SUPPORTED_NON_TEE_HYPERVISORS} " =~ " ${KATA_HYPERVISOR} " ]] && skip "Test not supported for ${KATA_HYPERVISOR}."
 	# Start the service/deployment/pod
 	kubectl apply -f "${pod_config_dir}/pod-confidential-unencrypted.yaml"
 
@@ -49,7 +48,7 @@ teardown() {
 	if ! is_confidential_hardware; then
 		skip "Test is supported only on confidential hardware (which ${KATA_HYPERVISOR} is not)"
 	fi
-	
+
 	kubectl describe "pod/${pod_name}" || true
 	kubectl delete -f "${pod_config_dir}/pod-confidential-unencrypted.yaml" || true
 	teardown_common "${node}" "${node_start_time:-}"

@@ -10,12 +10,12 @@ use crate::ch::utils::get_vsock_path;
 use crate::kernel_param::KernelParams;
 use crate::selinux;
 use crate::utils::create_dir_all_with_inherit_owner;
+use crate::utils::remove_dir_all_if_exists;
 use crate::utils::set_groups;
 use crate::utils::vm_cleanup;
 use crate::utils::{bytes_to_megs, get_jailer_root, get_sandbox_path, megs_to_bytes};
 use crate::MemoryConfig;
 use crate::VM_ROOTFS_DRIVER_BLK;
-use crate::VM_ROOTFS_DRIVER_PMEM;
 use crate::{VcpuThreadIds, VmmState};
 use anyhow::{anyhow, Context, Result};
 use ch_config::ch_api::cloud_hypervisor_vm_netdev_add_with_fds;
@@ -44,7 +44,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
-use std::fs::remove_dir_all;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -58,7 +57,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
-const CH_NAME: &str = "cloud-hypervisor";
+const CH_NAME: &str = "clh";
 
 /// Number of milliseconds to wait before retrying a CH operation.
 const CH_POLL_TIME_MS: u64 = 50;
@@ -130,12 +129,8 @@ impl CloudHypervisorInner {
         let confidential_guest = cfg.security_info.confidential_guest;
 
         // Note that the configuration option hypervisor.block_device_driver is not used.
-        let rootfs_driver = if confidential_guest {
-            // PMEM is not available with TDX.
-            VM_ROOTFS_DRIVER_BLK
-        } else {
-            VM_ROOTFS_DRIVER_PMEM
-        };
+        // NVDIMM is not supported for Cloud Hypervisor.
+        let rootfs_driver = VM_ROOTFS_DRIVER_BLK;
 
         let rootfs_type = match cfg.boot_info.rootfs_type.is_empty() {
             true => DEFAULT_CH_ROOTFS_TYPE,
@@ -151,7 +146,12 @@ impl CloudHypervisorInner {
         #[cfg(target_arch = "aarch64")]
         let console_param_debug = KernelParams::from_string("console=ttyAMA0,115200n8");
 
-        let mut rootfs_param = KernelParams::new_rootfs_kernel_params(rootfs_driver, rootfs_type)?;
+        let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+            &cfg.boot_info.kernel_verity_params,
+            rootfs_driver,
+            rootfs_type,
+            true,
+        )?;
 
         let mut console_params = if enable_debug {
             if confidential_guest {
@@ -165,8 +165,7 @@ impl CloudHypervisorInner {
 
         params.append(&mut console_params);
 
-        // Add the rootfs device
-        params.append(&mut rootfs_param);
+        params.append(&mut rootfs_params);
 
         // Now add some additional options required for CH
         let extra_options = [
@@ -188,12 +187,8 @@ impl CloudHypervisorInner {
     }
 
     async fn boot_vm(&mut self) -> Result<()> {
-        let (shared_fs_devices, network_devices, host_devices) = self.get_shared_devices().await?;
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
+        let (shared_fs_devices, network_devices, host_devices, protection_device) =
+            self.get_shared_devices().await?;
 
         let sandbox_path = get_sandbox_path(&self.id);
 
@@ -218,6 +213,7 @@ impl CloudHypervisorInner {
             guest_protection_to_use: self.guest_protection_to_use.clone(),
             shared_fs_devices,
             host_devices,
+            protection_device,
             ..Default::default()
         };
 
@@ -230,9 +226,7 @@ impl CloudHypervisorInner {
             "CH specific VmConfig configuration (JSON): {:?}", serialised
         );
 
-        let response =
-            cloud_hypervisor_vm_create(socket.try_clone().context("failed to clone socket")?, cfg)
-                .await?;
+        let response = cloud_hypervisor_vm_create(&self.api_socket, cfg).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "vm boot response: {:?}", detail);
@@ -241,13 +235,10 @@ impl CloudHypervisorInner {
         if let Some(network_devices) = network_devices {
             for net in network_devices {
                 let vm_fds = net.fds.clone().unwrap_or_default();
-                let response = cloud_hypervisor_vm_netdev_add_with_fds(
-                    socket.try_clone().context("failed to clone socket")?,
-                    net,
-                    vm_fds.clone(),
-                )
-                .await
-                .context("failed to add vm netdev with fds")?;
+                let response =
+                    cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, net, vm_fds.clone())
+                        .await
+                        .context("failed to add vm netdev with fds")?;
 
                 if let Some(detail) = response {
                     debug!(sl!(), "vm netdev add response: {:?}", detail);
@@ -260,9 +251,7 @@ impl CloudHypervisorInner {
             }
         }
 
-        let response =
-            cloud_hypervisor_vm_start(socket.try_clone().context("failed to clone socket")?)
-                .await?;
+        let response = cloud_hypervisor_vm_start(&self.api_socket).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "vm start response: {:?}", detail);
@@ -309,7 +298,7 @@ impl CloudHypervisorInner {
 
         let api_socket = result?;
 
-        self.api_socket = Some(api_socket);
+        *self.api_socket.lock().await = Some(api_socket);
 
         Ok(())
     }
@@ -383,12 +372,8 @@ impl CloudHypervisorInner {
         }
 
         let netns = self.netns.clone();
-        if self.netns.is_some() {
-            info!(
-                sl!(),
-                "set netns for vmm : {:?}",
-                self.netns.as_ref().unwrap()
-            );
+        if let Some(netns_ref) = &self.netns {
+            info!(sl!(), "set netns for vmm : {:?}", netns_ref);
         }
 
         let user: Option<RootlessUser> = if is_rootless() {
@@ -469,14 +454,9 @@ impl CloudHypervisorInner {
     }
 
     async fn cloud_hypervisor_shutdown(&mut self) -> Result<()> {
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
-        let response =
-            cloud_hypervisor_vmm_shutdown(socket.try_clone().context("shutdown failed")?).await?;
+        let response = cloud_hypervisor_vmm_shutdown(&self.api_socket)
+            .await
+            .context("shutdown failed")?;
 
         if let Some(detail) = response {
             debug!(sl!(), "shutdown response: {:?}", detail);
@@ -562,17 +542,10 @@ impl CloudHypervisorInner {
     }
 
     async fn cloud_hypervisor_ping_until_ready(&mut self, _poll_time_ms: u64) -> Result<()> {
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
         loop {
-            let response =
-                cloud_hypervisor_vmm_ping(socket.try_clone().context("failed to clone socket")?)
-                    .await
-                    .context("ping failed");
+            let response = cloud_hypervisor_vmm_ping(&self.api_socket)
+                .await
+                .context("ping failed");
 
             if let Ok(response) = response {
                 if let Some(detail) = response {
@@ -751,7 +724,9 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "CloudHypervisor::cleanup()");
-        remove_dir_all(get_rootless_symlink_sandbox_path(self.id.as_str()))?;
+        if is_rootless() {
+            remove_dir_all_if_exists(get_rootless_symlink_sandbox_path(self.id.as_str()).as_str())?;
+        }
         vm_cleanup(&self.config, self.vm_path.as_str())
     }
 
@@ -780,23 +755,14 @@ impl CloudHypervisorInner {
             return Ok((old_vcpus, new_vcpus));
         }
 
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
         let vmresize = VmResize {
             desired_vcpus: Some(new_vcpus as u8),
             ..Default::default()
         };
 
-        cloud_hypervisor_vm_resize(
-            socket.try_clone().context("failed to clone socket")?,
-            vmresize,
-        )
-        .await
-        .context("resize vcpus")?;
+        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
+            .await
+            .context("resize vcpus")?;
 
         Ok((old_vcpus, new_vcpus))
     }
@@ -875,16 +841,9 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn resize_memory(&self, new_mem_mb: u32) -> Result<(u32, MemoryConfig)> {
-        let socket = self
-            .api_socket
-            .as_ref()
-            .ok_or("missing socket")
-            .map_err(|e| anyhow!(e))?;
-
-        let vminfo =
-            cloud_hypervisor_vm_info(socket.try_clone().context("failed to clone socket")?)
-                .await
-                .context("get vminfo")?;
+        let vminfo = cloud_hypervisor_vm_info(&self.api_socket)
+            .await
+            .context("get vminfo")?;
 
         let current_mem_size = vminfo.config.memory.size;
         let new_total_mem = megs_to_bytes(new_mem_mb);
@@ -952,12 +911,9 @@ impl CloudHypervisorInner {
             ..Default::default()
         };
 
-        cloud_hypervisor_vm_resize(
-            socket.try_clone().context("failed to clone socket")?,
-            vmresize,
-        )
-        .await
-        .context("resize memory")?;
+        cloud_hypervisor_vm_resize(&self.api_socket, vmresize)
+            .await
+            .context("resize memory")?;
 
         Ok((new_mem_mb, MemoryConfig::default()))
     }
@@ -1101,7 +1057,7 @@ fn get_guest_protection() -> Result<GuestProtection> {
     Ok(guest_protection)
 }
 
-// Return a TID/VCPU map from a specified /proc/{pid} path.
+// Return a VCPU/TID map from a specified /proc/{pid} path.
 fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
     const VCPU_STR: &str = "vcpu";
 
@@ -1144,7 +1100,7 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
             .parse::<u32>()
             .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
 
-        vcpus.insert(tid, vcpu_id);
+        vcpus.insert(vcpu_id, tid);
     }
 
     if vcpus.is_empty() {
@@ -1609,5 +1565,66 @@ mod tests {
 
             assert!(actual_error == expected_error, "{}", msg);
         }
+    }
+
+    #[actix_rt::test]
+    async fn test_get_ch_vcpu_tids_mapping() {
+        let tmp_dir = Builder::new().prefix("fake-proc-pid").tempdir().unwrap();
+        let task_dir = tmp_dir.path().join("task");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        #[derive(Debug)]
+        struct ThreadInfo<'a> {
+            tid: &'a str,
+            comm: &'a str,
+        }
+
+        let threads = &[
+            // Non-vcpu thread, should be skipped.
+            ThreadInfo {
+                tid: "1000",
+                comm: "main_thread\n",
+            },
+            ThreadInfo {
+                tid: "2001",
+                comm: "vcpu0\n",
+            },
+            ThreadInfo {
+                tid: "2002",
+                comm: "vcpu1\n",
+            },
+            ThreadInfo {
+                tid: "2003",
+                comm: "vcpu2\n",
+            },
+        ];
+
+        for t in threads {
+            let tid_dir = task_dir.join(t.tid);
+            fs::create_dir_all(&tid_dir).unwrap();
+            fs::write(tid_dir.join("comm"), t.comm).unwrap();
+        }
+
+        let proc_path = tmp_dir.path().to_str().unwrap();
+        let result = get_ch_vcpu_tids(proc_path);
+
+        let msg = format!("result: {result:?}");
+
+        if std::env::var("DEBUG").is_ok() {
+            println!("DEBUG: {msg}");
+        }
+
+        let vcpus = result.unwrap();
+
+        // The mapping must be vcpu_id -> tid.
+        assert_eq!(vcpus.len(), 3, "non-vcpu threads should be excluded");
+        assert_eq!(vcpus[&0], 2001, "vcpu 0 should map to tid 2001");
+        assert_eq!(vcpus[&1], 2002, "vcpu 1 should map to tid 2002");
+        assert_eq!(vcpus[&2], 2003, "vcpu 2 should map to tid 2003");
+
+        assert!(
+            !vcpus.contains_key(&1000),
+            "non-vcpu thread should not be in the map"
+        );
     }
 }

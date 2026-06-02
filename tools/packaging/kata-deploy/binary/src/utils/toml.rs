@@ -15,9 +15,9 @@ fn parse_toml_path(path: &str) -> Result<Vec<String>> {
     let mut parts = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = path.chars().peekable();
+    let chars = path.chars().peekable();
 
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         match ch {
             '"' => {
                 in_quotes = !in_quotes;
@@ -50,12 +50,45 @@ fn parse_toml_path(path: &str) -> Result<Vec<String>> {
     Ok(parts)
 }
 
+/// K3s/RKE2 containerd config templates start with a Go template directive that
+/// is not valid TOML. This helper strips it before parsing and returns it so we
+/// can prepend it back when writing.
+fn split_non_toml_header(content: &str) -> (&str, &str) {
+    if content.starts_with("{{") {
+        if let Some(pos) = content.find('\n') {
+            return (&content[..=pos], &content[pos + 1..]);
+        }
+        return (content, "");
+    }
+    ("", content)
+}
+
+/// Write a TOML file with an optional non-TOML header (e.g. K3s template line).
+/// Ensures the header ends with a newline before the TOML body.
+/// Trims leading newlines from the serialized document to avoid many blank lines
+/// when the file was initially empty (e.g. containerd drop-in).
+fn write_toml_with_header(file_path: &Path, header: &str, doc: &DocumentMut) -> Result<()> {
+    let normalized_header = if header.is_empty() {
+        String::new()
+    } else if header.ends_with('\n') {
+        header.to_string()
+    } else {
+        format!("{header}\n")
+    };
+    let body = doc.to_string();
+    let body_trimmed = body.trim_start_matches('\n');
+    std::fs::write(file_path, format!("{}{}", normalized_header, body_trimmed))
+        .with_context(|| format!("Failed to write TOML file: {file_path:?}"))?;
+    Ok(())
+}
+
 /// Set a TOML value at a given path (e.g., ".plugins.cri.containerd.runtimes.kata.runtime_type")
 pub fn set_toml_value(file_path: &Path, path: &str, value: &str) -> Result<()> {
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let mut doc = content
+    let (header, toml_content) = split_non_toml_header(&content);
+    let mut doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -83,8 +116,7 @@ pub fn set_toml_value(file_path: &Path, path: &str, value: &str) -> Result<()> {
         }
     }
 
-    std::fs::write(file_path, doc.to_string())
-        .with_context(|| format!("Failed to write TOML file: {file_path:?}"))?;
+    write_toml_with_header(file_path, header, &doc)?;
 
     Ok(())
 }
@@ -94,7 +126,8 @@ pub fn get_toml_value(file_path: &Path, path: &str) -> Result<String> {
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let doc = content
+    let (_header, toml_content) = split_non_toml_header(&content);
+    let doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -161,7 +194,8 @@ pub fn append_to_toml_array(file_path: &Path, path: &str, value: &str) -> Result
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let mut doc = content
+    let (header, toml_content) = split_non_toml_header(&content);
+    let mut doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -176,7 +210,10 @@ pub fn append_to_toml_array(file_path: &Path, path: &str, value: &str) -> Result
             // This is the array itself - use .get() to avoid panic on missing key
             let key_exists = current.get(part.as_str()).is_some();
             if !key_exists {
-                current.insert(part.as_str(), Item::Value(Value::Array(toml_edit::Array::new())));
+                current.insert(
+                    part.as_str(),
+                    Item::Value(Value::Array(toml_edit::Array::new())),
+                );
             }
             if let Some(Item::Value(Value::Array(arr))) = current.get_mut(part.as_str()) {
                 let value_item = parse_toml_value(value);
@@ -214,8 +251,7 @@ pub fn append_to_toml_array(file_path: &Path, path: &str, value: &str) -> Result
         }
     }
 
-    std::fs::write(file_path, doc.to_string())
-        .with_context(|| format!("Failed to write TOML file: {file_path:?}"))?;
+    write_toml_with_header(file_path, header, &doc)?;
 
     Ok(())
 }
@@ -225,7 +261,8 @@ pub fn remove_from_toml_array(file_path: &Path, path: &str, value: &str) -> Resu
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let mut doc = content
+    let (header, toml_content) = split_non_toml_header(&content);
+    let mut doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -265,8 +302,7 @@ pub fn remove_from_toml_array(file_path: &Path, path: &str, value: &str) -> Resu
         }
     }
 
-    std::fs::write(file_path, doc.to_string())
-        .with_context(|| format!("Failed to write TOML file: {file_path:?}"))?;
+    write_toml_with_header(file_path, header, &doc)?;
 
     Ok(())
 }
@@ -276,7 +312,8 @@ pub fn get_toml_array(file_path: &Path, path: &str) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let doc = content
+    let (_header, toml_content) = split_non_toml_header(&content);
+    let doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -319,7 +356,8 @@ pub fn set_toml_array(file_path: &Path, path: &str, values: &[String]) -> Result
     let content = std::fs::read_to_string(file_path)
         .with_context(|| format!("Failed to read TOML file: {file_path:?}"))?;
 
-    let mut doc = content
+    let (header, toml_content) = split_non_toml_header(&content);
+    let mut doc = toml_content
         .parse::<DocumentMut>()
         .context("Failed to parse TOML")?;
 
@@ -348,44 +386,9 @@ pub fn set_toml_array(file_path: &Path, path: &str, values: &[String]) -> Result
         }
     }
 
-    std::fs::write(file_path, doc.to_string())
-        .with_context(|| format!("Failed to write TOML file: {file_path:?}"))?;
+    write_toml_with_header(file_path, header, &doc)?;
 
     Ok(())
-}
-
-/// Append a string to a TOML string value (e.g., kernel_params)
-/// This function is idempotent - it won't duplicate existing values
-pub fn append_to_toml_string(file_path: &Path, path: &str, append_value: &str) -> Result<()> {
-    let current_value = get_toml_value(file_path, path).unwrap_or_else(|_| String::new());
-    let current_value = current_value.trim().trim_matches('"');
-
-    // Split current value into tokens and check if append_value already exists
-    let tokens: Vec<&str> = current_value.split_whitespace().collect();
-    let append_trimmed = append_value.trim();
-
-    // Check if the value (or any param with same key) already exists
-    let value_already_exists = if append_trimmed.contains('=') {
-        // For key=value params, check if the key already exists
-        let append_key = append_trimmed.split('=').next().unwrap();
-        tokens
-            .iter()
-            .any(|token| token.contains('=') && token.split('=').next().unwrap() == append_key)
-    } else {
-        // For simple values, check exact match
-        tokens.contains(&append_trimmed)
-    };
-
-    let new_value = if current_value.is_empty() {
-        append_trimmed.to_string()
-    } else if value_already_exists {
-        // Value already exists, don't append (idempotency)
-        current_value.to_string()
-    } else {
-        format!("{} {}", current_value, append_trimmed)
-    };
-
-    set_toml_value(file_path, path, &format!("\"{new_value}\""))
 }
 
 fn parse_toml_value(value: &str) -> Item {
@@ -428,7 +431,179 @@ fn parse_toml_value(value: &str) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use tempfile::NamedTempFile;
+
+    // --- split_non_toml_header ---
+
+    #[rstest]
+    #[case("", "", "")]
+    #[case("key = \"value\"\n", "", "key = \"value\"\n")]
+    #[case("[plugins]\nfoo = 1\n", "", "[plugins]\nfoo = 1\n")]
+    #[case("{{ template \"base\" . }}\n", "{{ template \"base\" . }}\n", "")]
+    #[case(
+        "{{ template \"base\" . }}\n[plugins]\nfoo = 1\n",
+        "{{ template \"base\" . }}\n",
+        "[plugins]\nfoo = 1\n"
+    )]
+    #[case(
+        "{{ template \"base\" . }}\n\n[debug]\nlevel = \"debug\"\n",
+        "{{ template \"base\" . }}\n",
+        "\n[debug]\nlevel = \"debug\"\n"
+    )]
+    // No trailing newline after the template line
+    #[case("{{ template \"base\" . }}", "{{ template \"base\" . }}", "")]
+    fn test_split_non_toml_header(
+        #[case] input: &str,
+        #[case] expected_header: &str,
+        #[case] expected_toml: &str,
+    ) {
+        let (header, toml) = split_non_toml_header(input);
+        assert_eq!(
+            header, expected_header,
+            "header mismatch for input: {:?}",
+            input
+        );
+        assert_eq!(toml, expected_toml, "toml mismatch for input: {:?}", input);
+    }
+
+    // --- TOML operations on files with K3s/RKE2 base template header ---
+
+    #[rstest]
+    fn test_set_toml_value_with_k3s_header() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "{{ template \"base\" . }}\n").unwrap();
+
+        set_toml_value(
+            path,
+            ".plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.kata-qemu.runtime_type",
+            "\"io.containerd.kata-qemu.v2\"",
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.starts_with("{{ template \"base\" . }}\n"),
+            "header must be preserved"
+        );
+        assert!(content.contains("runtime_type"), "value must be written");
+
+        let value = get_toml_value(
+            path,
+            ".plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.kata-qemu.runtime_type",
+        )
+        .unwrap();
+        assert_eq!(value, "io.containerd.kata-qemu.v2");
+    }
+
+    #[rstest]
+    fn test_set_toml_value_with_k3s_header_idempotent() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "{{ template \"base\" . }}\n").unwrap();
+
+        for _ in 0..3 {
+            set_toml_value(path, ".debug.level", "\"debug\"").unwrap();
+        }
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            content.matches("{{ template \"base\" . }}").count(),
+            1,
+            "header must appear exactly once"
+        );
+        let value = get_toml_value(path, ".debug.level").unwrap();
+        assert_eq!(value, "debug");
+    }
+
+    #[rstest]
+    fn test_append_to_toml_array_with_k3s_header() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "{{ template \"base\" . }}\nimports = []\n").unwrap();
+
+        append_to_toml_array(path, ".imports", "\"/etc/containerd/conf.d/kata.toml\"").unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.starts_with("{{ template \"base\" . }}\n"));
+        assert!(content.contains("/etc/containerd/conf.d/kata.toml"));
+    }
+
+    #[rstest]
+    fn test_remove_from_toml_array_with_k3s_header() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(
+            path,
+            "{{ template \"base\" . }}\nimports = [\"/path/a\", \"/path/b\"]\n",
+        )
+        .unwrap();
+
+        remove_from_toml_array(path, ".imports", "\"/path/a\"").unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.starts_with("{{ template \"base\" . }}\n"));
+        assert!(!content.contains("/path/a"));
+        assert!(content.contains("/path/b"));
+    }
+
+    #[rstest]
+    fn test_set_toml_array_with_k3s_header() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "{{ template \"base\" . }}\n").unwrap();
+
+        set_toml_array(
+            path,
+            ".imports",
+            &["/path/one".to_string(), "/path/two".to_string()],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.starts_with("{{ template \"base\" . }}\n"));
+        let values = get_toml_array(path, ".imports").unwrap();
+        assert_eq!(values, vec!["/path/one", "/path/two"]);
+    }
+
+    #[rstest]
+    fn test_multiple_runtimes_with_k3s_header() {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, "{{ template \"base\" . }}\n").unwrap();
+
+        let pluginid = "\"io.containerd.cri.v1.runtime\"";
+        for shim in &["kata-qemu", "kata-clh"] {
+            let table = format!(".plugins.{pluginid}.containerd.runtimes.{shim}");
+            set_toml_value(
+                path,
+                &format!("{table}.runtime_type"),
+                &format!("\"io.containerd.{shim}.v2\""),
+            )
+            .unwrap();
+            set_toml_value(
+                path,
+                &format!("{table}.privileged_without_host_devices"),
+                "true",
+            )
+            .unwrap();
+        }
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.starts_with("{{ template \"base\" . }}\n"));
+        assert!(content.contains("kata-qemu"));
+        assert!(content.contains("kata-clh"));
+
+        for shim in &["kata-qemu", "kata-clh"] {
+            let rt = get_toml_value(
+                path,
+                &format!(".plugins.{pluginid}.containerd.runtimes.{shim}.runtime_type"),
+            )
+            .unwrap();
+            assert_eq!(rt, format!("io.containerd.{shim}.v2"));
+        }
+    }
 
     #[test]
     fn test_set_toml_value() {
@@ -444,6 +619,40 @@ mod tests {
         .unwrap();
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("runtime_type"));
+    }
+
+    #[rstest]
+    #[case("", "")]
+    #[case("{{ template \"base\" . }}\n", "{{ template \"base\" . }}\n")]
+    fn test_set_toml_value_empty_file_no_leading_newlines(
+        #[case] initial_content: &str,
+        #[case] expected_prefix: &str,
+    ) {
+        let file = NamedTempFile::new().unwrap();
+        let path = file.path();
+        std::fs::write(path, initial_content).unwrap();
+
+        set_toml_value(
+            path,
+            ".plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.kata-qemu.runtime_type",
+            "\"io.containerd.kata-qemu.v2\"",
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.starts_with(expected_prefix),
+            "header/prefix must be preserved"
+        );
+        let body_start = content.strip_prefix(expected_prefix).unwrap();
+        assert!(
+            !body_start.starts_with('\n'),
+            "written TOML body must not start with newline(s) after header, got {} leading newlines",
+            body_start.chars().take_while(|&c| c == '\n').count()
+        );
+        assert!(
+            body_start.trim_start().starts_with('['),
+            "body should start with a TOML table"
+        );
     }
 
     #[test]
@@ -558,38 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn test_append_to_toml_string() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        std::fs::write(
-            path,
-            "[hypervisor]\n[hypervisor.qemu]\nkernel_params = \"param1 param2\"\n",
-        )
-        .unwrap();
-
-        append_to_toml_string(path, "hypervisor.qemu.kernel_params", "param3").unwrap();
-
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.contains("param1 param2 param3"));
-    }
-
-    #[test]
-    fn test_append_to_toml_string_empty() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        std::fs::write(
-            path,
-            "[hypervisor]\n[hypervisor.qemu]\nkernel_params = \"\"\n",
-        )
-        .unwrap();
-
-        append_to_toml_string(path, "hypervisor.qemu.kernel_params", "first_param").unwrap();
-
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.contains("first_param"));
-    }
-
-    #[test]
     fn test_hierarchical_toml_paths() {
         let file = NamedTempFile::new().unwrap();
         let path = file.path();
@@ -610,24 +787,18 @@ mod tests {
         assert_eq!(agent_debug, "false");
     }
 
-    #[test]
-    fn test_toml_value_types() {
+    #[rstest]
+    #[case("test.string_value", "test_string", "test_string")]
+    #[case("test.bool_value", "true", "true")]
+    #[case("test.int_value", "42", "42")]
+    fn test_toml_value_types(#[case] path: &str, #[case] value: &str, #[case] expected: &str) {
         let file = NamedTempFile::new().unwrap();
-        let path = file.path();
-        std::fs::write(path, "").unwrap();
+        let file_path = file.path();
+        std::fs::write(file_path, "").unwrap();
 
-        // Test different value types
-        set_toml_value(path, "test.string_value", "test_string").unwrap();
-        set_toml_value(path, "test.bool_value", "true").unwrap();
-        set_toml_value(path, "test.int_value", "42").unwrap();
-
-        let string_val = get_toml_value(path, "test.string_value").unwrap();
-        let bool_val = get_toml_value(path, "test.bool_value").unwrap();
-        let int_val = get_toml_value(path, "test.int_value").unwrap();
-
-        assert_eq!(string_val, "test_string");
-        assert_eq!(bool_val, "true");
-        assert_eq!(int_val, "42");
+        set_toml_value(file_path, path, value).unwrap();
+        let got = get_toml_value(file_path, path).unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -661,12 +832,15 @@ mod tests {
                 );
 
                 // Test modifying kernel_params on real config
-                let result = append_to_toml_string(
+                let current =
+                    get_toml_value(temp_path, "hypervisor.qemu.kernel_params").unwrap_or_default();
+                let new_value = format!("{} agent.log=debug", current.trim_matches('"'));
+                let result = set_toml_value(
                     temp_path,
                     "hypervisor.qemu.kernel_params",
-                    "agent.log=debug",
+                    &format!("\"{}\"", new_value),
                 );
-                assert!(result.is_ok(), "Should be able to append to kernel_params");
+                assert!(result.is_ok(), "Should be able to set kernel_params");
 
                 // Test enabling debug on real config
                 let result = set_toml_value(temp_path, "hypervisor.qemu.enable_debug", "true");
@@ -765,19 +939,11 @@ kernel_params = "console=hvc0"
         )
         .unwrap();
 
-        // Add https_proxy
-        append_to_toml_string(
+        // Set kernel_params with proxy settings
+        set_toml_value(
             path,
             "hypervisor.qemu.kernel_params",
-            "agent.https_proxy=http://proxy.example.com:8080",
-        )
-        .unwrap();
-
-        // Add no_proxy
-        append_to_toml_string(
-            path,
-            "hypervisor.qemu.kernel_params",
-            "agent.no_proxy=localhost,127.0.0.1",
+            "\"console=hvc0 agent.https_proxy=http://proxy.example.com:8080 agent.no_proxy=localhost,127.0.0.1\"",
         )
         .unwrap();
 
@@ -787,14 +953,14 @@ kernel_params = "console=hvc0"
     }
 
     #[test]
-    fn test_runtime_rs_cloud_hypervisor_config() {
-        // Test with actual cloud-hypervisor config from runtime-rs
+    fn test_runtime_rs_clh_config() {
+        // Test with actual clh config from runtime-rs
         let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
-            .map(|p| p.join("src/runtime-rs/config/configuration-cloud-hypervisor.toml.in"));
+            .map(|p| p.join("src/runtime-rs/config/configuration-clh-runtime-rs.toml.in"));
 
         if let Some(ref path) = config_path {
             if path.exists() {
@@ -830,7 +996,7 @@ kernel_params = "console=hvc0"
                     .replace("@DEFVIRTIOFSEXTRAARGS@", "[]")
                     .replace("@DEFVIRTIOFSDAEMON@", "virtiofsd")
                     .replace("@DEFSHAREDFS_CLH_VIRTIOFS@", "virtio-fs")
-                    .replace("@HYPERVISOR_CLH@", "cloud-hypervisor")
+                    .replace("@HYPERVISOR_NAME_CLH@", "clh")
                     .replace("@PROJECT_NAME@", "kata-containers")
                     .replace("@PROJECT_TYPE@", "kata")
                     .replace("@RUNTIMENAME@", "kata-runtime")
@@ -852,24 +1018,19 @@ kernel_params = "console=hvc0"
                 let temp_path = temp_file.path();
                 std::fs::write(temp_path, content).unwrap();
 
-                // Verify cloud-hypervisor specific fields exist
-                let vm_rootfs =
-                    get_toml_value(temp_path, "hypervisor.cloud-hypervisor.vm_rootfs_driver");
+                // Verify clh-specific fields exist
+                let vm_rootfs = get_toml_value(temp_path, "hypervisor.clh.vm_rootfs_driver");
                 assert!(
                     vm_rootfs.is_ok(),
                     "Should have vm_rootfs_driver field: {:?}",
                     vm_rootfs.err()
                 );
 
-                // Test modifying cloud-hypervisor config
-                let result = set_toml_value(
-                    temp_path,
-                    "hypervisor.cloud-hypervisor.enable_debug",
-                    "true",
-                );
+                // Test modifying clh config
+                let result = set_toml_value(temp_path, "hypervisor.clh.enable_debug", "true");
                 assert!(
                     result.is_ok(),
-                    "Should be able to set enable_debug on cloud-hypervisor config"
+                    "Should be able to set enable_debug on clh config"
                 );
             }
         }
@@ -948,13 +1109,16 @@ kernel_params = "console=hvc0"
                     rootfs.err()
                 );
 
-                // Test adding debug parameters
-                let result = append_to_toml_string(
+                // Test setting kernel parameters
+                let current = get_toml_value(temp_path, "hypervisor.dragonball.kernel_params")
+                    .unwrap_or_default();
+                let new_value = format!("{} agent.log=debug", current.trim_matches('"'));
+                let result = set_toml_value(
                     temp_path,
                     "hypervisor.dragonball.kernel_params",
-                    "agent.log=debug",
+                    &format!("\"{}\"", new_value),
                 );
-                assert!(result.is_ok(), "Should append to kernel_params");
+                assert!(result.is_ok(), "Should set kernel_params");
             }
         }
     }
@@ -973,7 +1137,7 @@ kernel_params = "console=hvc0"
             let go_config = base.join("src/runtime/config/configuration-qemu.toml.in");
             // Rust runtime config
             let rust_config =
-                base.join("src/runtime-rs/config/configuration-cloud-hypervisor.toml.in");
+                base.join("src/runtime-rs/config/configuration-clh-runtime-rs.toml.in");
 
             if go_config.exists() && rust_config.exists() {
                 // Create temp copies
@@ -1141,17 +1305,24 @@ kernel_params = "console=hvc0"
             .contains("Failed to read TOML file"));
     }
 
-    #[test]
-    fn test_get_toml_value_invalid_toml() {
+    #[rstest]
+    #[case("get")]
+    #[case("set")]
+    fn test_invalid_toml(#[case] op: &str) {
         let temp_file = NamedTempFile::new().unwrap();
         let temp_path = temp_file.path();
-
-        // Write invalid TOML
         std::fs::write(temp_path, "this is not [ valid toml {").unwrap();
 
-        let result = get_toml_value(temp_path, "some.path");
-        assert!(result.is_err(), "Should fail parsing invalid TOML");
-        // Just verify it's an error, don't check specific message
+        let result = match op {
+            "get" => get_toml_value(temp_path, "some.path").map(drop),
+            "set" => set_toml_value(temp_path, "some.path", "\"value\""),
+            _ => panic!("unknown op"),
+        };
+        assert!(
+            result.is_err(),
+            "Should fail parsing invalid TOML (op={})",
+            op
+        );
     }
 
     #[test]
@@ -1177,18 +1348,6 @@ kernel_params = "console=hvc0"
     }
 
     #[test]
-    fn test_set_toml_value_invalid_toml() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let temp_path = temp_file.path();
-
-        // Write invalid TOML
-        std::fs::write(temp_path, "this is not [ valid toml {").unwrap();
-
-        let result = set_toml_value(temp_path, "some.path", "\"value\"");
-        assert!(result.is_err(), "Should fail parsing invalid TOML");
-    }
-
-    #[test]
     fn test_append_to_toml_array_nonexistent_file() {
         let result = append_to_toml_array(
             Path::new("/nonexistent/file.toml"),
@@ -1198,30 +1357,25 @@ kernel_params = "console=hvc0"
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_append_to_toml_array_not_an_array() {
+    #[rstest]
+    #[case("append")]
+    #[case("get")]
+    fn test_toml_array_not_an_array(#[case] op: &str) {
         let temp_file = NamedTempFile::new().unwrap();
         let temp_path = temp_file.path();
-
-        // Write TOML with a string, not an array
         std::fs::write(temp_path, "[section]\nkey = \"value\"").unwrap();
 
-        let result = append_to_toml_array(temp_path, "section.key", "\"item\"");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not an array"));
-    }
-
-    #[test]
-    fn test_get_toml_array_not_an_array() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let temp_path = temp_file.path();
-
-        // Write TOML with a string, not an array
-        std::fs::write(temp_path, "[section]\nkey = \"value\"").unwrap();
-
-        let result = get_toml_array(temp_path, "section.key");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not an array"));
+        let result = match op {
+            "append" => append_to_toml_array(temp_path, "section.key", "\"item\"").map(drop),
+            "get" => get_toml_array(temp_path, "section.key").map(drop),
+            _ => panic!("unknown op"),
+        };
+        assert!(result.is_err(), "op={}", op);
+        assert!(
+            result.unwrap_err().to_string().contains("not an array"),
+            "op={}",
+            op
+        );
     }
 
     #[test]
@@ -1244,46 +1398,6 @@ kernel_params = "console=hvc0"
         assert_eq!(value1, value2, "set_toml_value must be idempotent");
         // get_toml_value returns the value without TOML formatting quotes
         assert_eq!(value1, "/opt/kata/bin/qemu");
-    }
-
-    #[test]
-    fn test_append_to_toml_string_idempotent_with_duplicates() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let temp_path = temp_file.path();
-
-        // Initial TOML with kernel params
-        std::fs::write(
-            temp_path,
-            "[hypervisor.qemu]\nkernel_params = \"console=ttyS0\"\n",
-        )
-        .unwrap();
-
-        // Append first time
-        append_to_toml_string(
-            temp_path,
-            "hypervisor.qemu.kernel_params",
-            "agent.log=debug",
-        )
-        .unwrap();
-        let value1 = get_toml_value(temp_path, "hypervisor.qemu.kernel_params").unwrap();
-
-        // Append same value second time - should not duplicate
-        append_to_toml_string(
-            temp_path,
-            "hypervisor.qemu.kernel_params",
-            "agent.log=debug",
-        )
-        .unwrap();
-        let value2 = get_toml_value(temp_path, "hypervisor.qemu.kernel_params").unwrap();
-
-        // Should be identical (no duplication)
-        assert_eq!(
-            value1, value2,
-            "append_to_toml_string must not create duplicates"
-        );
-        assert!(value2.contains("console=ttyS0"));
-        assert!(value2.contains("agent.log=debug"));
-        assert_eq!(value2.matches("agent.log=debug").count(), 1);
     }
 
     #[test]

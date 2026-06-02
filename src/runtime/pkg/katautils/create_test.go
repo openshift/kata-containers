@@ -21,7 +21,6 @@ import (
 	config "github.com/kata-containers/kata-containers/src/runtime/pkg/device/config"
 	ktu "github.com/kata-containers/kata-containers/src/runtime/pkg/katatestutils"
 	"github.com/kata-containers/kata-containers/src/runtime/pkg/oci"
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/compatoci"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
@@ -142,7 +141,7 @@ func TestSetEphemeralStorageType(t *testing.T) {
 
 	ociMounts = append(ociMounts, mount)
 	ociSpec.Mounts = ociMounts
-	ociSpec = SetEphemeralStorageType(ociSpec, false)
+	ociSpec = SetEphemeralStorageType(ociSpec, false, vc.EmptyDirModeSharedFs)
 
 	mountType := ociSpec.Mounts[0].Type
 	assert.Equal(mountType, "ephemeral",
@@ -427,13 +426,15 @@ func TestVfioChecksClh(t *testing.T) {
 
 	// Check valid CLH vfio configs
 	f := func(coldPlug, hotPlug config.PCIePort) error {
-		return checkPCIeConfig(coldPlug, hotPlug, defaultMachineType, virtcontainers.ClhHypervisor)
+		return checkPCIeConfig(coldPlug, hotPlug, defaultMachineType, vc.ClhHypervisor)
 	}
 	assert.NoError(f(config.NoPort, config.NoPort))
 	assert.NoError(f(config.NoPort, config.RootPort))
+	assert.NoError(f(config.RootPort, config.NoPort))
 	assert.Error(f(config.RootPort, config.RootPort))
-	assert.Error(f(config.RootPort, config.NoPort))
 	assert.Error(f(config.NoPort, config.SwitchPort))
+	assert.Error(f(config.SwitchPort, config.NoPort))
+	assert.Error(f(config.BridgePort, config.NoPort))
 }
 
 func TestVfioCheckQemu(t *testing.T) {
@@ -441,7 +442,7 @@ func TestVfioCheckQemu(t *testing.T) {
 
 	// Check valid Qemu vfio configs
 	f := func(coldPlug, hotPlug config.PCIePort) error {
-		return checkPCIeConfig(coldPlug, hotPlug, defaultMachineType, virtcontainers.QemuHypervisor)
+		return checkPCIeConfig(coldPlug, hotPlug, defaultMachineType, vc.QemuHypervisor)
 	}
 
 	assert.NoError(f(config.NoPort, config.NoPort))

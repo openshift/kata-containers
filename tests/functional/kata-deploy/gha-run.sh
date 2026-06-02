@@ -10,6 +10,7 @@ set -o nounset
 set -o pipefail
 
 kata_deploy_dir="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=/dev/null
 source "${kata_deploy_dir}/../../gha-run-k8s-common.sh"
 
 function run_tests() {
@@ -18,6 +19,10 @@ function run_tests() {
 	pushd "${kata_deploy_dir}"
 	bash run-kata-deploy-tests.sh
 	popd
+}
+
+function report_tests() {
+	report_bats_tests "${kata_deploy_dir}"
 }
 
 function cleanup_runtimeclasses() {
@@ -45,6 +50,7 @@ function main() {
     export KATA_HOST_OS="${KATA_HOST_OS:-}"
 
     platform="aks"
+    # shellcheck disable=SC2154
     if [[ "${KATA_HYPERVISOR}" = "qemu-tdx" ]]; then
 	    platform="tdx"
     fi
@@ -59,6 +65,7 @@ function main() {
         install-kubectl) install_kubectl ;;
         get-cluster-credentials) get_cluster_credentials "kata-deploy" ;;
         run-tests) run_tests ;;
+        report-tests) report_tests ;;
         delete-cluster) cleanup "aks" "kata-deploy" ;;
         *) >&2 echo "Invalid argument"; exit 2 ;;
     esac

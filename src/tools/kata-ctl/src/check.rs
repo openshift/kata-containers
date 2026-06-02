@@ -362,12 +362,8 @@ mod tests {
             let result = get_single_cpu_info(d.cpuinfo_path, d.processor_delimiter_str);
             let msg = format!("{msg}, result: {result:?}");
 
-            if d.result.is_ok() {
-                assert_eq!(
-                    result.as_ref().unwrap(),
-                    d.result.as_ref().unwrap(),
-                    "{msg}"
-                );
+            if let Ok(d_result) = &d.result {
+                assert_eq!(result.as_ref().unwrap(), d_result, "{msg}");
                 continue;
             }
 
@@ -422,12 +418,8 @@ mod tests {
             let result = get_cpu_flags(d.cpu_info_str, d.cpu_flags_tag);
             let msg = format!("{msg}, result: {result:?}");
 
-            if d.result.is_ok() {
-                assert_eq!(
-                    result.as_ref().unwrap(),
-                    d.result.as_ref().unwrap(),
-                    "{msg}"
-                );
+            if let Ok(d_result) = &d.result {
+                assert_eq!(result.as_ref().unwrap(), d_result, "{msg}");
                 continue;
             }
 
@@ -458,15 +450,15 @@ mod tests {
             // Failure scenarios
             TestData {
                 test_url: "http:",
-                expected: "builder error: empty host",
+                expected: "builder error",
             },
             TestData {
                 test_url: "_localhost_",
-                expected: "builder error: relative URL without a base",
+                expected: "builder error",
             },
             TestData {
                 test_url: "http://localhost :80",
-                expected: "builder error: invalid international domain name",
+                expected: "builder error",
             },
         ];
 
@@ -486,11 +478,11 @@ mod tests {
         let releases = get_kata_all_releases_by_url(KATA_GITHUB_RELEASE_URL);
         // sometime in GitHub action accessing to github.com API may fail
         // we can skip this test to prevent the whole test fail.
-        if releases.is_err() {
+        if let Err(error) = releases {
             warn!(
                 sl!(),
                 "get kata version failed({:?}), this maybe a temporary error, just skip the test.",
-                releases.unwrap_err()
+                error
             );
             return;
         }

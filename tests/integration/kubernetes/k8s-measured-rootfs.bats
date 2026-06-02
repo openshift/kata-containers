@@ -9,18 +9,24 @@ load "${BATS_TEST_DIRNAME}/../../common.bash"
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
+case "${KATA_HYPERVISOR}" in
+	*-runtime-rs)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtime-rs/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+	*)
+		shim_config_file="/opt/kata/share/defaults/kata-containers/runtimes/${KATA_HYPERVISOR}/configuration-${KATA_HYPERVISOR}.toml"
+		;;
+esac
+
 check_and_skip() {
-	case "${KATA_HYPERVISOR}" in
-		qemu-tdx|qemu-coco-dev)
-			if [ "$(uname -m)" == "s390x" ]; then
-				skip "measured rootfs tests not implemented for s390x"
-			fi
-			return
-			;;
-		*)
-			skip "measured rootfs tests not implemented for hypervisor: $KATA_HYPERVISOR"
-			;;
-	esac
+	if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
+		if [[ "$(uname -m)" == "s390x" ]]; then
+			skip "measured rootfs tests not implemented for s390x"
+		fi
+		return
+	else
+		skip "measured rootfs tests not implemented for hypervisor: ${KATA_HYPERVISOR}"
+	fi
 }
 
 setup() {
@@ -29,26 +35,34 @@ setup() {
 	setup_common || die "setup_common failed"
 }
 
-@test "Test cannnot launch pod with measured boot enabled and incorrect hash" {
-	pod_config="$(new_pod_config nginx "kata-${KATA_HYPERVISOR}")"
+@test "Test cannot launch pod with measured boot enabled and incorrect hash" {
+	ensure_yq
+	nginx_registry=$(get_from_kata_deps ".docker_images.nginx.registry")
+	nginx_digest=$(get_from_kata_deps ".docker_images.nginx.digest")
+	nginx_image="${nginx_registry}@${nginx_digest}"
+
+	pod_config="$(new_pod_config "${nginx_image}" "kata-${KATA_HYPERVISOR}")"
 	auto_generate_policy "${pod_config_dir}" "${pod_config}"
 
 	incorrect_hash="1111111111111111111111111111111111111111111111111111111111111111"
 
-	# To avoid editing that file on the worker node, here it will be
-	# enabled via pod annotations.
+	# Read verity parameters from config, then override via annotations.
+	kernel_verity_params=$(exec_host "$node" "sed -n 's/^kernel_verity_params = \"\\(.*\\)\"/\\1/p' ${shim_config_file}" || true)
+	[ -n "${kernel_verity_params}" ] || die "Missing kernel_verity_params in ${shim_config_file}"
+
+	kernel_verity_params=$(printf '%s\n' "$kernel_verity_params" | sed -E "s/root_hash=[^,]*/root_hash=${incorrect_hash}/")
 	set_metadata_annotation "$pod_config" \
-		"io.katacontainers.config.hypervisor.kernel_params" \
-		"rootfs_verity.scheme=dm-verity rootfs_verity.hash=$incorrect_hash"
+		"io.katacontainers.config.hypervisor.kernel_verity_params" \
+		"${kernel_verity_params}"
 	# Run on a specific node so we know from where to inspect the logs
 	set_node "$pod_config" "$node"
 
 	# For debug sake
 	echo "Pod $pod_config file:"
 	cat $pod_config
-	kubectl apply -f $pod_config
 
-	waitForProcess "60" "3" "exec_host $node journalctl -t kata | grep \"verity: .* metadata block .* is corrupted\""
+	assert_pod_container_creating "$pod_config"
+	assert_logs_contain "$node" kata "${node_start_time}" "verity: .* metadata block .* is corrupted"
 }
 
 teardown() {

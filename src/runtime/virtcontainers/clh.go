@@ -332,6 +332,9 @@ func (clh *cloudHypervisor) getClhStopSandboxTimeout() time.Duration {
 func (clh *cloudHypervisor) setConfig(config *HypervisorConfig) error {
 	clh.config = *config
 
+	// We don't support NVDIMM with Cloud Hypervisor.
+	clh.config.DisableImageNvdimm = true
+
 	return nil
 }
 
@@ -466,8 +469,8 @@ func (clh *cloudHypervisor) enableProtection() error {
 	}
 }
 
-func getNonUserDefinedKernelParams(rootfstype string, disableNvdimm bool, dax bool, debug bool, confidential bool, iommu bool) ([]Param, error) {
-	params, err := GetKernelRootParams(rootfstype, disableNvdimm, dax)
+func getNonUserDefinedKernelParams(rootfstype string, disableNvdimm bool, dax bool, debug bool, confidential bool, iommu bool, kernelVerityParams string) ([]Param, error) {
+	params, err := GetKernelRootParams(rootfstype, disableNvdimm, dax, kernelVerityParams)
 	if err != nil {
 		return []Param{}, err
 	}
@@ -584,10 +587,15 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	// Set initial amount of cpu's for the virtual machine
 	clh.vmconfig.Cpus = chclient.NewCpusConfig(int32(clh.config.NumVCPUs()), int32(clh.config.DefaultMaxVCPUs))
 
-	disableNvdimm := (clh.config.DisableImageNvdimm || clh.config.ConfidentialGuest)
-	enableDax := !disableNvdimm
+	if pathExists("/dev/mshv") {
+		// The nested property is true by default, but is not supported yet on MSHV.
+		clh.vmconfig.Cpus.SetNested(false)
+	}
 
-	params, err := getNonUserDefinedKernelParams(hypervisorConfig.RootfsType, disableNvdimm, enableDax, clh.config.Debug, clh.config.ConfidentialGuest, clh.config.IOMMU)
+	disableNvdimm := true
+	enableDax := false
+
+	params, err := getNonUserDefinedKernelParams(hypervisorConfig.RootfsType, disableNvdimm, enableDax, clh.config.Debug, clh.config.ConfidentialGuest, clh.config.IOMMU, hypervisorConfig.KernelVerityParams)
 	if err != nil {
 		return err
 	}
@@ -607,31 +615,20 @@ func (clh *cloudHypervisor) CreateVM(ctx context.Context, id string, network Net
 	}
 
 	if assetType == types.ImageAsset {
-		if clh.config.DisableImageNvdimm || clh.config.ConfidentialGuest {
-			disk := chclient.NewDiskConfig()
-			disk.Path = &assetPath
-			disk.SetReadonly(true)
+		disk := chclient.NewDiskConfig()
+		disk.Path = &assetPath
+		disk.SetReadonly(true)
+		disk.SetImageType("Raw")
 
-			diskRateLimiterConfig := clh.getDiskRateLimiterConfig()
-			if diskRateLimiterConfig != nil {
-				disk.SetRateLimiterConfig(*diskRateLimiterConfig)
-			}
+		diskRateLimiterConfig := clh.getDiskRateLimiterConfig()
+		if diskRateLimiterConfig != nil {
+			disk.SetRateLimiterConfig(*diskRateLimiterConfig)
+		}
 
-			if clh.vmconfig.Disks != nil {
-				*clh.vmconfig.Disks = append(*clh.vmconfig.Disks, *disk)
-			} else {
-				clh.vmconfig.Disks = &[]chclient.DiskConfig{*disk}
-			}
+		if clh.vmconfig.Disks != nil {
+			*clh.vmconfig.Disks = append(*clh.vmconfig.Disks, *disk)
 		} else {
-			pmem := chclient.NewPmemConfig(assetPath)
-			*pmem.DiscardWrites = true
-			pmem.SetIommu(clh.config.IOMMU)
-
-			if clh.vmconfig.Pmem != nil {
-				*clh.vmconfig.Pmem = append(*clh.vmconfig.Pmem, *pmem)
-			} else {
-				clh.vmconfig.Pmem = &[]chclient.PmemConfig{*pmem}
-			}
+			clh.vmconfig.Disks = &[]chclient.DiskConfig{*disk}
 		}
 	} else {
 		// assetType == types.InitrdAsset
@@ -911,6 +908,7 @@ func (clh *cloudHypervisor) addInitdataDisk(initdataImage string) {
 		disk.Direct = &clh.config.BlockDeviceCacheDirect
 	}
 	disk.SetIommu(clh.config.IOMMU)
+	disk.SetImageType("Raw")
 
 	if rl := clh.getDiskRateLimiterConfig(); rl != nil {
 		disk.SetRateLimiterConfig(*rl)
@@ -949,6 +947,7 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 	clhDisk := *chclient.NewDiskConfig()
 	clhDisk.Path = &drive.File
 	clhDisk.Readonly = &drive.ReadOnly
+	clhDisk.SetImageType("Raw")
 	clhDisk.VhostUser = func(b bool) *bool { return &b }(false)
 	if clh.config.BlockDeviceCacheSet {
 		clhDisk.Direct = &clh.config.BlockDeviceCacheDirect
@@ -975,6 +974,44 @@ func (clh *cloudHypervisor) hotplugAddBlockDevice(drive *config.BlockDrive) erro
 	drive.PCIPath, err = clhPciInfoToPath(pciInfo)
 
 	return err
+}
+
+// coldPlugVFIODevice appends a VFIO device to the VM configuration so that it
+// is present when the VM is created (before boot). Cloud Hypervisor's CreateVM
+// API accepts a list of devices that are attached at VM creation time, which
+// effectively provides cold-plug semantics — the guest sees the device on its
+// PCI bus from the very first enumeration.
+func (clh *cloudHypervisor) coldPlugVFIODevice(device *config.VFIODev) error {
+	switch device.Type {
+	case config.VFIOPCIDeviceNormalType, config.VFIOPCIDeviceMediatedType:
+		// Supported PCI VFIO device types for Cloud Hypervisor.
+	default:
+		return fmt.Errorf("VFIO device %+v has unsupported type %v; only PCI VFIO devices are supported in Cloud Hypervisor", device, device.Type)
+	}
+	if strings.TrimSpace(device.SysfsDev) == "" {
+		return fmt.Errorf("VFIO device %q has empty or invalid SysfsDev path", device.ID)
+	}
+
+	clh.Logger().WithFields(log.Fields{
+		"device": device.ID,
+		"sysfs":  device.SysfsDev,
+		"bdf":    device.BDF,
+	}).Info("Cold-plugging VFIO device into VM config")
+
+	clhDevice := *chclient.NewDeviceConfig(device.SysfsDev)
+	clhDevice.SetIommu(clh.config.IOMMU)
+	clhDevice.SetId(device.ID)
+
+	if clh.vmconfig.Devices != nil {
+		*clh.vmconfig.Devices = append(*clh.vmconfig.Devices, clhDevice)
+	} else {
+		clh.vmconfig.Devices = &[]chclient.DeviceConfig{clhDevice}
+	}
+
+	// Track the device ID so that it can be referenced later (e.g. for removal).
+	clh.devicesIds[device.ID] = device.ID
+
+	return nil
 }
 
 func (clh *cloudHypervisor) hotPlugVFIODevice(device *config.VFIODev) error {
@@ -1343,6 +1380,8 @@ func (clh *cloudHypervisor) AddDevice(ctx context.Context, devInfo interface{}, 
 		clh.addVSock(defaultGuestVSockCID, v.UdsPath)
 	case types.Volume:
 		err = clh.addVolume(v)
+	case config.VFIODev:
+		err = clh.coldPlugVFIODevice(&v)
 	default:
 		clh.Logger().WithField("function", "AddDevice").Warnf("Add device of type %v is not supported.", v)
 		return fmt.Errorf("Not implemented support for %s", v)
@@ -1381,10 +1420,7 @@ func (clh *cloudHypervisor) terminate(ctx context.Context, waitOnly bool) (err e
 	defer span.End()
 
 	pid := clh.state.PID
-	pidRunning := true
-	if pid == 0 {
-		pidRunning = false
-	}
+	pidRunning := pid != 0
 
 	defer func() {
 		clh.Logger().Debug("Cleanup VM")
@@ -1770,10 +1806,10 @@ func (clh *cloudHypervisor) addNet(e Endpoint) error {
 		return errors.New("net Pair to be added is nil, needed to get TAP file descriptors")
 	}
 
-	if len(netPair.TapInterface.VMFds) == 0 {
+	if len(netPair.VMFds) == 0 {
 		return errors.New("The file descriptors for the network pair are not present")
 	}
-	clh.netDevicesFiles[mac] = netPair.TapInterface.VMFds
+	clh.netDevicesFiles[mac] = netPair.VMFds
 
 	netRateLimiterConfig := clh.getNetRateLimiterConfig()
 
@@ -1939,5 +1975,12 @@ func (clh *cloudHypervisor) vmInfo() (chclient.VmInfo, error) {
 }
 
 func (clh *cloudHypervisor) IsRateLimiterBuiltin() bool {
+	return true
+}
+
+func pathExists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
 	return true
 }

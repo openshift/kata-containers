@@ -17,7 +17,6 @@ spec:
       labels:
         app: policy-nginx-rc
     spec:
-      terminationGracePeriodSeconds: 0
       runtimeClassName: kata
       containers:
       - name: nginxtest
@@ -44,3 +43,4 @@ spec:
       - name: hostpath-vol-read-only
         hostPath:
           path: /tmp/results-read-only
+      preemptionPolicy: PreemptLowerPriority

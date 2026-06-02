@@ -86,12 +86,13 @@ impl FcInner {
         let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
         kernel_params.push(Param::new("pci", "off"));
         kernel_params.push(Param::new("iommu", "off"));
-        let rootfs_driver = self.config.blockdev_info.block_device_driver.clone();
-
-        kernel_params.append(&mut KernelParams::new_rootfs_kernel_params(
-            &rootfs_driver,
+        let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+            &self.config.boot_info.kernel_verity_params,
+            &self.config.blockdev_info.block_device_driver,
             &self.config.boot_info.rootfs_type,
-        )?);
+            true,
+        )?;
+        kernel_params.append(&mut rootfs_params);
         kernel_params.append(&mut KernelParams::from_string(
             &self.config.boot_info.kernel_params,
         ));
@@ -110,7 +111,7 @@ impl FcInner {
 
         let body_config: String = json!({
             "mem_size_mib": self.config.memory_info.default_memory,
-            "vcpu_count": self.config.cpu_info.default_vcpus,
+            "vcpu_count": self.config.cpu_info.default_vcpus.ceil() as u8,
         })
         .to_string();
         let body_kernel: String = json!({
@@ -190,13 +191,10 @@ impl FcInner {
                 .disk_rate_limiter_ops_one_time_burst,
         );
 
-        let rate_limiter = serde_json::to_string(&block_rate_limit)
-            .with_context(|| format!("serde {block_rate_limit:?} to json"))?;
-
         let body: String = json!({
             "drive_id": format!("drive{drive_id}"),
             "path_on_host": new_drive_path,
-            "rate_limiter": rate_limiter,
+            "rate_limiter": block_rate_limit,
         })
         .to_string();
         self.request_with_retry(

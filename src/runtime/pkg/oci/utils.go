@@ -165,6 +165,10 @@ type RuntimeConfig struct {
 	// Determines if Kata creates emptyDir on the guest
 	DisableGuestEmptyDir bool
 
+	// EmptyDirMode specifies how Kubernetes emptyDir volumes are handled.
+	// Valid values are "shared-fs" (default) or "block-encrypted".
+	EmptyDirMode string
+
 	// CreateContainer timeout which, if provided, indicates the createcontainer request timeout
 	// needed for the workload ( Mostly used for pulling images in the guest )
 	CreateContainerTimeout uint64
@@ -193,6 +197,10 @@ type RuntimeConfig struct {
 	//	ColdPlugVFIO != NoPort AND PodResourceAPISock != "" => kubelet
 	//		based cold plug.
 	PodResourceAPISock string
+
+	// KubeletRootDir is the kubelet root directory used to match ConfigMap/Secret
+	// volume paths (e.g. /var/lib/k0s/kubelet for k0s). If empty, default is used.
+	KubeletRootDir string
 }
 
 // AddKernelParam allows the addition of new kernel parameters to an existing
@@ -636,6 +644,15 @@ func addHypervisorPathOverrides(ocispec specs.Spec, config *vc.SandboxConfig, ru
 		}
 	}
 
+	if value, ok := ocispec.Annotations[vcAnnotations.KernelVerityParams]; ok {
+		if value != "" {
+			if _, err := vc.ParseKernelVerityParams(value); err != nil {
+				return fmt.Errorf("invalid kernel_verity_params in annotation: %w", err)
+			}
+			config.HypervisorConfig.KernelVerityParams = value
+		}
+	}
+
 	return nil
 }
 
@@ -776,6 +793,14 @@ func addHypervisorMemoryOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig
 		return err
 	}
 
+	if annotation, ok := ocispec.Annotations[vcAnnotations.NUMAMapping]; ok {
+		guestNUMANodes, err := vcutils.GetGuestNUMANodes(strings.Fields(annotation))
+		if err != nil {
+			return err
+		}
+		sbConfig.HypervisorConfig.GuestNUMANodes = guestNUMANodes
+	}
+
 	return nil
 }
 
@@ -895,9 +920,39 @@ func addHypervisorBlockOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig)
 		return err
 	}
 
-	return newAnnotationConfiguration(ocispec, vcAnnotations.BlockDeviceCacheNoflush).setBool(func(blockDeviceCacheNoflush bool) {
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.BlockDeviceCacheNoflush).setBool(func(blockDeviceCacheNoflush bool) {
 		sbConfig.HypervisorConfig.BlockDeviceCacheNoflush = blockDeviceCacheNoflush
-	})
+	}); err != nil {
+		return err
+	}
+
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.BlockDeviceLogicalSectorSize).setUintWithCheck(func(size uint64) error {
+		if size != 0 && (size < 512 || size > 65536 || (size&(size-1)) != 0) {
+			return fmt.Errorf("invalid %s %d: must be 0 or a power of 2 between 512 and 65536", vcAnnotations.BlockDeviceLogicalSectorSize, size)
+		}
+		sbConfig.HypervisorConfig.BlockDeviceLogicalSectorSize = uint32(size)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := newAnnotationConfiguration(ocispec, vcAnnotations.BlockDevicePhysicalSectorSize).setUintWithCheck(func(size uint64) error {
+		if size != 0 && (size < 512 || size > 65536 || (size&(size-1)) != 0) {
+			return fmt.Errorf("invalid %s %d: must be 0 or a power of 2 between 512 and 65536", vcAnnotations.BlockDevicePhysicalSectorSize, size)
+		}
+		sbConfig.HypervisorConfig.BlockDevicePhysicalSectorSize = uint32(size)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	logical := sbConfig.HypervisorConfig.BlockDeviceLogicalSectorSize
+	physical := sbConfig.HypervisorConfig.BlockDevicePhysicalSectorSize
+	if logical != 0 && physical != 0 && logical > physical {
+		return fmt.Errorf("invalid sector sizes: logical (%d) must not be larger than physical (%d)", logical, physical)
+	}
+
+	return nil
 }
 
 func addHypervisorVirtioFsOverrides(ocispec specs.Spec, sbConfig *vc.SandboxConfig, runtime RuntimeConfig) error {
@@ -1190,6 +1245,8 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 
 		DisableGuestSeccomp: runtime.DisableGuestSeccomp,
 
+		EmptyDirMode: runtime.EmptyDirMode,
+
 		EnableVCPUsPinning: runtime.EnableVCPUsPinning,
 
 		GuestSeLinuxLabel: runtime.GuestSeLinuxLabel,
@@ -1199,6 +1256,8 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 		CreateContainerTimeout: runtime.CreateContainerTimeout,
 
 		ForceGuestPull: runtime.ForceGuestPull,
+
+		KubeletRootDir: runtime.KubeletRootDir,
 	}
 
 	if err := addAnnotations(ocispec, &sandboxConfig, runtime); err != nil {

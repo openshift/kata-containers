@@ -125,7 +125,7 @@ If you want to enable SELinux in Permissive mode, add `enforcing=0` to the kerne
 Enable full debug as follows:
 
 ```bash
-$ sudo sed -i -e 's/^# *\(enable_debug\).*=.*$/\1 = true/g' /etc/kata-containers/configuration.toml
+$ sudo sed -i -E 's/^(\s*enable_debug\s*=\s*)false/\1true/' /etc/kata-containers/configuration.toml
 $ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.log=debug initcall_debug"/g' /etc/kata-containers/configuration.toml
 ```
 
@@ -289,14 +289,14 @@ provided by your distribution.
 
 As a prerequisite, you need to install Docker. Otherwise, you will not be
 able to run the `rootfs.sh` script with `USE_DOCKER=true` as expected in
-the following example.
+the following example. Specifying the `OS_VERSION` is required when using `distro="ubuntu"`.
 
 ```bash
 $ export distro="ubuntu" # example
 $ export ROOTFS_DIR="$(realpath kata-containers/tools/osbuilder/rootfs-builder/rootfs)"
 $ sudo rm -rf "${ROOTFS_DIR}"
 $ pushd kata-containers/tools/osbuilder/rootfs-builder
-$ script -fec 'sudo -E USE_DOCKER=true ./rootfs.sh "${distro}"'
+$ script -fec 'sudo -E USE_DOCKER=true OS_VERSION=noble ./rootfs.sh "${distro}"'
 $ popd
 ```
 
@@ -522,10 +522,18 @@ $ sudo kata-runtime check
 If your system is *not* able to run Kata Containers, the previous command will error out and explain why.
 
 # Run Kata Containers with Containerd
+
 Refer to the [How to use Kata Containers and Containerd](how-to/containerd-kata.md) how-to guide.
 
 # Run Kata Containers with Kubernetes
-Refer to the [Run Kata Containers with Kubernetes](how-to/run-kata-with-k8s.md) how-to guide.
+
+- Containerd
+
+Refer to the [How to use Kata Containers and Containerd with Kubernetes](how-to/how-to-use-k8s-with-containerd-and-kata.md) how-to guide.
+
+- CRI-O
+
+Refer to the [How to use Kata Containers and CRI-O with Kubernetes](how-to/how-to-use-k8s-with-crio-and-kata.md) how-to guide.
 
 # Troubleshoot Kata Containers
 
@@ -730,7 +738,7 @@ sudo sed -i -e 's/^kernel_params = "\(.*\)"/kernel_params = "\1 agent.debug_cons
 
 ##### Connecting to the debug console
 
-Next, connect to the debug console. The VSOCKS paths vary slightly between each
+Next, connect to the debug console. The VSOCK paths vary slightly between each
 VMM solution.
 
 In case of cloud-hypervisor, connect to the `vsock` as shown:

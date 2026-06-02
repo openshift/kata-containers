@@ -7,17 +7,11 @@
 
 load "${BATS_TEST_DIRNAME}/lib.sh"
 load "${BATS_TEST_DIRNAME}/../../common.bash"
+load "${BATS_TEST_DIRNAME}/../../hypervisor_helpers.sh"
 load "${BATS_TEST_DIRNAME}/tests_common.sh"
 
 setup() {
-	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
-	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
-	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
-	[ "$(uname -m)" == "s390x" ] && [ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/12155"
-	[[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && skip "Requires CPU hotplug which disabled by static_sandbox_resource_mgmt"
-	( [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] || [ "${KATA_HYPERVISOR}" == "qemu-snp" ] || \
-		[ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
-		&& skip "TEEs do not support memory / CPU hotplug"
+	is_hotplug_supported "${KATA_HYPERVISOR}" || skip "${KATA_HYPERVISOR} doesn't support memory / CPU hotplug"
 
 	pod_name="constraints-cpu-test"
 	container_name="first-cpu-container"
@@ -117,14 +111,7 @@ setup() {
 }
 
 teardown() {
-	[ "${KATA_HYPERVISOR}" == "firecracker" ] && skip "test not working see: ${fc_limitations}"
-	[ "${KATA_HYPERVISOR}" == "fc" ] && skip "test not working see: ${fc_limitations}"
-	[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ] && skip "Requires CPU hotplug which isn't supported on ${KATA_HYPERVISOR} yet"
-	[ "$(uname -m)" == "s390x" ] && [ "${KATA_HYPERVISOR}" == "qemu-runtime-rs" ] && skip "See: https://github.com/kata-containers/kata-containers/issues/12155"
-	[[ "${KATA_HYPERVISOR}" == qemu-coco-dev* ]] && skip "Requires CPU hotplug which disabled by static_sandbox_resource_mgmt"
-	( [ "${KATA_HYPERVISOR}" == "qemu-tdx" ] || [ "${KATA_HYPERVISOR}" == "qemu-snp" ] || \
-		[ "${KATA_HYPERVISOR}" == "qemu-se" ] ) \
-		&& skip "TEEs do not support memory / CPU hotplug"
+	is_hotplug_supported "${KATA_HYPERVISOR}" || skip "${KATA_HYPERVISOR} doesn't support memory / CPU hotplug"
 
 	# Debugging information
 	kubectl describe "pod/$pod_name"

@@ -9,7 +9,6 @@ kind: Pod
 metadata:
   name: hostpath-kmsg
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   restartPolicy: Never
   volumes:
@@ -17,7 +16,7 @@ spec:
     hostPath:
       path: /dev/kmsg
   containers:
-  - image: quay.io/prometheus/busybox:latest 
+  - image: quay.io/prometheus/busybox:latest
     name: container
     volumeMounts:
     - name: dev-kmsg
