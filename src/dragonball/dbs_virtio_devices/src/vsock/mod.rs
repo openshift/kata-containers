@@ -153,7 +153,7 @@ pub trait VsockEpollListener: AsRawFd {
     /// Get the set of events for which the listener wants to be notified.
     fn get_polled_evset(&self) -> epoll::Events;
 
-    /// Notify the listener that one ore more events have occured.
+    /// Notify the listener that one or more events have occurred.
     fn notify(&mut self, evset: epoll::Events);
 }
 
@@ -339,7 +339,7 @@ mod tests {
             }
         }
 
-        pub fn create_event_handler_context(&self) -> EventHandlerContext {
+        pub fn create_event_handler_context(&self) -> EventHandlerContext<'_> {
             const QSIZE: u16 = 256;
 
             let guest_rxvq = GuestQ::new(GuestAddress(0x0010_0000), &self.mem, QSIZE);

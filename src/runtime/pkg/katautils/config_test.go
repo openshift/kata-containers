@@ -218,6 +218,7 @@ func createAllRuntimeConfigFiles(dir, hypervisor string) (testConfig testRuntime
 		JaegerPassword:  jaegerPassword,
 
 		FactoryConfig: factoryConfig,
+		EmptyDirMode:  vc.EmptyDirModeSharedFs,
 	}
 
 	err = SetKernelParams(&runtimeConfig)
@@ -599,6 +600,7 @@ func TestMinimalRuntimeConfig(t *testing.T) {
 		AgentConfig: expectedAgentConfig,
 
 		FactoryConfig: expectedFactoryConfig,
+		EmptyDirMode:  vc.EmptyDirModeSharedFs,
 	}
 	err = SetKernelParams(&expectedConfig)
 	if err != nil {
@@ -704,6 +706,41 @@ func TestNewQemuHypervisorConfig(t *testing.T) {
 		t.Errorf("Expected value for BlockDeviceAIO  %v, got %v", blockDeviceAIO, config.BlockDeviceAIO)
 	}
 
+}
+
+func TestValidateBlockDeviceSectorSize(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, size := range []uint32{0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536} {
+		assert.NoError(validateBlockDeviceSectorSize("test_field", size), "expected size %d to be accepted", size)
+	}
+
+	for _, size := range []uint32{3, 100, 1000, 3000, 5000} {
+		assert.Error(validateBlockDeviceSectorSize("test_field", size), "expected non-power-of-2 size %d to be rejected", size)
+	}
+
+	for _, size := range []uint32{1, 256} {
+		assert.Error(validateBlockDeviceSectorSize("test_field", size), "expected below-minimum size %d to be rejected", size)
+	}
+
+	for _, size := range []uint32{131072, 1048576} {
+		assert.Error(validateBlockDeviceSectorSize("test_field", size), "expected above-maximum size %d to be rejected", size)
+	}
+}
+
+func TestValidateBlockDeviceSectorSizes(t *testing.T) {
+	assert := assert.New(t)
+
+	assert.NoError(validateBlockDeviceSectorSizes(0, 0))
+	assert.NoError(validateBlockDeviceSectorSizes(512, 0))
+	assert.NoError(validateBlockDeviceSectorSizes(0, 4096))
+	assert.NoError(validateBlockDeviceSectorSizes(512, 4096))
+	assert.NoError(validateBlockDeviceSectorSizes(4096, 4096))
+	assert.NoError(validateBlockDeviceSectorSizes(512, 512))
+
+	assert.Error(validateBlockDeviceSectorSizes(4096, 512), "logical > physical should be rejected")
+	assert.Error(validateBlockDeviceSectorSizes(4096, 1024), "logical > physical should be rejected")
+	assert.Error(validateBlockDeviceSectorSizes(65536, 512), "logical > physical should be rejected")
 }
 
 func TestNewFirecrackerHypervisorConfig(t *testing.T) {
@@ -1606,6 +1643,39 @@ func TestCheckNetNsConfig(t *testing.T) {
 		InterNetworkModel: vc.NetXConnectDefaultModel,
 	}
 	err = checkNetNsConfig(config)
+	assert.Error(err)
+}
+
+func TestCheckEmptyDirMode(t *testing.T) {
+	assert := assert.New(t)
+
+	// Valid values
+	r := runtime{EmptyDirMode: vc.EmptyDirModeSharedFs}
+	mode, err := r.emptyDirMode()
+	assert.NoError(err)
+	assert.Equal(vc.EmptyDirModeSharedFs, mode)
+
+	r = runtime{EmptyDirMode: vc.EmptyDirModeVirtioBlkEncrypted}
+	mode, err = r.emptyDirMode()
+	assert.NoError(err)
+	assert.Equal(vc.EmptyDirModeVirtioBlkEncrypted, mode)
+
+	r = runtime{}
+	mode, err = r.emptyDirMode()
+	assert.NoError(err)
+	assert.Equal(vc.EmptyDirModeSharedFs, mode)
+
+	// Invalid values
+	r = runtime{EmptyDirMode: "invalid"}
+	_, err = r.emptyDirMode()
+	assert.Error(err)
+
+	r = runtime{EmptyDirMode: "shared_fs"}
+	_, err = r.emptyDirMode()
+	assert.Error(err)
+
+	r = runtime{EmptyDirMode: "block_encrypted"}
+	_, err = r.emptyDirMode()
 	assert.Error(err)
 }
 

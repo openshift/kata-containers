@@ -1,59 +1,69 @@
 # How to do a Kata Containers Release
+
 This document lists the tasks required to create a Kata Release.
 
 ## Requirements
 
 - GitHub permissions to run workflows.
 
-## Versioning
+## Release Model
 
-The Kata Containers project uses [semantic versioning](http://semver.org/) for all releases.
-Semantic versions are comprised of three fields in the form:
+Kata Containers follows a rolling release model with monthly snapshots.
+New features, bug fixes, and improvements are continuously integrated into
+`main`. Each month, a snapshot is tagged as a new `MINOR` release.
 
-```
-MAJOR.MINOR.PATCH
-```
+### Versioning
 
-When `MINOR` increases, the new release adds **new features** but *without changing the existing behavior*.
+Releases use the `MAJOR.MINOR.PATCH` scheme. Monthly snapshots increment
+`MINOR`; `PATCH` is typically `0`. Major releases are rare (years apart) and
+signal significant architectural changes that may require updates to container
+managers (Containerd, CRI-O) or other infrastructure. Breaking changes in
+`MINOR` releases are avoided where possible, but may occasionally occur as
+features are deprecated or removed.
 
-When `MAJOR` increases, the new release adds **new features, bug fixes, or
-both** and which **changes the behavior from the previous release** (incompatible with previous releases).
+### No Stable Branches
 
-A major release will also likely require a change of the container manager version used,
--for example Containerd or CRI-O. Please refer to the release notes for further details.
-
-**Important** : the Kata Containers project doesn't have stable branches (see
-[this issue](https://github.com/kata-containers/kata-containers/issues/9064) for details).
-Bug fixes are released as part of `MINOR` or `MAJOR` releases only. `PATCH` is always `0`.
+The Kata Containers project does not maintain stable branches (see
+[#9064](https://github.com/kata-containers/kata-containers/issues/9064)).
+Bug fixes land on `main` and ship in the next monthly snapshot rather than
+being backported. Downstream projects that need extended support or compliance
+certifications should select a monthly snapshot as their stable base and manage
+their own validation and patch backporting from there.
 
 ## Release Process
 
-### Bump the `VERSION` and `Chart.yaml` file
+### Lock the `main` branch and announce release process
 
-When the `kata-containers/kata-containers` repository is ready for a new release,
-first create a PR to set the release in the [`VERSION`](./../VERSION) file and update the
-`version` and `appVersion` in the
-[`Chart.yaml`](./../tools/packaging/kata-deploy/helm-chart/kata-deploy/Chart.yaml) file and
-have it merged.
-
-### Lock the `main` branch
-
-In order to prevent any PRs getting merged during the release process, and slowing the release
-process down, by impacting the payload caches, we have recently trailed setting the `main`
-branch to read only whilst the release action runs.
+In order to prevent any PRs getting merged during the release process, and
+slowing the release process down, by impacting the payload caches, we have
+recently trialed setting the `main` branch to read-only.
+Once the `kata-containers/kata-containers` repository is ready for a new
+release, lock the main branch until the release action has completed.
+Notify the #kata-dev Slack channel about the ongoing release process.
+Ideally, CI usage by others should be reduced to a minimum during the
+ongoing release process.
 
 > [!NOTE]
-> Admin permission is needed to complete this task.
+> Admin permission is needed to lock/unlock the `main` branch.
+
+### Bump the `VERSION` and `Chart.yaml` file
+
+Create a PR to set the release in the [`VERSION`](./../VERSION) file and to
+update the `version` and `appVersion` fields in the
+[`Chart.yaml`](./../tools/packaging/kata-deploy/helm-chart/kata-deploy/Chart.yaml)
+file. Temporarily unlock the main branch to merge the PR.
 
 ### Wait for the `VERSION` bump PR payload publish to complete
 
-To reduce the chance of need to re-run the release workflow, check the
-[CI | Publish Kata Containers payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml)
+To reduce the chance of need to re-run the release workflow, check the [CI |
+Publish Kata Containers
+payload](https://github.com/kata-containers/kata-containers/actions/workflows/payload-after-push.yaml)
 once the `VERSION` PR bump has merged to check that the assets build correctly
 and are cached, so that the release process can just download these artifacts
-rather than needing to build them all, which takes time and can reveal errors in infra.
+rather than needing to build them all, which takes time and can reveal errors in
+infra.
 
-### Check GitHub Actions
+### Trigger the `Release Kata Containers` GitHub Action
 
 We make use of [GitHub actions](https://github.com/features/actions) in the
 [release](https://github.com/kata-containers/kata-containers/actions/workflows/release.yaml)
@@ -63,11 +73,10 @@ release artifacts.
 > [!NOTE]
 > Write permissions to trigger the action.
 
-The action is manually triggered and is responsible for generating a new
-release (including a new tag), pushing those to the
-`kata-containers/kata-containers` repository. The new release is initially
-created as a draft. It is promoted to an official release when the whole
-workflow has completed successfully.
+The action is manually triggered and is responsible for generating a new release
+(including a new tag), pushing those to the `kata-containers/kata-containers`
+repository. The new release is initially created as a draft. It is promoted to
+an official release when the whole workflow has completed successfully.
 
 Check the [actions status
 page](https://github.com/kata-containers/kata-containers/actions) to verify all
@@ -75,12 +84,13 @@ steps in the actions workflow have completed successfully. On success, a static
 tarball containing Kata release artifacts will be uploaded to the [Release
 page](https://github.com/kata-containers/kata-containers/releases).
 
-If the workflow fails because of some external environmental causes, e.g. network
-timeout, simply re-run the failed jobs until they eventually succeed.
+If the workflow fails because of some external environmental causes, e.g.
+network timeout, simply re-run the failed jobs until they eventually succeed.
 
-If for some reason you need to cancel the workflow or re-run it entirely, go first
-to the [Release page](https://github.com/kata-containers/kata-containers/releases) and
-delete the draft release from the previous run.
+If for some reason you need to cancel the workflow or re-run it entirely, go
+first to the [Release
+page](https://github.com/kata-containers/kata-containers/releases) and delete
+the draft release from the previous run.
 
 ### Unlock the `main` branch
 
@@ -90,9 +100,8 @@ an admin to do it.
 ### Improve the release notes
 
 Release notes are auto-generated by the GitHub CLI tool used as part of our
-release workflow.  However, some manual tweaking may still be necessary in
-order to highlight the most important features and bug fixes in a specific
-release.
+release workflow.  However, some manual tweaking may still be necessary in order
+to highlight the most important features and bug fixes in a specific release.
 
 With this in mind, please, poke @channel on #kata-dev and people who worked on
 the release will be able to contribute to that.

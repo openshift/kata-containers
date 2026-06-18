@@ -23,7 +23,6 @@ import (
 	exp "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/experimental"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/persist/fs"
 
-	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	vcAnnotations "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/annotations"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -49,6 +48,11 @@ func testCreateSandbox(t *testing.T, id string,
 	htype HypervisorType, hconfig HypervisorConfig,
 	nconfig NetworkConfig, containers []ContainerConfig,
 	volumes []types.Volume) (*Sandbox, error) {
+
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
 
 	if tc.NotValid(ktu.NeedRoot()) {
 		t.Skip(testDisabledAsNonRoot)
@@ -689,43 +693,43 @@ func TestSandboxCreateAssets(t *testing.T) {
 		{
 			types.FirmwareAsset,
 			map[string]string{
-				annotations.FirmwarePath: filename,
-				annotations.FirmwareHash: assetContentHash,
+				vcAnnotations.FirmwarePath: filename,
+				vcAnnotations.FirmwareHash: assetContentHash,
 			},
 		},
 		{
 			types.HypervisorAsset,
 			map[string]string{
-				annotations.HypervisorPath: filename,
-				annotations.HypervisorHash: assetContentHash,
+				vcAnnotations.HypervisorPath: filename,
+				vcAnnotations.HypervisorHash: assetContentHash,
 			},
 		},
 		{
 			types.ImageAsset,
 			map[string]string{
-				annotations.ImagePath: filename,
-				annotations.ImageHash: assetContentHash,
+				vcAnnotations.ImagePath: filename,
+				vcAnnotations.ImageHash: assetContentHash,
 			},
 		},
 		{
 			types.InitrdAsset,
 			map[string]string{
-				annotations.InitrdPath: filename,
-				annotations.InitrdHash: assetContentHash,
+				vcAnnotations.InitrdPath: filename,
+				vcAnnotations.InitrdHash: assetContentHash,
 			},
 		},
 		{
 			types.JailerAsset,
 			map[string]string{
-				annotations.JailerPath: filename,
-				annotations.JailerHash: assetContentHash,
+				vcAnnotations.JailerPath: filename,
+				vcAnnotations.JailerHash: assetContentHash,
 			},
 		},
 		{
 			types.KernelAsset,
 			map[string]string{
-				annotations.KernelPath: filename,
-				annotations.KernelHash: assetContentHash,
+				vcAnnotations.KernelPath: filename,
+				vcAnnotations.KernelHash: assetContentHash,
 			},
 		},
 	}
@@ -769,7 +773,7 @@ func TestSandboxCreateAssets(t *testing.T) {
 	imagePathData := &testData{
 		assetType: types.ImageAsset,
 		annotations: map[string]string{
-			annotations.ImagePath: "rhel9-os",
+			vcAnnotations.ImagePath: "rhel9-os",
 		},
 	}
 
@@ -1307,6 +1311,10 @@ func checkSandboxRemains() error {
 }
 
 func TestSandboxCreationFromConfigRollbackFromCreateSandbox(t *testing.T) {
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
 	defer cleanUp()
 	assert := assert.New(t)
 	ctx := context.Background()
@@ -1398,15 +1406,19 @@ func TestSandboxExperimentalFeature(t *testing.T) {
 }
 
 func TestSandbox_Cgroups(t *testing.T) {
+	// GITHUB_RUNNER_CI_NON_VIRT is set to true in .github/workflows/build-checks.yaml file for ARM64 runners because the self hosted runners do not support Virtualization
+	if os.Getenv("GITHUB_RUNNER_CI_NON_VIRT") == "true" {
+		t.Skip("Skipping the test as the GitHub self hosted runners for ARM64 do not support Virtualization")
+	}
 	sandboxContainer := ContainerConfig{}
 	sandboxContainer.Annotations = make(map[string]string)
-	sandboxContainer.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	sandboxContainer.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	emptyJSONLinux := ContainerConfig{
 		CustomSpec: newEmptySpec(),
 	}
 	emptyJSONLinux.Annotations = make(map[string]string)
-	emptyJSONLinux.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	emptyJSONLinux.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	cloneSpec1 := newEmptySpec()
 	cloneSpec1.Linux.CgroupsPath = "/myRuntime/myContainer"
@@ -1414,7 +1426,7 @@ func TestSandbox_Cgroups(t *testing.T) {
 		CustomSpec: cloneSpec1,
 	}
 	successfulContainer.Annotations = make(map[string]string)
-	successfulContainer.Annotations[annotations.ContainerTypeKey] = string(PodSandbox)
+	successfulContainer.Annotations[vcAnnotations.ContainerTypeKey] = string(PodSandbox)
 
 	// nolint: govet
 	tests := []struct {
@@ -1468,6 +1480,19 @@ func TestSandbox_Cgroups(t *testing.T) {
 				config: &SandboxConfig{Containers: []ContainerConfig{
 					successfulContainer,
 				}}},
+			false,
+			true,
+		},
+		{
+			"sandbox, remote hypervisor (no kvm required)",
+			&Sandbox{
+				config: &SandboxConfig{
+					HypervisorType: RemoteHypervisor,
+					Containers: []ContainerConfig{
+						successfulContainer,
+					},
+				},
+			},
 			false,
 			true,
 		},

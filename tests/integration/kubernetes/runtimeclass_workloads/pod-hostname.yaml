@@ -9,11 +9,10 @@ kind: Pod
 metadata:
   name: test-pod-hostname
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   restartPolicy: Never
   containers:
-  - image: quay.io/prometheus/busybox:latest 
+  - image: quay.io/prometheus/busybox:latest
     name: pod-hostname-c01
     command: ["sh"]
     args: ["-c", "hostname"]

@@ -1,29 +1,29 @@
 # How to use Kata Containers and Containerd
 
-This document covers the installation and configuration of [containerd](https://containerd.io/) 
+This document covers the installation and configuration of [containerd](https://containerd.io/)
 and [Kata Containers](https://katacontainers.io). The containerd provides not only the `ctr`
-command line tool, but also the [CRI](https://kubernetes.io/blog/2016/12/container-runtime-interface-cri-in-kubernetes/) 
+command line tool, but also the [CRI](https://kubernetes.io/blog/2016/12/container-runtime-interface-cri-in-kubernetes/)
 interface for [Kubernetes](https://kubernetes.io) and other CRI clients.
 
-This document is primarily written for Kata Containers v1.5.0-rc2 or above, and containerd v1.2.0 or above. 
+This document is primarily written for Kata Containers v3.28 or above, and containerd v1.7.0 or above.
 Previous versions are addressed here, but we suggest users upgrade to the newer versions for better support.
 
 ## Concepts
 
 ### Kubernetes `RuntimeClass`
 
-[`RuntimeClass`](https://kubernetes.io/docs/concepts/containers/runtime-class/) is a Kubernetes feature first 
-introduced in Kubernetes 1.12 as alpha. It is the feature for selecting the container runtime configuration to 
-use to run a pod’s containers. This feature is supported in `containerd` since [v1.2.0](https://github.com/containerd/containerd/releases/tag/v1.2.0).
+[`RuntimeClass`](https://kubernetes.io/docs/concepts/containers/runtime-class/) is a Kubernetes feature first
+introduced in Kubernetes 1.12 as alpha. It is the feature for selecting the container runtime configuration to
+use to run a pod's containers. This feature is supported in `containerd` since [v1.2.0](https://github.com/containerd/containerd/releases/tag/v1.2.0).
 
 Before the `RuntimeClass` was introduced, Kubernetes was not aware of the difference of runtimes on the node. `kubelet`
 creates Pod sandboxes and containers through CRI implementations, and treats all the Pods equally. However, there
-are requirements to run trusted Pods (i.e. Kubernetes plugin) in a native container like runc, and to run untrusted 
+are requirements to run trusted Pods (i.e. Kubernetes plugin) in a native container like runc, and to run untrusted
 workloads with isolated sandboxes (i.e. Kata Containers).
 
 As a result, the CRI implementations extended their semantics for the requirements:
 
-- At the beginning, [Frakti](https://github.com/kubernetes/frakti) checks the network configuration of a Pod, and
+- At the beginning, [`Frakti`](https://github.com/kubernetes/frakti) checks the network configuration of a Pod, and
   treat Pod with `host` network as trusted, while others are treated as untrusted.
 - The containerd introduced an annotation for untrusted Pods since [v1.0](https://github.com/containerd/cri/blob/v1.0.0-rc.0/docs/config.md):
   ```yaml
@@ -32,17 +32,17 @@ As a result, the CRI implementations extended their semantics for the requiremen
   ```
 - Similarly, CRI-O introduced the annotation `io.kubernetes.cri-o.TrustedSandbox` for untrusted Pods.
 
-To eliminate the complexity of user configuration introduced by the non-standardized annotations and provide 
-extensibility, `RuntimeClass` was introduced. This gives users the ability to affect the runtime behavior 
-through `RuntimeClass` without the knowledge of the CRI daemons. We suggest that users with multiple runtimes 
+To eliminate the complexity of user configuration introduced by the non-standardized annotations and provide
+extensibility, `RuntimeClass` was introduced. This gives users the ability to affect the runtime behavior
+through `RuntimeClass` without the knowledge of the CRI daemons. We suggest that users with multiple runtimes
 use `RuntimeClass` instead of the deprecated annotations.
 
 ### Containerd Runtime V2 API: Shim V2 API
 
 The [`containerd-shim-kata-v2` (short as `shimv2` in this documentation)](../../src/runtime/cmd/containerd-shim-kata-v2/)
 implements the [Containerd Runtime V2 (Shim API)](https://github.com/containerd/containerd/tree/main/core/runtime/v2) for Kata.
-With `shimv2`, Kubernetes can launch Pod and OCI-compatible containers with one shim per Pod. Prior to `shimv2`, `2N+1` 
-shims (i.e. a `containerd-shim` and a `kata-shim` for each container and the Pod sandbox itself) and no standalone `kata-proxy` 
+With `shimv2`, Kubernetes can launch Pod and OCI-compatible containers with one shim per Pod. Prior to `shimv2`, `2N+1`
+shims (i.e. a `containerd-shim` and a `kata-shim` for each container and the Pod sandbox itself) and no standalone `kata-proxy`
 process were used, even with VSOCK not available.
 
 ![Kubernetes integration with shimv2](../design/arch-images/shimv2.svg)
@@ -87,7 +87,7 @@ $ popd
 
 ### Install `cri-tools`
 
-> **Note:** `cri-tools` is a set of tools for CRI used for development and testing. Users who only want 
+> **Note:** `cri-tools` is a set of tools for CRI used for development and testing. Users who only want
 > to use containerd with Kubernetes can skip the `cri-tools`.
 
 You can install the `cri-tools` from source code:
@@ -104,7 +104,7 @@ $ popd
 
 ### Configure containerd to use Kata Containers
 
-By default, the configuration of containerd is located at `/etc/containerd/config.toml`, and the 
+By default, the configuration of containerd is located at `/etc/containerd/config.toml`, and the
 `cri` plugins are placed in the following section:
 
 ```toml
@@ -123,18 +123,56 @@ The following sections outline how to add Kata Containers to the configurations.
 
 #### Kata Containers as a `RuntimeClass`
 
-For 
-- Kata Containers v1.5.0 or above (including `1.5.0-rc`)
-- Containerd v1.2.0 or above
-- Kubernetes v1.12.0 or above
+For Kubernetes users, we suggest using `RuntimeClass` to select Kata Containers as the runtime for untrusted workloads. The configuration is as follows:
+
+- Kata Containers v3.28.0 or above
+- Containerd v1.7.0 or above
+- Kubernetes v1.33 or above
 
 The `RuntimeClass` is suggested.
 
+The following example registers custom runtimes into containerd:
+
+You can check the detailed information about the configuration of containerd in the [Containerd config documentation](https://github.com/containerd/containerd/blob/main/docs/cri/config.md).
+
++ In containerd 2.x
+
+```toml
+version = 3
+[plugins."io.containerd.cri.v1.runtime".containerd]
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes]
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
+      runtime_type = "io.containerd.kata.v2"
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
+        ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration.toml"
+```
+
++ In containerd 1.7.x
+
+```toml
+version = 2
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+      runtime_type = "io.containerd.runc.v2"
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+      runtime_type = "io.containerd.kata.v2"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+        ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration.toml"
+```
+
 The following configuration includes two runtime classes:
-- `plugins.cri.containerd.runtimes.runc`: the runc, and it is the default runtime.
-- `plugins.cri.containerd.runtimes.kata`: The function in containerd (reference [the document here](https://github.com/containerd/containerd/tree/main/core/runtime/v2)) 
-  where the dot-connected string `io.containerd.kata.v2` is translated to `containerd-shim-kata-v2` (i.e. the 
-  binary name of the Kata implementation of [Containerd Runtime V2 (Shim API)](https://github.com/containerd/containerd/tree/main/core/runtime/v2)).
+
+- `plugins.<X>.containerd.runtimes.runc`: the runc, and it is the default runtime.
+- `plugins.<X>.containerd.runtimes.kata`: The function in containerd (reference [the document here](https://github.com/containerd/containerd/tree/main/core/runtime/v2))
+  where the dot-connected string `io.containerd.kata.v2` is translated to `containerd-shim-kata-v2` (i.e. the
+  binary name of the Kata implementation of [Containerd Runtime V2 (Shim API)](https://github.com/containerd/containerd/tree/main/core/runtime/v2)). By default, the `containerd-shim-kata-v2` (short of `shimv2`) binary will be installed under the path of `/usr/local/bin/`.
+
+And `<X>` is `io.containerd.cri.v1.runtime` for containerd v2.x and `io.containerd.grpc.v1.cri` for containerd v1.7.x.
+
++ In containerd 1.7.x
 
 ```toml
     [plugins.cri.containerd]
@@ -149,12 +187,36 @@ The following configuration includes two runtime classes:
             CriuPath = ""
             CriuWorkPath = ""
             IoGid = 0
-      [plugins.cri.containerd.runtimes.kata]
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
          runtime_type = "io.containerd.kata.v2"
          privileged_without_host_devices = true
          pod_annotations = ["io.katacontainers.*"]
          container_annotations = ["io.katacontainers.*"]
          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+            ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration.toml"
+```
+
++ In containerd 2.x
+
+```toml
+    [plugins."io.containerd.cri.v1.runtime".containerd]
+      no_pivot = false
+    [plugins."io.containerd.cri.v1.runtime".containerd.runtimes]
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+         privileged_without_host_devices = false
+         runtime_type = "io.containerd.runc.v2"
+        [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
+            BinaryName = ""
+            CriuImagePath = ""
+            CriuPath = ""
+            CriuWorkPath = ""
+            IoGid = 0
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata]
+         runtime_type = "io.containerd.kata.v2"
+         privileged_without_host_devices = true
+         pod_annotations = ["io.katacontainers.*"]
+         container_annotations = ["io.katacontainers.*"]
+         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
             ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration.toml"
 ```
 
@@ -164,26 +226,62 @@ The following configuration includes two runtime classes:
 
 `container_annotations` is the list of container annotations passed through to the OCI config of the containers.
 
-This `ConfigPath` option is optional. If you do not specify it, shimv2 first tries to get the configuration file from the environment variable `KATA_CONF_FILE`. If neither are set, shimv2 will use the default Kata configuration file paths (`/etc/kata-containers/configuration.toml` and `/usr/share/defaults/kata-containers/configuration.toml`).
+This `ConfigPath` option is optional. If you want to use a different configuration file, you can specify the path of the configuration file with `ConfigPath` in the containerd configuration file. We use containerd 2.x configuration as an example here, and the configuration for containerd 1.7.x is similar, just replace `io.containerd.cri.v1.runtime` with `io.containerd.grpc.v1.cri`.
+
+```toml
+         [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata.options]
+            ConfigPath = "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+```
+
+> **Note:** In this example, the specified `ConfigPath` is valid in Kubernetes/Containerd workflow with containerd v1.7+ but doesn't work with ctr and nerdctl.
+
+If you do not specify it, `shimv2` first tries to get the configuration file from the environment variable `KATA_CONF_FILE`. If you want to adopt this way, you should first create a shell script as `containerd-shim-kata-v2` which is placed under the path of `/usr/local/bin/`. The following is an example of the shell script `containerd-shim-kata-qemu-v2` which specifies the configuration file with `KATA_CONF_FILE`
+
+> **Note:** Just use containerd 2.x configuration as an example, the configuration for containerd 1.7.x is similar, just replace `io.containerd.cri.v1.runtime` with `io.containerd.grpc.v1.cri`
+
+```shell
+~$ cat /usr/local/bin/containerd-shim-kata-qemu-v2
+#!/bin/bash
+KATA_CONF_FILE=/opt/kata/share/defaults/kata-containers/configuration-qemu.toml /opt/kata/bin/containerd-shim-kata-v2 "$@"
+```
+
+And then just reference it in the configuration of containerd:
+
+```toml
+      [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-qemu]
+         runtime_type = "io.containerd.kata-qemu.v2"
+```
+
+Finally you can run a Kata container with the runtime `io.containerd.kata-qemu.v2`:
+
+```shell
+$ sudo ctr run --cni --runtime io.containerd.kata-qemu.v2 -t --rm docker.io/library/busybox:latest hello sh
+```
+
+> **Note:** The `KATA_CONF_FILE` environment variable is valid in both Kubernetes/Containerd workflow with containerd and containerd tools(ctr, nerdctl, etc.) scenarios.
+
+If neither are set, shimv2 will use the default Kata configuration file paths (`/etc/kata-containers/configuration.toml` and `/usr/share/defaults/kata-containers/configuration.toml` and `/opt/kata/share/defaults/kata-containers/configuration.toml`).
 
 #### Kata Containers as the runtime for untrusted workload
 
-For cases without `RuntimeClass` support, we can use the legacy annotation method to support using Kata Containers 
-for an untrusted workload. With the following configuration, you can run trusted workloads with a runtime such as `runc` 
-and then, run an untrusted workload with Kata Containers: 
+For cases without `RuntimeClass` support, we can use the legacy annotation method to support using Kata Containers
+for an untrusted workload. With the following configuration, you can run trusted workloads with a runtime such as `runc`
+and then, run an untrusted workload with Kata Containers:
 
 ```toml
-    [plugins.cri.containerd]
-    # "plugins.cri.containerd.default_runtime" is the runtime to use in containerd.
-    [plugins.cri.containerd.default_runtime]
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+    # "plugins."io.containerd.grpc.v1.cri".containerd.default_runtime" is the runtime to use in containerd.
+    [plugins."io.containerd.grpc.v1.cri".containerd.default_runtime]
       # runtime_type is the runtime type to use in containerd e.g. io.containerd.runtime.v1.linux
       runtime_type = "io.containerd.runtime.v1.linux"
 
-    # "plugins.cri.containerd.untrusted_workload_runtime" is a runtime to run untrusted workloads on it.
-    [plugins.cri.containerd.untrusted_workload_runtime]
+    # "plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime" is a runtime to run untrusted workloads on it.
+    [plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime]
       # runtime_type is the runtime type to use in containerd e.g. io.containerd.runtime.v1.linux
       runtime_type = "io.containerd.kata.v2"
 ```
+
+> **Note:** The `untrusted_workload_runtime` is deprecated since containerd v1.7.0, and it is recommended to use `RuntimeClass` instead.
 
 You can find more information on the [Containerd config documentation](https://github.com/containerd/containerd/blob/main/docs/cri/config.md)
 
@@ -192,8 +290,8 @@ You can find more information on the [Containerd config documentation](https://g
 If you want to set Kata Containers as the only runtime in the deployment, you can simply configure as follows:
 
 ```toml
-    [plugins.cri.containerd]
-    [plugins.cri.containerd.default_runtime]
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+    [plugins."io.containerd.grpc.v1.cri".containerd.default_runtime]
       runtime_type = "io.containerd.kata.v2"
 ```
 
@@ -201,9 +299,9 @@ If you want to set Kata Containers as the only runtime in the deployment, you ca
 
 > **Note:** If you skipped the [Install `cri-tools`](#install-cri-tools) section, you can skip this section too.
 
-First, add the CNI configuration in the containerd configuration. 
+First, add the CNI configuration in the containerd configuration.
 
-The following is the configuration if you installed CNI as the *[Install CNI plugins](#install-cni-plugins)* section outlined. 
+The following is the configuration if you installed CNI as the *[Install CNI plugins](#install-cni-plugins)* section outlined.
 
 Put the CNI configuration as `/etc/cni/net.d/10-mynet.conf`:
 
@@ -246,11 +344,14 @@ debug: true
 
 ### Launch containers with `ctr` command line
 
+> **Note:** With containerd command tool `ctr`, the `ConfigPath` is not supported, and the configuration file should be explicitly specified with the option `--runtime-config-path`, otherwise, it'll use the default configurations.
+
 To run a container with Kata Containers through the containerd command line, you can run the following:
 
 ```bash
 $ sudo ctr image pull docker.io/library/busybox:latest
-$ sudo ctr run --cni --runtime io.containerd.run.kata.v2 -t --rm docker.io/library/busybox:latest hello sh
+$ CONFIG_PATH="/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+$ sudo ctr run --cni --runtime io.containerd.kata.v2 --runtime-config-path $CONFIG_PATH -t --rm docker.io/library/busybox:latest hello sh
 ```
 
 This launches a BusyBox container named `hello`, and it will be removed by `--rm` after it quits.
@@ -260,7 +361,9 @@ loopback interface is created.
 ### Launch containers using `ctr` command line with rootfs bundle
 
 #### Get rootfs
+
 Use the script to create rootfs
+
 ```bash
 ctr i pull quay.io/prometheus/busybox:latest
 ctr i export rootfs.tar quay.io/prometheus/busybox:latest
@@ -278,7 +381,9 @@ for ((i=0;i<$(cat ${layers_dir}/manifest.json | jq -r ".[].Layers | length");i++
   tar -C ${rootfs_dir} -xf ${layers_dir}/$(cat ${layers_dir}/manifest.json | jq -r ".[].Layers[${i}]")
 done
 ```
+
 #### Get `config.json`
+
 Use runc spec to generate `config.json`
 ```bash
 cd ./bundle/rootfs
@@ -295,10 +400,13 @@ Change the root `path` in `config.json` to the absolute path of rootfs
 ```
 
 #### Run container
+
 ```bash
-sudo ctr run -d --runtime io.containerd.run.kata.v2 --config bundle/config.json hello
+CONFIG_PATH="/opt/kata/share/defaults/kata-containers/configuration-qemu.toml"
+sudo ctr run -d --runtime io.containerd.kata.v2 --runtime-config-path $CONFIG_PATH --config bundle/config.json hello
 sudo ctr t exec --exec-id ${ID} -t hello sh
 ```
+
 ### Launch Pods with `crictl` command line
 
 With the `crictl` command line of `cri-tools`, you can specify runtime class with `-r` or `--runtime` flag.
@@ -324,7 +432,7 @@ $ sudo crictl start 1aab7585530e6
 1aab7585530e6
 ```
 
-In Kubernetes, you need to create a `RuntimeClass` resource and add the `RuntimeClass` field in the Pod Spec 
+In Kubernetes, you need to create a `RuntimeClass` resource and add the `RuntimeClass` field in the Pod Spec
 (see this [document](https://kubernetes.io/docs/concepts/containers/runtime-class/) for more information).
 
 If `RuntimeClass` is not supported, you can use the following annotation in a Kubernetes pod to identify as an untrusted workload:

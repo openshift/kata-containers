@@ -14,14 +14,14 @@
 [hypervisor.qemu]
 path = "@QEMUPATH@"
 kernel = "@KERNELPATH_NV@"
-initrd = "@INITRDPATH_NV@"
+image = "@IMAGEPATH_NV@"
 machine_type = "@MACHINETYPE@"
 
 # rootfs filesystem type:
-#   - ext4 (default)
+#   - ext4
 #   - xfs
-#   - erofs
-rootfs_type = @DEFROOTFSTYPE@
+#   - erofs (default for NVIDIA)
+rootfs_type = @DEFROOTFSTYPE_NV@
 
 # Enable running QEMU VMM as a non-root user.
 # By default QEMU VMM run as root. When this is set to true, QEMU VMM process runs as
@@ -51,9 +51,14 @@ valid_hypervisor_paths = @QEMUVALIDHYPERVISORPATHS@
 # container and look for 'default-kernel-parameters' log entries.
 kernel_params = "@KERNELPARAMS_NV@"
 
+# Optional dm-verity parameters (comma-separated key=value list):
+# root_hash=...,salt=...,data_blocks=...,data_block_size=...,hash_block_size=...
+# These are used by the runtime to assemble dm-verity kernel params.
+kernel_verity_params = "@KERNELVERITYPARAMS_NV@"
+
 # Path to the firmware.
 # If you want that qemu uses the default firmware leave this option empty
-firmware = "@FIRMWAREPATH@"
+firmware = "@FIRMWAREPATH_NV@"
 
 # Path to the firmware volume.
 # firmware TDVF or OVMF can be split into FIRMWARE_VARS.fd (UEFI variables
@@ -144,12 +149,18 @@ memory_offset = 0
 # Default false
 enable_virtio_mem = false
 
-# Disable block device from being used for a container's rootfs.
+# Disable hotplugging host block devices to guest VMs for container rootfs.
 # In case of a storage driver like devicemapper where a container's
 # root file system is backed by a block device, the block device is passed
 # directly to the hypervisor for performance reasons.
 # This flag prevents the block device from being passed to the hypervisor,
 # virtio-fs is used instead to pass the rootfs.
+# WARNING:
+#   Don't set this flag to false if you don't understand well the behavior of
+#   your container runtime and image snapshotter. Some snapshotters might use
+#   container image storage devices that are not meant to be hotplugged into a
+#   guest VM - e.g., because they contain files used by the host or by other
+#   guests.
 disable_block_device_use = @DEFDISABLEBLOCK@
 
 # Shared file system type:
@@ -235,6 +246,16 @@ block_device_cache_direct = false
 # Default false
 block_device_cache_noflush = false
 
+# Specifies the logical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_logical_sector_size = 0
+
+# Specifies the physical sector size, in bytes, reported by block devices to the guest.
+# Common values are 512 and 4096. Set to 0 to use the QEMU/hypervisor default.
+# Default 0
+block_device_physical_sector_size = 0
+
 # Enable iothreads (data-plane) to be used. This causes IO to be
 # handled in a separate IO thread. This is currently implemented
 # for virtio-scsi and virtio-blk.
@@ -292,6 +313,21 @@ enable_iommu = false
 # Enable IOMMU_PLATFORM, default false
 # Enabling this will result in the VM device having iommu_platform=on set
 enable_iommu_platform = false
+
+# Enable NUMA topology, default false
+# When enable_numa is enabled, the hypervisor will expose host NUMA topology
+# as is: map VM NUMA nodes to host 1:1 and bind vCPUs to related CPUs.
+# Note: To take proper advantage of NUMA, static_sandbox_resource_mgmt should
+# also be enabled for memory pre-allocation.
+enable_numa = false
+
+# NUMA node mapping allows customizing how VM NUMA nodes map to host NUMA nodes.
+# Each entry defines a VM NUMA node and the host NUMA node(s) it maps to.
+# Format: ["<host_nodes>", "<host_nodes>", ...]
+# Example: ["0", "1"] creates 2 VM NUMA nodes, mapping to host nodes 0 and 1
+# Example: ["0-1", "2-3"] creates 2 VM NUMA nodes, first maps to host 0-1, second to 2-3
+# If empty and enable_numa is true, VM NUMA nodes map 1:1 to host NUMA nodes.
+numa_mapping = []
 
 # List of valid annotations values for the vhost user store path
 # The default if not set is empty (all annotations rejected.)
@@ -355,16 +391,16 @@ msize_9p = @DEFMSIZE9P@
 # nvdimm is not supported when `confidential_guest = true`.
 disable_image_nvdimm = @DEFDISABLEIMAGENVDIMM_NV@
 
-# Enable hot-plugging of VFIO devices to a bridge-port, 
-# root-port or switch-port. 
+# Enable hot-plugging of VFIO devices to a bridge-port,
+# root-port or switch-port.
 # The default setting is  "no-port"
 hot_plug_vfio = "no-port"
 
 # In a confidential compute environment hot-plugging can compromise
-# security. 
-# Enable cold-plugging of VFIO devices to a bridge-port, 
-# root-port or switch-port. 
-# The default setting is  "no-port", which means disabled. 
+# security.
+# Enable cold-plugging of VFIO devices to a bridge-port,
+# root-port or switch-port.
+# The default setting is  "no-port", which means disabled.
 cold_plug_vfio = "@DEFAULTVFIOPORT_NV@"
 
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
@@ -552,7 +588,14 @@ debug_console_enabled = false
 
 # Agent connection dialing timeout value in seconds
 # (default: 90)
-dial_timeout = 90
+dial_timeout = @DEFAULTTIMEOUT_NV@
+
+# Timeout in seconds for guest components (attestation-agent, confidential-data-hub)
+# to create their Unix sockets after being spawned by the agent.
+# With NVIDIA GPUs and NVSwitches, the attestation-agent needs extra time
+# to collect evidence during initialization.
+# (agent default when unset: 6)
+launch_process_timeout = @DEFAULTLAUNCHPROCESSTIMEOUT_NV@
 
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
@@ -588,7 +631,7 @@ disable_guest_seccomp = @DEFDISABLEGUESTSECCOMP@
 # vCPUs pinning settings
 # if enabled, each vCPU thread will be scheduled to a fixed CPU
 # qualified condition: num(vCPU threads) == num(CPUs in sandbox's CPUSet)
-enable_vcpus_pinning = false
+enable_vcpus_pinning = @DEFENABLEVCPUPINNING_NV@
 
 # Apply a custom SELinux security policy to the container process inside the VM.
 # This is used when you want to apply a type other than the default `container_t`,
@@ -670,6 +713,18 @@ vfio_mode = "@DEFVFIOMODE@"
 # be created on the host and shared via virtio-fs. This is potentially slower, but allows sharing of files from host to guest.
 disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 
+# Specifies how Kubernetes emptyDir volumes are handled.
+# Options:
+#
+#   - shared-fs (default)
+#     Shares the emptyDir folder with the guest using the method given
+#     by the `shared_fs` setting.
+#
+#   - block-encrypted
+#     Plugs a block device to be encrypted in the guest.
+#
+emptydir_mode = "@DEFEMPTYDIRMODE@"
+
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
@@ -683,9 +738,9 @@ enable_pprof = false
 
 # Indicates the CreateContainer request timeout needed for the workload(s)
 # It using guest_pull this includes the time to pull the image inside the guest
-# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)  
-# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config 
-# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout. 
+# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)
+# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config
+# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout.
 # In essence, the timeout used for guest pull=runtime-request-timeout<create_container_timeout?runtime-request-timeout:create_container_timeout.
 create_container_timeout = @DEFAULTTIMEOUT_NV@
 
@@ -697,6 +752,11 @@ create_container_timeout = @DEFAULTTIMEOUT_NV@
 # to the hypervisor.
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
+
+# kubelet_root_dir is the kubelet root directory used to match ConfigMap/Secret
+# volume paths for propagation. Override for distros that use a different path
+# (e.g. k0s: /var/lib/k0s/kubelet).
+kubelet_root_dir = "@DEFKUBELETROOTDIR@"
 
 # pod_resource_api_sock specifies the unix socket for the Kubelet's
 # PodResource API endpoint. If empty, kubernetes based cold plug

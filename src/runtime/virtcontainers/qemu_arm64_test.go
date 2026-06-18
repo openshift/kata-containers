@@ -122,43 +122,11 @@ func TestQemuArm64AppendImage(t *testing.T) {
 			ID:       "mem0",
 			MemPath:  f.Name(),
 			Size:     (uint64)(imageStat.Size()),
+			ReadOnly: true,
 		},
 	}
 
 	devices, err = arm64.appendImage(context.Background(), devices, f.Name())
-	assert.NoError(err)
-	assert.Equal(expectedOut, devices)
-}
-
-func TestQemuArm64AppendNvdimmImage(t *testing.T) {
-	var devices []govmmQemu.Device
-	assert := assert.New(t)
-
-	f, err := os.CreateTemp("", "img")
-	assert.NoError(err)
-	defer func() { _ = f.Close() }()
-	defer func() { _ = os.Remove(f.Name()) }()
-
-	imageStat, err := f.Stat()
-	assert.NoError(err)
-
-	cfg := qemuConfig(QemuVirt)
-	cfg.ImagePath = f.Name()
-	arm64, err := newQemuArch(cfg)
-	assert.NoError(err)
-
-	expectedOut := []govmmQemu.Device{
-		govmmQemu.Object{
-			Driver:   govmmQemu.NVDIMM,
-			Type:     govmmQemu.MemoryBackendFile,
-			DeviceID: "nv0",
-			ID:       "mem0",
-			MemPath:  f.Name(),
-			Size:     (uint64)(imageStat.Size()),
-		},
-	}
-
-	devices, err = arm64.appendNvdimmImage(devices, f.Name())
 	assert.NoError(err)
 	assert.Equal(expectedOut, devices)
 }

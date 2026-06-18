@@ -58,19 +58,20 @@ func unmountNoFollow(path string) error {
 	return syscall.Unmount(path, syscall.MNT_DETACH|UmountNoFollow)
 }
 
-// Resolve the K8S root dir if it is a symbolic link
-func resolveRootDir() string {
-	rootDir, err := os.Readlink(defaultKubernetesRootDir)
-	if err != nil {
-		// Use the default root dir in case of any errors resolving the root dir symlink
-		return defaultKubernetesRootDir
+// resolveRootDirWithBase returns the resolved (followed symlink) kubelet root path.
+// If base is non-empty it is used as the root; otherwise defaultKubernetesRootDir is used.
+func resolveRootDirWithBase(base string) string {
+	if base == "" {
+		base = defaultKubernetesRootDir
 	}
-	// Make root dir an absolute path if needed
+	rootDir, err := os.Readlink(base)
+	if err != nil {
+		return base
+	}
 	if !filepath.IsAbs(rootDir) {
-		rootDir, err = filepath.Abs(filepath.Join(filepath.Dir(defaultKubernetesRootDir), rootDir))
+		rootDir, err = filepath.Abs(filepath.Join(filepath.Dir(base), rootDir))
 		if err != nil {
-			// Use the default root dir in case of any errors resolving the root dir symlink
-			return defaultKubernetesRootDir
+			return base
 		}
 	}
 	return rootDir
@@ -99,9 +100,14 @@ func NewFilesystemShare(s *Sandbox) (*FilesystemShare, error) {
 		return nil, fmt.Errorf("Creating watcher returned error %w", err)
 	}
 
-	kubernetesRootDir := resolveRootDir()
-	configVolRegex := regexp.MustCompile("^" + kubernetesRootDir + configVolRegexString)
-	timestampDirRegex := regexp.MustCompile("^" + kubernetesRootDir + configVolRegexString + timestampDirRegexString)
+	baseRoot := ""
+	if s.config != nil {
+		baseRoot = s.config.KubeletRootDir
+	}
+	kubernetesRootDir := resolveRootDirWithBase(baseRoot)
+	quotedRoot := regexp.QuoteMeta(kubernetesRootDir)
+	configVolRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString)
+	timestampDirRegex := regexp.MustCompile("^" + quotedRoot + configVolRegexString + timestampDirRegexString)
 
 	return &FilesystemShare{
 		prepared:           false,
@@ -325,7 +331,8 @@ func (f *FilesystemShare) ShareFile(ctx context.Context, c *Container, m *Mount)
 				return err
 			}
 
-			if !(info.Mode().IsRegular() || info.Mode().IsDir() || (info.Mode()&os.ModeSymlink) == os.ModeSymlink) {
+			mode := info.Mode()
+			if !mode.IsRegular() && !mode.IsDir() && mode&os.ModeSymlink != os.ModeSymlink {
 				f.Logger().WithField("ignored-file", srcPath).Debug("Ignoring file as FS sharing not supported")
 				if srcPath == srcRoot {
 					// Ignore the mount if this is not a regular file (excludes socket, device, ...) as it cannot be handled by
@@ -693,17 +700,17 @@ func (f *FilesystemShare) ShareRootFilesystem(ctx context.Context, c *Container)
 			f.Logger().Error("malformed block drive")
 			return nil, fmt.Errorf("malformed block drive")
 		}
-		switch {
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioMmio:
+		switch f.sandbox.config.HypervisorConfig.BlockDeviceDriver {
+		case config.VirtioMmio:
 			rootfsStorage.Driver = kataMmioBlkDevType
 			rootfsStorage.Source = blockDrive.VirtPath
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlockCCW:
+		case config.VirtioBlockCCW:
 			rootfsStorage.Driver = kataBlkCCWDevType
 			rootfsStorage.Source = blockDrive.DevNo
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioBlock:
+		case config.VirtioBlock:
 			rootfsStorage.Driver = kataBlkDevType
 			rootfsStorage.Source = blockDrive.PCIPath.String()
-		case f.sandbox.config.HypervisorConfig.BlockDeviceDriver == config.VirtioSCSI:
+		case config.VirtioSCSI:
 			rootfsStorage.Driver = kataSCSIDevType
 			rootfsStorage.Source = blockDrive.SCSIAddr
 		default:

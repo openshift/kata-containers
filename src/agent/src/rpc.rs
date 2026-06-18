@@ -9,6 +9,7 @@ use kata_agent_policy::policy::PolicyCopyFileRequest;
 use rustjail::{pipestream::PipeStream, process::StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 
 use std::convert::TryFrom;
 #[cfg(feature = "agent-policy")]
@@ -18,6 +19,7 @@ use std::fmt::Debug;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+#[cfg(target_arch = "s390x")]
 use std::str::FromStr;
 use std::sync::Arc;
 use ttrpc::{
@@ -69,7 +71,7 @@ use crate::device::block_device_handler::get_virtio_blk_pci_device_name;
 use crate::device::network_device_handler::wait_for_ccw_net_interface;
 #[cfg(not(target_arch = "s390x"))]
 use crate::device::network_device_handler::wait_for_pci_net_interface;
-use crate::device::{add_devices, handle_cdi_devices, update_env_pci};
+use crate::device::{add_devices, dump_nvidia_cdi_yaml, handle_cdi_devices, update_env_pci};
 use crate::features::get_build_features;
 use crate::metrics::get_metrics;
 use crate::mount::baremount;
@@ -101,7 +103,6 @@ use libc::{self, c_char, c_ushort, pid_t, winsize, TIOCSWINSZ};
 use std::fs;
 use std::os::unix::prelude::PermissionsExt;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use nix::unistd::{Gid, Uid};
 use std::fs::{File, OpenOptions};
@@ -249,6 +250,7 @@ impl AgentService {
         // or other entities for a specifc device.
         // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
         // readonly
+        dump_nvidia_cdi_yaml(&sl())?;
         handle_cdi_devices(&sl(), &mut oci, "/var/run/cdi", AGENT_CONFIG.cdi_timeout).await?;
 
         // Handle trusted storage configuration before mounting any storage
@@ -638,6 +640,69 @@ impl AgentService {
         Ok(resp)
     }
 
+    async fn do_read_termination_log(
+        &self,
+        container_id: &str,
+    ) -> Result<protocols::agent::GetDiagnosticDataResponse> {
+        let host_path = {
+            let sandbox = self.sandbox.lock().await;
+            let ctr = sandbox
+                .containers
+                .get(container_id)
+                .ok_or_else(|| anyhow!("Invalid container id: {}", container_id))?;
+
+            let spec = ctr
+                .config
+                .spec
+                .as_ref()
+                .ok_or_else(|| anyhow!("No OCI spec for container {}", container_id))?;
+
+            let annotations = spec.annotations().as_ref();
+            let termination_path = annotations
+                .and_then(|a| a.get("io.kubernetes.container.terminationMessagePath"))
+                .ok_or_else(|| anyhow!("No terminationMessagePath annotation"))?;
+
+            // The path is the *container* destination (e.g. /dev/termination-log). The agent
+            // runs outside the container mount namespace; the file is on the guest at the
+            // bind-mount source (e.g. /run/kata-containers/shared/containers/...-termination-log).
+            let term_dest = Path::new(termination_path.as_str());
+            spec.mounts()
+                .as_ref()
+                .and_then(|mounts| {
+                    mounts.iter().find_map(|m| {
+                        if m.destination() == term_dest {
+                            m.source().clone()
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "termination message mount not found for {}",
+                        termination_path
+                    )
+                })?
+        };
+
+        // Kubernetes caps termination messages at 4 KiB; read raw bytes with
+        // the same limit so a malicious workload cannot exhaust agent memory,
+        // and handle non-UTF-8 content gracefully.
+        const MAX_TERMINATION_MSG: usize = 4096;
+        let contents = match tokio::fs::read(&host_path).await {
+            Ok(mut buf) => {
+                buf.truncate(MAX_TERMINATION_MSG);
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(anyhow!("Failed to read termination log: {}", e)),
+        };
+
+        let mut resp = protocols::agent::GetDiagnosticDataResponse::new();
+        resp.data = contents;
+        Ok(resp)
+    }
+
     async fn do_write_stream(
         &self,
         req: protocols::agent::WriteStreamRequest,
@@ -706,25 +771,66 @@ impl AgentService {
 
         let reader = reader.ok_or_else(|| anyhow!("cannot get stream reader"))?;
 
-        tokio::select! {
-            // Poll the futures in the order they appear from top to bottom
-            // it is very important to avoid data loss. If there is still
-            // data in the buffer and read_stream branch will return
-            // Poll::Ready so that the term_exit_notifier will never polled
-            // before all data were read.
+        // Create one in-flight read future and reuse it in both branches.
+        let read_fut = read_stream(&reader, req.len as usize);
+        tokio::pin!(read_fut);
+
+        // Cancellation and polling model: Rust async is polled, not preempted.
+        // `Future::poll()` is a synchronous function call that runs to completion and
+        // returns Ready or Pending (`std::future::Future`).
+        // Readiness notifications (Waker::wake / Tokio Notify) only schedule the task
+        // to be polled again later; they do not interrupt an in-progress poll.
+        // Therefore, a Notify becoming ready while `poll_read()` is executing cannot cause
+        // the read future to be dropped mid-way; cancellation can only happen when the branch
+        // is still pending between polls (Tokio `select!` cancels by dropping non-selected futures).
+        // Detailed information, please refer to Tokio doc for more information:
+        // - Future::poll: https://doc.rust-lang.org/std/future/trait.Future.html
+        // - Waker: https://doc.rust-lang.org/std/task/struct.Waker.html
+        // - Tokio select!: https://docs.rs/tokio/latest/tokio/macro.select.html
+        let data = tokio::select! {
+            // Use `biased` to make the polling order deterministic (top-to-bottom).
+            // This ensures that *when multiple branches are ready at the same time*,
+            // we prefer reading pending output over reacting to the exit notification.
+            //
+            // Note: `biased` does NOT guarantee that we won't lose output. If the exit
+            // notification becomes ready while `read_stream` is still pending, the
+            // exit branch may be selected and we may stop reading before draining the
+            // remaining buffered data.
+            //
+            // Detailed information, please refer to Tokio doc for more information:
+            // https://docs.rs/tokio/latest/src/tokio/macros/select.rs.html#67
             biased;
-            v = read_stream(&reader, req.len as usize)  => {
-                let vector = v?;
 
-                let mut resp = ReadStreamResponse::new();
-                resp.set_data(vector);
-
-                Ok(resp)
-            }
+            v = &mut read_fut => v?,
             _ = term_exit_notifier.notified() => {
-                Err(anyhow!("eof"))
+                // Drain-after-exit rationale:
+                // The process has exited, but the data may still be buffered in the pipe/pty.
+                // We should keep waiting for the same in-flight read for a bounded window to drain the data.
+                //
+                // It enters this branch only if `term_exit_notifier.notified()` fires. It then try to "drain"
+                // any remaining buffered output for a short, bounded time window:
+                // - If non-empty data is read: return immediately.
+                // - else then return empty data as EOF.
+
+                const DRAIN_DEADLINE_MS: u64 = 500; // 500ms
+                let deadline = Duration::from_millis(DRAIN_DEADLINE_MS);
+
+                // Attempt to drain remaining buffered output after process exit
+                // Try reading with timeout
+                match timeout(deadline, &mut read_fut).await {
+                    Ok(v) => v?, // got data or EOF (empty)
+                    _ => {
+                        warn!(sl(), "exit-drain timeout, return EOF"; "container-id" => cid, "exec-id" => eid);
+                        Vec::new() // Return empty as EOF
+                    }
+                }
             }
-        }
+        };
+
+        let mut resp = ReadStreamResponse::new();
+        resp.set_data(data);
+
+        Ok(resp)
     }
 }
 
@@ -1025,10 +1131,11 @@ impl agent_ttrpc::AgentService for AgentService {
         if !interface.devicePath.is_empty() {
             #[cfg(not(target_arch = "s390x"))]
             {
-                let pcipath = pci::Path::from_str(&interface.devicePath).map_ttrpc_err(|e| {
-                    format!("Unexpected pci-path for network interface: {e:?}")
-                })?;
-                wait_for_pci_net_interface(&self.sandbox, &pcipath)
+                let (root_complex, pcipath) = pcipath_from_dev_tree_path(&interface.devicePath)
+                    .map_ttrpc_err(|e| {
+                        format!("Invalid PCI path for network interface: {:?}", e)
+                    })?;
+                wait_for_pci_net_interface(&self.sandbox, root_complex, &pcipath)
                     .await
                     .map_ttrpc_err(|e| format!("interface not available: {e:?}"))?;
             }
@@ -1609,6 +1716,26 @@ impl agent_ttrpc::AgentService for AgentService {
         Ok(Empty::new())
     }
 
+    async fn get_diagnostic_data(
+        &self,
+        ctx: &TtrpcContext,
+        req: protocols::agent::GetDiagnosticDataRequest,
+    ) -> ttrpc::Result<protocols::agent::GetDiagnosticDataResponse> {
+        trace_rpc_call!(ctx, "get_diagnostic_data", req);
+        is_allowed(&req).await?;
+
+        match req.log_type.as_str() {
+            "termination_log" => self
+                .do_read_termination_log(&req.container_id)
+                .await
+                .map_ttrpc_err(same),
+            other => Err(ttrpc_error(
+                ttrpc::Code::INVALID_ARGUMENT,
+                format!("unsupported diagnostic log_type: {other}"),
+            )),
+        }
+    }
+
     async fn mem_agent_memcg_set(
         &self,
         _ctx: &::ttrpc::r#async::TtrpcContext,
@@ -1787,10 +1914,6 @@ async fn read_stream(reader: &Mutex<ReadHalf<PipeStream>>, l: usize) -> Result<V
     let mut reader = reader.lock().await;
     let len = reader.read(&mut content).await?;
     content.resize(len, 0);
-
-    if len == 0 {
-        return Err(anyhow!("read meet eof"));
-    }
 
     Ok(content)
 }
@@ -2140,7 +2263,9 @@ async fn do_add_swap(sandbox: &Arc<Mutex<Sandbox>>, req: &AddSwapRequest) -> Res
         slots.push(pci::SlotFn::new(*slot, 0)?);
     }
     let pcipath = pci::Path::new(slots)?;
-    let dev_name = get_virtio_blk_pci_device_name(sandbox, &pcipath).await?;
+    // Default all virtio devices to root_complex 00 aka pcie.0
+    let root_complex = "00";
+    let dev_name = get_virtio_blk_pci_device_name(sandbox, root_complex, &pcipath).await?;
 
     let c_str = CString::new(dev_name)?;
     let ret = unsafe { libc::swapon(c_str.as_ptr() as *const c_char, 0) };
@@ -2282,9 +2407,6 @@ fn is_sealed_secret_path(source_path: &str) -> bool {
 }
 
 async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
-    if !confidential_data_hub::is_cdh_client_initialized() {
-        return Ok(());
-    }
     let linux = oci
         .linux()
         .as_ref()
@@ -2294,30 +2416,63 @@ async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
         for specdev in devices.iter() {
             if specdev.path().as_path().to_str() == Some(TRUSTED_IMAGE_STORAGE_DEVICE) {
                 let dev_major_minor = format!("{}:{}", specdev.major(), specdev.minor());
-                let secure_storage_integrity = AGENT_CONFIG.secure_storage_integrity.to_string();
-                info!(
-                    sl(),
-                    "trusted_store device major:min {}, enable data integrity {}",
-                    dev_major_minor,
-                    secure_storage_integrity
-                );
-
-                let options = std::collections::HashMap::from([
-                    ("deviceId".to_string(), dev_major_minor),
-                    ("encryptType".to_string(), "LUKS".to_string()),
-                    ("dataIntegrity".to_string(), secure_storage_integrity),
-                ]);
-                confidential_data_hub::secure_mount(
-                    "BlockDevice",
-                    &options,
-                    vec![],
+                cdh_secure_mount(
+                    "block-device",
+                    &dev_major_minor,
+                    "luks2",
                     KATA_IMAGE_WORK_DIR,
+                    "-E lazy_journal_init",
                 )
                 .await?;
                 break;
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) async fn cdh_secure_mount(
+    device_type: &str,
+    device_id: &str,
+    encrypt_type: &str,
+    mount_point: &str,
+    mkfs_opts: &str,
+) -> Result<()> {
+    if !confidential_data_hub::is_cdh_client_initialized() {
+        return Ok(());
+    }
+
+    let integrity = AGENT_CONFIG.secure_storage_integrity.to_string();
+
+    info!(
+        sl(),
+        "cdh_secure_mount: device_type {}, device_id {}, encrypt_type {}, integrity {}, mkfs_opts {}",
+        device_type,
+        device_id,
+        encrypt_type,
+        integrity,
+        mkfs_opts
+    );
+
+    let options = std::collections::HashMap::from([
+        ("deviceId".to_string(), device_id.to_string()),
+        ("sourceType".to_string(), "empty".to_string()),
+        ("targetType".to_string(), "fileSystem".to_string()),
+        ("filesystemType".to_string(), "ext4".to_string()),
+        ("mkfsOpts".to_string(), mkfs_opts.to_string()),
+        ("encryptionType".to_string(), encrypt_type.to_string()),
+        ("dataIntegrity".to_string(), integrity),
+    ]);
+
+    std::fs::create_dir_all(mount_point).inspect_err(|e| {
+        error!(
+            sl(),
+            "Failed to create mount point directory {}: {:?}", mount_point, e
+        );
+    })?;
+
+    confidential_data_hub::secure_mount(device_type, &options, vec![], mount_point).await?;
+
     Ok(())
 }
 

@@ -44,13 +44,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
-Set the correct containerd conf path depending on the k8s distribution
+Set the correct containerd conf path depending on the k8s distribution.
+If containerd.configDir is set explicitly, use that instead.
 */}}
 {{- define "containerdConfPath" -}}
-{{- if eq .k8sDistribution "rke2" -}}
+{{- if and .containerd .containerd.configDir -}}
+{{- .containerd.configDir -}}
+{{- else if eq .k8sDistribution "rke2" -}}
 /var/lib/rancher/rke2/agent/etc/containerd/
 {{- else if eq .k8sDistribution "k3s" -}}
- /var/lib/rancher/k3s/agent/etc/containerd/
+/var/lib/rancher/k3s/agent/etc/containerd/
 {{- else if eq .k8sDistribution "k0s" -}}
 /etc/k0s/
 {{- else if eq .k8sDistribution "microk8s" -}}
@@ -97,13 +100,34 @@ Returns the namespace where node-feature-discovery is found, or empty string if 
 {{- end -}}
 
 {{/*
-Get enabled shims for a specific architecture from structured config
+Get enabled shims for a specific architecture from structured config.
+Uses null-based defaults for disableAll support:
+- enabled: ~ (null) + disableAll: false → enabled
+- enabled: ~ (null) + disableAll: true  → disabled
+- enabled: true  → always enabled (explicit override)
+- enabled: false → always disabled (explicit override)
 */}}
 {{- define "kata-deploy.getEnabledShimsForArch" -}}
 {{- $arch := .arch -}}
+{{- $disableAll := .root.Values.shims.disableAll | default false -}}
 {{- $enabledShims := list -}}
 {{- range $shimName, $shimConfig := .root.Values.shims -}}
-{{- if $shimConfig.enabled -}}
+{{- if ne $shimName "disableAll" -}}
+{{- /* Determine if shim is enabled based on enabled field and disableAll */ -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- /* Explicit true: always enabled */ -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- /* Explicit false: always disabled */ -}}
+{{- $shimEnabled = false -}}
+{{- else -}}
+{{- /* Null/unset: use inverse of disableAll (enabled by default, disabled when disableAll=true) */ -}}
+{{- if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- end -}}
+{{- if $shimEnabled -}}
 {{- $archSupported := false -}}
 {{- range $shimConfig.supportedArches -}}
 {{- if eq . $arch -}}
@@ -115,15 +139,26 @@ Get enabled shims for a specific architecture from structured config
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- join " " $enabledShims -}}
 {{- end -}}
 
 {{/*
-Get default shim for a specific architecture from structured config
+Get default shim for a specific architecture from structured config.
+Returns the configured default shim only if it is actually enabled and
+supports the requested architecture. Returns empty string otherwise so
+that callers can skip setting the env var rather than propagating a
+bogus value that would cause kata-deploy to fail at runtime.
 */}}
 {{- define "kata-deploy.getDefaultShimForArch" -}}
 {{- $arch := .arch -}}
-{{- index .root.Values.defaultShim $arch -}}
+{{- $defaultShim := index .root.Values.defaultShim $arch -}}
+{{- if $defaultShim -}}
+{{- $enabledShims := include "kata-deploy.getEnabledShimsForArch" (dict "root" .root "arch" $arch) | trim | splitList " " -}}
+{{- if has $defaultShim $enabledShims -}}
+{{- $defaultShim -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -132,9 +167,19 @@ Format: shim1:snapshotter1,shim2:snapshotter2
 */}}
 {{- define "kata-deploy.getSnapshotterHandlerMappingForArch" -}}
 {{- $arch := .arch -}}
+{{- $disableAll := .root.Values.shims.disableAll | default false -}}
 {{- $mappings := list -}}
 {{- range $shimName, $shimConfig := .root.Values.shims -}}
-{{- if $shimConfig.enabled -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if $shimEnabled -}}
 {{- $archSupported := false -}}
 {{- range $shimConfig.supportedArches -}}
 {{- if eq . $arch -}}
@@ -151,6 +196,7 @@ Format: shim1:snapshotter1,shim2:snapshotter2
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- join "," $mappings -}}
 {{- end -}}
 
@@ -160,9 +206,19 @@ Format: shim1:pullType1,shim2:pullType2
 */}}
 {{- define "kata-deploy.getPullTypeMappingForArch" -}}
 {{- $arch := .arch -}}
+{{- $disableAll := .root.Values.shims.disableAll | default false -}}
 {{- $mappings := list -}}
 {{- range $shimName, $shimConfig := .root.Values.shims -}}
-{{- if $shimConfig.enabled -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if $shimEnabled -}}
 {{- $archSupported := false -}}
 {{- range $shimConfig.supportedArches -}}
 {{- if eq . $arch -}}
@@ -183,6 +239,7 @@ Format: shim1:pullType1,shim2:pullType2
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- join "," $mappings -}}
 {{- end -}}
 
@@ -192,9 +249,19 @@ Output format: "shim:annotation1,annotation2" (space-separated entries, each wit
 */}}
 {{- define "kata-deploy.getAllowedHypervisorAnnotationsForArch" -}}
 {{- $arch := .arch -}}
+{{- $disableAll := .root.Values.shims.disableAll | default false -}}
 {{- $perShimAnnotations := list -}}
 {{- range $shimName, $shimConfig := .root.Values.shims -}}
-{{- if $shimConfig.enabled -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if $shimEnabled -}}
 {{- $archSupported := false -}}
 {{- range $shimConfig.supportedArches -}}
 {{- if eq . $arch -}}
@@ -214,6 +281,7 @@ Output format: "shim:annotation1,annotation2" (space-separated entries, each wit
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- join " " $perShimAnnotations -}}
 {{- end -}}
 
@@ -222,12 +290,23 @@ Get agent HTTPS proxy from structured config
 Builds per-shim semicolon-separated list: "shim1=value1;shim2=value2"
 */}}
 {{- define "kata-deploy.getAgentHttpsProxy" -}}
+{{- $disableAll := .Values.shims.disableAll | default false -}}
 {{- $proxies := list -}}
 {{- range $shimName, $shimConfig := .Values.shims -}}
-  {{- if and $shimConfig.enabled $shimConfig.agent $shimConfig.agent.httpsProxy -}}
-    {{- $entry := printf "%s=%s" $shimName $shimConfig.agent.httpsProxy -}}
-    {{- $proxies = append $proxies $entry -}}
-  {{- end -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if and $shimEnabled $shimConfig.agent $shimConfig.agent.httpsProxy -}}
+{{- $entry := printf "%s=%s" $shimName $shimConfig.agent.httpsProxy -}}
+{{- $proxies = append $proxies $entry -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- join ";" $proxies -}}
 {{- end -}}
@@ -237,14 +316,55 @@ Get agent NO_PROXY from structured config
 Builds per-shim semicolon-separated list: "shim1=value1;shim2=value2"
 */}}
 {{- define "kata-deploy.getAgentNoProxy" -}}
+{{- $disableAll := .Values.shims.disableAll | default false -}}
 {{- $proxies := list -}}
 {{- range $shimName, $shimConfig := .Values.shims -}}
-  {{- if and $shimConfig.enabled $shimConfig.agent $shimConfig.agent.noProxy -}}
-    {{- $entry := printf "%s=%s" $shimName $shimConfig.agent.noProxy -}}
-    {{- $proxies = append $proxies $entry -}}
-  {{- end -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if and $shimEnabled $shimConfig.agent $shimConfig.agent.noProxy -}}
+{{- $entry := printf "%s=%s" $shimName $shimConfig.agent.noProxy -}}
+{{- $proxies = append $proxies $entry -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- join ";" $proxies -}}
+{{- end -}}
+
+{{/*
+Main kata-deploy image reference for the DaemonSet.
+Supports tag (reference:tag) and digest (reference@sha256:...) formats.
+When reference contains "@" (digest), use reference as-is; otherwise use reference:tag (tag defaults to Chart.AppVersion).
+*/}}
+{{- define "kata-deploy.image" -}}
+{{- $ref := .Values.image.reference -}}
+{{- $tag := default .Chart.AppVersion .Values.image.tag | toString -}}
+{{- if contains "@" $ref -}}
+{{- $ref -}}
+{{- else -}}
+{{- printf "%s:%s" $ref $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+kubectl image reference for verification and cleanup jobs.
+Supports tag (reference:tag) and digest (reference@sha256:...) formats.
+When reference already contains "@" (digest) or tag is empty, use reference as-is.
+*/}}
+{{- define "kata-deploy.kubectlImage" -}}
+{{- $ref := .Values.kubectlImage.reference -}}
+{{- $tag := .Values.kubectlImage.tag | toString -}}
+{{- if or (contains "@" $ref) (eq $tag "") -}}
+{{- $ref -}}
+{{- else -}}
+{{- printf "%s:%s" $ref $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -272,9 +392,19 @@ Note: EXPERIMENTAL_FORCE_GUEST_PULL only checks containerd.forceGuestPull, not c
 */}}
 {{- define "kata-deploy.getForceGuestPullForArch" -}}
 {{- $arch := .arch -}}
+{{- $disableAll := .root.Values.shims.disableAll | default false -}}
 {{- $shimNames := list -}}
 {{- range $shimName, $shimConfig := .root.Values.shims -}}
-{{- if $shimConfig.enabled -}}
+{{- if ne $shimName "disableAll" -}}
+{{- $shimEnabled := false -}}
+{{- if eq $shimConfig.enabled true -}}
+{{- $shimEnabled = true -}}
+{{- else if eq $shimConfig.enabled false -}}
+{{- $shimEnabled = false -}}
+{{- else if not $disableAll -}}
+{{- $shimEnabled = true -}}
+{{- end -}}
+{{- if $shimEnabled -}}
 {{- $archSupported := false -}}
 {{- range $shimConfig.supportedArches -}}
 {{- if eq . $arch -}}
@@ -288,20 +418,6 @@ Note: EXPERIMENTAL_FORCE_GUEST_PULL only checks containerd.forceGuestPull, not c
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
 {{- join "," $shimNames -}}
 {{- end -}}
-
-{{/*
-Detect if this is a Rust-based build by checking the image tag
-Returns "true" if the tag contains "-rust", otherwise returns "false"
-This is a temporary helper for dual script/rust support
-*/}}
-{{- define "kata-deploy.isRustBuild" -}}
-{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
-{{- if or (contains "-rust" $tag) (contains "nightly-rust" $tag) -}}
-true
-{{- else -}}
-false
-{{- end -}}
-{{- end -}}
-

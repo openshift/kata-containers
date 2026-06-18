@@ -8,8 +8,9 @@ kind: Pod
 metadata:
   name: policy-pod
   uid: policy-pod-uid
+  labels:
+    some-test-label: label-value1
 spec:
-  terminationGracePeriodSeconds: 0
   runtimeClassName: kata
   containers:
     - name: prometheus
@@ -27,6 +28,15 @@ spec:
             configMapKeyRef:
               name: policy-configmap
               key: data-2
+        - name: TEST_DIR1
+          value: foo
+        - name: TEST_DIR2
+          value: bar
+        - name: VARIABLE_FROM_LABEL
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.labels['some-test-label']
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -54,8 +64,27 @@ spec:
       envFrom:
       - configMapRef:
           name: policy-configmap
+      volumeMounts:
+        - name: test-volume1
+          mountPath: /test-mount1
+          subPathExpr: $(TEST_DIR1)/$(TEST_DIR2)
   topologySpreadConstraints:
     - maxSkew: 2
       topologyKey: kubernetes.io/hostname
       whenUnsatisfiable: ScheduleAnyway
   priorityClassName: test-high-priority
+  volumes:
+    - name: test-volume1
+      emptyDir: {}
+  affinity:
+    podAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 12
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - not-a-real-hostname

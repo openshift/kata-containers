@@ -10,16 +10,24 @@ metadata:
   labels:
     app: ${POD_NAME_INSTRUCT}
   annotations:
-    io.katacontainers.config.hypervisor.kernel_params: "agent.image_registry_auth=kbs:///default/credentials/nvcr agent.aa_kbc_params=cc_kbc::${CC_KBS_ADDR}"
+    # Start CDH process and configure AA for KBS communication
+    # aa_kbc_params tells the Attestation Agent where KBS is located
+    io.katacontainers.config.hypervisor.kernel_params: "agent.guest_components_procs=confidential-data-hub agent.aa_kbc_params=cc_kbc::${CC_KBS_ADDR}"
+    # cc_init_data annotation will be added by genpolicy with CDH configuration
+    # from the custom default-initdata.toml created by create_nim_initdata_file()
 spec:
+  # Explicit user/group/supplementary groups to support nydus guest-pull.
+  # See issue https://github.com/kata-containers/kata-containers/issues/11162 and
+  # other references to this issue in the genpolicy source folder.
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    supplementalGroups: [4, 20, 24, 25, 27, 29, 30, 44, 46]
   restartPolicy: Never
   runtimeClassName: kata
   imagePullSecrets:
     - name: ngc-secret-instruct
-  securityContext:
-    runAsUser: 0
-    runAsGroup: 0
-    fsGroup: 0
   containers:
   - name: ${POD_NAME_INSTRUCT}
     image: nvcr.io/nim/meta/llama-3.1-8b-instruct:1.13.1
@@ -58,14 +66,27 @@ spec:
       - name: NGC_API_KEY
         valueFrom:
           secretKeyRef:
-            name: ngc-api-key-instruct
+            name: ngc-api-key-sealed-instruct
             key: api-key
     # GPU resource limit (for NVIDIA GPU)
     resources:
       limits:
         nvidia.com/pgpu: "1"
         cpu: "16"
-        memory: "128Gi"
+        memory: "48Gi"
+    volumeMounts:
+      - name: nim-trusted-cache
+        mountPath: /opt/nim/.cache
+    volumeDevices:
+      - devicePath: /dev/trusted_store
+        name: trusted-storage
+  volumes:
+  - name: nim-trusted-cache
+    emptyDir:
+      sizeLimit: 64Gi
+  - name: trusted-storage
+    persistentVolumeClaim:
+      claimName: trusted-pvc-instruct
 ---
 apiVersion: v1
 kind: Secret
@@ -78,7 +99,9 @@ data:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: ngc-api-key-instruct
+  name: ngc-api-key-sealed-instruct
 type: Opaque
 data:
-  api-key: "${NGC_API_KEY_BASE64}"
+  # Sealed secret pointing to kbs:///default/ngc-api-key/instruct
+  # CDH will unseal this by fetching the actual key from KBS
+  api-key: "${NGC_API_KEY_SEALED_SECRET_INSTRUCT_BASE64}"

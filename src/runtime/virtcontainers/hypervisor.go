@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -91,9 +92,10 @@ const (
 )
 
 var (
-	hvLogger                   = logrus.WithField("source", "virtcontainers/hypervisor")
-	noGuestMemHotplugErr error = errors.New("guest memory hotplug not supported")
-	conflictingAssets    error = errors.New("cannot set both image and initrd at the same time")
+	hvLogger                        = logrus.WithField("source", "virtcontainers/hypervisor")
+	noGuestMemHotplugErr      error = errors.New("guest memory hotplug not supported")
+	s390xVirtioMemRequiredErr error = errors.New("memory hotplug on s390x requires virtio-mem to be enabled")
+	conflictingAssets         error = errors.New("cannot set both image and initrd at the same time")
 )
 
 // In some architectures the maximum number of vCPUs depends on the number of physical cores.
@@ -126,18 +128,56 @@ const (
 	EROFS RootfsType = "erofs"
 )
 
-func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Param, error) {
-	var kernelRootParams []Param
+func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool, kernelVerityParams string) ([]Param, error) {
+	cfg, err := ParseKernelVerityParams(kernelVerityParams)
+	if err != nil {
+		return []Param{}, err
+	}
 
 	// EXT4 filesystem is used by default.
 	if rootfstype == "" {
 		rootfstype = string(EXT4)
 	}
 
+	if cfg != nil {
+		rootDevice := "/dev/pmem0p1"
+		hashDevice := "/dev/pmem0p2"
+		if disableNvdimm {
+			rootDevice = "/dev/vda1"
+			hashDevice = "/dev/vda2"
+		}
+
+		dataSectors := (cfg.dataBlockSize / 512) * cfg.dataBlocks
+		verityCmd := fmt.Sprintf(
+			"dm-verity,,,ro,0 %d verity 1 %s %s %d %d %d 0 sha256 %s %s",
+			dataSectors,
+			rootDevice,
+			hashDevice,
+			cfg.dataBlockSize,
+			cfg.hashBlockSize,
+			cfg.dataBlocks,
+			cfg.rootHash,
+			cfg.salt,
+		)
+
+		rootFlags, err := kernelVerityRootFlags(rootfstype)
+		if err != nil {
+			return []Param{}, err
+		}
+
+		return []Param{
+			{Key: "dm-mod.create", Value: fmt.Sprintf("\"%s\"", verityCmd)},
+			{Key: "root", Value: "/dev/dm-0"},
+			{Key: "rootflags", Value: rootFlags},
+			{Key: "rootfstype", Value: rootfstype},
+		}, nil
+	}
+
 	if disableNvdimm && dax {
 		return []Param{}, fmt.Errorf("Virtio-Blk does not support DAX")
 	}
 
+	kernelRootParams := []Param{}
 	if disableNvdimm {
 		// Virtio-Blk
 		kernelRootParams = append(kernelRootParams, Param{"root", string(VirtioBlk)})
@@ -171,8 +211,114 @@ func GetKernelRootParams(rootfstype string, disableNvdimm bool, dax bool) ([]Par
 	}
 
 	kernelRootParams = append(kernelRootParams, Param{"rootfstype", rootfstype})
-
 	return kernelRootParams, nil
+}
+
+const (
+	verityBlockSizeBytes = 512
+)
+
+type kernelVerityConfig struct {
+	rootHash      string
+	salt          string
+	dataBlocks    uint64
+	dataBlockSize uint64
+	hashBlockSize uint64
+}
+
+func ParseKernelVerityParams(params string) (*kernelVerityConfig, error) {
+	if strings.TrimSpace(params) == "" {
+		return nil, nil
+	}
+
+	values := map[string]string{}
+	for _, field := range strings.Split(params, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid kernel_verity_params entry: %q", field)
+		}
+		values[parts[0]] = parts[1]
+	}
+
+	cfg := &kernelVerityConfig{
+		rootHash: values["root_hash"],
+		salt:     values["salt"],
+	}
+	if cfg.rootHash == "" {
+		return nil, fmt.Errorf("missing kernel_verity_params root_hash")
+	}
+
+	parseUintField := func(name string) (uint64, error) {
+		value, ok := values[name]
+		if !ok || value == "" {
+			return 0, fmt.Errorf("missing kernel_verity_params %s", name)
+		}
+		parsed, err := strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid kernel_verity_params %s %q: %w", name, value, err)
+		}
+		return parsed, nil
+	}
+
+	dataBlocks, err := parseUintField("data_blocks")
+	if err != nil {
+		return nil, err
+	}
+	dataBlockSize, err := parseUintField("data_block_size")
+	if err != nil {
+		return nil, err
+	}
+	hashBlockSize, err := parseUintField("hash_block_size")
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.salt == "" {
+		return nil, fmt.Errorf("missing kernel_verity_params salt")
+	}
+	if dataBlocks == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_blocks: must be non-zero")
+	}
+	if dataBlockSize == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_block_size: must be non-zero")
+	}
+	if hashBlockSize == 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params hash_block_size: must be non-zero")
+	}
+	if dataBlockSize%verityBlockSizeBytes != 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params data_block_size: must be multiple of %d", verityBlockSizeBytes)
+	}
+	if hashBlockSize%verityBlockSizeBytes != 0 {
+		return nil, fmt.Errorf("invalid kernel_verity_params hash_block_size: must be multiple of %d", verityBlockSizeBytes)
+	}
+
+	cfg.dataBlocks = dataBlocks
+	cfg.dataBlockSize = dataBlockSize
+	cfg.hashBlockSize = hashBlockSize
+
+	return cfg, nil
+}
+
+func kernelVerityRootFlags(rootfstype string) (string, error) {
+	// EXT4 filesystem is used by default.
+	if rootfstype == "" {
+		rootfstype = string(EXT4)
+	}
+
+	switch RootfsType(rootfstype) {
+	case EROFS:
+		return "ro", nil
+	case XFS:
+		return "ro", nil
+	case EXT4:
+		return "data=ordered,errors=remount-ro ro", nil
+	default:
+		return "", fmt.Errorf("unsupported rootfs type")
+	}
 }
 
 // DeviceType describes a virtualized device type.
@@ -483,6 +629,9 @@ type HypervisorConfig struct {
 	// KernelParams are additional guest kernel parameters.
 	KernelParams []Param
 
+	// KernelVerityParams are additional guest dm-verity parameters.
+	KernelVerityParams string
+
 	// HypervisorParams are additional hypervisor parameters.
 	HypervisorParams []Param
 
@@ -605,6 +754,16 @@ type HypervisorConfig struct {
 	// Denotes whether flush requests for the device are ignored.
 	BlockDeviceCacheNoflush bool
 
+	// BlockDeviceLogicalSectorSize specifies the logical sector size reported
+	// by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	BlockDeviceLogicalSectorSize uint32
+
+	// BlockDevicePhysicalSectorSize specifies the physical sector size reported
+	// by block devices to the guest, in bytes. Common values are 512 and 4096.
+	// Set to 0 to use the hypervisor default.
+	BlockDevicePhysicalSectorSize uint32
+
 	// DisableBlockDeviceUse disallows a block device from being used.
 	DisableBlockDeviceUse bool
 
@@ -640,6 +799,9 @@ type HypervisorConfig struct {
 
 	// IOMMUPlatform is used to indicate if IOMMU_PLATFORM is enabled for supported devices
 	IOMMUPlatform bool
+
+	// GuestNUMANodes defines guest NUMA topology and mapping to host NUMA nodes and CPUs.
+	GuestNUMANodes []types.GuestNUMANode
 
 	// DisableNestingChecks is used to override customizations performed
 	// when running on top of another VMM.
@@ -914,6 +1076,10 @@ func RoundUpNumVCPUs(cpus float32) uint32 {
 
 func (conf HypervisorConfig) NumVCPUs() uint32 {
 	return RoundUpNumVCPUs(conf.NumVCPUsF)
+}
+
+func (conf HypervisorConfig) NumGuestNUMANodes() uint32 {
+	return uint32(len(conf.GuestNUMANodes))
 }
 
 func appendParam(params []Param, parameter string, value string) []Param {

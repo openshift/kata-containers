@@ -42,11 +42,33 @@ impl K8sClient {
             .with_context(|| format!("Failed to get node: {}", self.node_name))
     }
 
-    pub async fn get_node_field(&self, jsonpath: &str) -> Result<String> {
+    /// Return `.status.nodeInfo.containerRuntimeVersion` for the bound node,
+    /// or an error if the field isn't populated. Avoids deep-cloning the
+    /// whole `Node` into a `serde_json::Value` tree just to walk a static
+    /// path.
+    pub async fn get_container_runtime_version(&self) -> Result<String> {
         let node = self.get_node().await?;
-        // Convert Node to serde_json::Value for JSONPath parsing
-        let node_value = serde_json::to_value(&node)?;
-        get_jsonpath_value(&node_value, jsonpath)
+        node.status
+            .as_ref()
+            .and_then(|s| s.node_info.as_ref())
+            .map(|i| i.container_runtime_version.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Node '{}' is missing status.nodeInfo.containerRuntimeVersion",
+                    self.node_name
+                )
+            })
+    }
+
+    /// Return the value of a single label from `.metadata.labels` on the
+    /// bound node, or `None` if the label is absent.
+    pub async fn get_node_label(&self, key: &str) -> Result<Option<String>> {
+        let node = self.get_node().await?;
+        Ok(node
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(key).cloned()))
     }
 
     pub async fn label_node(
@@ -59,7 +81,7 @@ impl K8sClient {
 
         let labels = node.metadata.labels.get_or_insert_with(Default::default);
 
-        if let Some(value) = label_value {
+        let patch = if let Some(value) = label_value {
             if overwrite || !labels.contains_key(label_key) {
                 labels.insert(label_key.to_string(), value.to_string());
                 info!(
@@ -67,16 +89,23 @@ impl K8sClient {
                     label_key, value, self.node_name
                 );
             }
+            Patch::Merge(json!({
+                "metadata": {
+                    "labels": labels
+                }
+            }))
         } else {
             labels.remove(label_key);
             info!("Removing label {} from node {}", label_key, self.node_name);
-        }
-
-        let patch = Patch::Merge(json!({
-            "metadata": {
-                "labels": labels
-            }
-        }));
+            // JSON merge patch: omit key = leave unchanged. To remove, set key to null.
+            let mut patch_labels = serde_json::Map::new();
+            patch_labels.insert(label_key.to_string(), serde_json::Value::Null);
+            Patch::Merge(json!({
+                "metadata": {
+                    "labels": patch_labels
+                }
+            }))
+        };
 
         let pp = PatchParams::default();
         self.node_api
@@ -87,25 +116,41 @@ impl K8sClient {
         Ok(())
     }
 
-    pub async fn count_kata_deploy_daemonsets(&self) -> Result<usize> {
+    /// Returns whether a non-terminating DaemonSet with this exact name
+    /// exists in the current namespace. Used to decide whether this pod is
+    /// being restarted (true) or uninstalled (false).
+    pub async fn own_daemonset_exists(&self, daemonset_name: &str) -> Result<bool> {
+        use k8s_openapi::api::apps::v1::DaemonSet;
+        use kube::api::Api;
+
+        let ds_api: Api<DaemonSet> = Api::default_namespaced(self.client.clone());
+        match ds_api.get_opt(daemonset_name).await? {
+            Some(ds) => Ok(ds.metadata.deletion_timestamp.is_none()),
+            None => Ok(false),
+        }
+    }
+
+    /// Returns how many non-terminating DaemonSets across all namespaces
+    /// have a name containing "kata-deploy". Used to decide whether shared
+    /// node-level resources (node label, CRI restart) should be cleaned up:
+    /// they are only safe to remove when no kata-deploy instance remains
+    /// on the cluster.
+    pub async fn count_any_kata_deploy_daemonsets(&self) -> Result<usize> {
         use k8s_openapi::api::apps::v1::DaemonSet;
         use kube::api::{Api, ListParams};
 
-        let ds_api: Api<DaemonSet> = Api::default_namespaced(self.client.clone());
-        let lp = ListParams::default();
-        let daemonsets = ds_api.list(&lp).await?;
+        let ds_api: Api<DaemonSet> = Api::all(self.client.clone());
+        let daemonsets = ds_api.list(&ListParams::default()).await?;
 
-        // Note: We use client-side filtering here because Kubernetes field selectors
-        // don't support "contains" operations - they only support exact matches and comparisons.
-        // Filtering by name containing "kata-deploy" requires client-side processing.
         let count = daemonsets
             .iter()
             .filter(|ds| {
-                ds.metadata
-                    .name
-                    .as_ref()
-                    .map(|n| n.contains("kata-deploy"))
-                    .unwrap_or(false)
+                ds.metadata.deletion_timestamp.is_none()
+                    && ds
+                        .metadata
+                        .name
+                        .as_ref()
+                        .is_some_and(|n| n.contains("kata-deploy"))
             })
             .count();
 
@@ -459,61 +504,21 @@ impl K8sClient {
     }
 }
 
-/// Get value from JSON using JSONPath-like syntax (simplified)
-fn get_jsonpath_value(obj: &serde_json::Value, jsonpath: &str) -> Result<String> {
-    // Simple JSONPath implementation for common cases
-    // Supports: .field, .field.subfield, [index]
-    let mut current = serde_json::to_value(obj)?;
-
-    for part in jsonpath.trim_start_matches('.').split('.') {
-        if part.is_empty() {
-            continue;
-        }
-
-        // Handle array access [index]
-        if let Some((key, index_str)) = part.split_once('[') {
-            if !key.is_empty() {
-                current = current
-                    .get(key)
-                    .ok_or_else(|| anyhow::anyhow!("Field '{key}' not found"))?
-                    .clone();
-            }
-            let index = index_str
-                .trim_end_matches(']')
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("Invalid array index"))?;
-            current = current
-                .as_array()
-                .and_then(|a| a.get(index))
-                .ok_or_else(|| anyhow::anyhow!("Array index {index} out of bounds"))?
-                .clone();
-        } else {
-            current = current
-                .get(part)
-                .ok_or_else(|| anyhow::anyhow!("Field '{part}' not found"))?
-                .clone();
-        }
-    }
-
-    match current {
-        serde_json::Value::String(s) => Ok(s),
-        serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::Bool(b) => Ok(b.to_string()),
-        _ => Ok(serde_json::to_string(&current)?),
-    }
+// Public API functions that use the client
+pub async fn get_container_runtime_version(config: &Config) -> Result<String> {
+    let client = K8sClient::new(&config.node_name).await?;
+    client.get_container_runtime_version().await
 }
 
-// Public API functions that use the client
-pub async fn get_node_field(config: &Config, jsonpath: &str) -> Result<String> {
+pub async fn get_node_label(config: &Config, key: &str) -> Result<Option<String>> {
     let client = K8sClient::new(&config.node_name).await?;
-    client.get_node_field(jsonpath).await
+    client.get_node_label(key).await
 }
 
 pub async fn get_node_ready_status(config: &Config) -> Result<String> {
     let client = K8sClient::new(&config.node_name).await?;
     let node = client.get_node().await?;
 
-    // Find the Ready condition in the node status
     if let Some(status) = &node.status {
         if let Some(conditions) = &status.conditions {
             for condition in conditions {
@@ -537,9 +542,14 @@ pub async fn label_node(
     client.label_node(label_key, label_value, overwrite).await
 }
 
-pub async fn count_kata_deploy_daemonsets(config: &Config) -> Result<usize> {
+pub async fn own_daemonset_exists(config: &Config) -> Result<bool> {
     let client = K8sClient::new(&config.node_name).await?;
-    client.count_kata_deploy_daemonsets().await
+    client.own_daemonset_exists(&config.daemonset_name).await
+}
+
+pub async fn count_any_kata_deploy_daemonsets(config: &Config) -> Result<usize> {
+    let client = K8sClient::new(&config.node_name).await?;
+    client.count_any_kata_deploy_daemonsets().await
 }
 
 pub async fn crd_exists(config: &Config, crd_name: &str) -> Result<bool> {
@@ -574,23 +584,4 @@ pub async fn update_runtimeclass(
 ) -> Result<()> {
     let client = K8sClient::new(&config.node_name).await?;
     client.update_runtimeclass(runtimeclass).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_get_jsonpath_value() {
-        let json = json!({
-            "status": {
-                "nodeInfo": {
-                    "containerRuntimeVersion": "containerd://1.7.0"
-                }
-            }
-        });
-
-        let result = get_jsonpath_value(&json, ".status.nodeInfo.containerRuntimeVersion").unwrap();
-        assert_eq!(result, "containerd://1.7.0");
-    }
 }

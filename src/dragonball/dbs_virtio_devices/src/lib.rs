@@ -245,8 +245,8 @@ pub enum Error {
     #[error("set user memory region failed: {0}")]
     SetUserMemoryRegion(kvm_ioctls::Error),
     /// Inserting mmap region failed.
-    #[error("inserting mmap region failed: {0}")]
-    InsertMmap(vm_memory::mmap::Error),
+    #[error("inserting mmap region failed")]
+    InsertMmap,
     /// Failed to set madvise on guest memory region.
     #[error("failed to set madvice() on guest memory region")]
     Madvise(#[source] nix::Error),
@@ -375,7 +375,7 @@ pub mod tests {
         AddressSpace, AddressSpaceLayout, AddressSpaceRegion, AddressSpaceRegionType,
     };
     use dbs_boot::layout::{GUEST_MEM_END, GUEST_MEM_START, GUEST_PHYS_END};
-    use dbs_interrupt::KvmIrqManager;
+    use dbs_interrupt::{InterruptManager, KvmIrqManager};
     use kvm_ioctls::{Kvm, VmFd};
     use virtio_queue::{QueueSync, QueueT};
     use vm_memory::{
@@ -439,19 +439,19 @@ pub mod tests {
             VirtqDesc { desc }
         }
 
-        pub fn addr(&self) -> VolatileRef<u64> {
+        pub fn addr(&self) -> VolatileRef<'_, u64> {
             self.desc.get_ref(offset_of!(DescriptorTmp, addr)).unwrap()
         }
 
-        pub fn len(&self) -> VolatileRef<u32> {
+        pub fn len(&self) -> VolatileRef<'_, u32> {
             self.desc.get_ref(offset_of!(DescriptorTmp, len)).unwrap()
         }
 
-        pub fn flags(&self) -> VolatileRef<u16> {
+        pub fn flags(&self) -> VolatileRef<'_, u16> {
             self.desc.get_ref(offset_of!(DescriptorTmp, flags)).unwrap()
         }
 
-        pub fn next(&self) -> VolatileRef<u16> {
+        pub fn next(&self) -> VolatileRef<'_, u16> {
             self.desc.get_ref(offset_of!(DescriptorTmp, next)).unwrap()
         }
 
@@ -513,11 +513,11 @@ pub mod tests {
             self.start.unchecked_add(self.ring.len() as GuestUsize)
         }
 
-        pub fn flags(&self) -> VolatileRef<u16> {
+        pub fn flags(&self) -> VolatileRef<'_, u16> {
             self.ring.get_ref(0).unwrap()
         }
 
-        pub fn idx(&self) -> VolatileRef<u16> {
+        pub fn idx(&self) -> VolatileRef<'_, u16> {
             self.ring.get_ref(2).unwrap()
         }
 
@@ -525,12 +525,12 @@ pub mod tests {
             4 + mem::size_of::<T>() * (i as usize)
         }
 
-        pub fn ring(&self, i: u16) -> VolatileRef<T> {
+        pub fn ring(&self, i: u16) -> VolatileRef<'_, T> {
             assert!(i < self.qsize);
             self.ring.get_ref(Self::ring_offset(i)).unwrap()
         }
 
-        pub fn event(&self) -> VolatileRef<u16> {
+        pub fn event(&self) -> VolatileRef<'_, u16> {
             self.ring.get_ref(Self::ring_offset(self.qsize)).unwrap()
         }
 
@@ -602,7 +602,7 @@ pub mod tests {
             (self.dtable.len() / VirtqDesc::dtable_len(1)) as u16
         }
 
-        pub fn dtable(&self, i: u16) -> VirtqDesc {
+        pub fn dtable(&self, i: u16) -> VirtqDesc<'_> {
             VirtqDesc::new(&self.dtable, i)
         }
 

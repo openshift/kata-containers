@@ -354,6 +354,18 @@ static_sandbox_resource_mgmt = @DEFSTATICRESOURCEMGMT_FC@
 # be created on the host and shared via virtio-fs. This is potentially slower, but allows sharing of files from host to guest.
 disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 
+# Specifies how Kubernetes emptyDir volumes are handled.
+# Options:
+#
+#   - shared-fs (default)
+#     Shares the emptyDir folder with the guest using the method given
+#     by the `shared_fs` setting.
+#
+#   - block-encrypted
+#     Plugs a block device to be encrypted in the guest.
+#
+emptydir_mode = "@DEFEMPTYDIRMODE@"
+
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
@@ -367,9 +379,9 @@ enable_pprof = false
 
 # Indicates the CreateContainer request timeout needed for the workload(s)
 # It using guest_pull this includes the time to pull the image inside the guest
-# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)  
-# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config 
-# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout. 
+# Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)
+# Note: The effective timeout is determined by the lesser of two values: runtime-request-timeout from kubelet config
+# (https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/#:~:text=runtime%2Drequest%2Dtimeout) and create_container_timeout.
 # In essence, the timeout used for guest pull=runtime-request-timeout<create_container_timeout?runtime-request-timeout:create_container_timeout.
 create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
 
@@ -381,6 +393,11 @@ create_container_timeout = @DEFCREATECONTAINERTIMEOUT@
 # to the hypervisor.
 # (default: /run/kata-containers/dans)
 dan_conf = "@DEFDANCONF@"
+
+# kubelet_root_dir is the kubelet root directory used to match ConfigMap/Secret
+# volume paths for propagation. Override for distros that use a different path
+# (e.g. k0s: /var/lib/k0s/kubelet).
+kubelet_root_dir = "@DEFKUBELETROOTDIR@"
 
 # pod_resource_api_sock specifies the unix socket for the Kubelet's
 # PodResource API endpoint. If empty, kubernetes based cold plug

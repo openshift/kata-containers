@@ -246,7 +246,7 @@ pub fn add_hypervisor_initdata_overrides(initdata_annotation: &str) -> Result<St
         return Ok("".to_string());
     }
 
-    decode_initdata(initdata_annotation)?.to_string()
+    decode_raw_initdata(initdata_annotation).context("decoding initdata annotation failed")
 }
 
 use std::io::Write;
@@ -335,7 +335,9 @@ url = 'http://kbs-service.xxx.cluster.local:8080'
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("base64 decode"));
+        assert!(error
+            .chain()
+            .any(|e| e.to_string().contains("base64 decode")));
     }
 
     #[test]
@@ -348,7 +350,9 @@ url = 'http://kbs-service.xxx.cluster.local:8080'
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("gz decoder failed"));
+        assert!(error
+            .chain()
+            .any(|e| e.to_string().contains("gz decoder failed")));
     }
 
     #[test]
@@ -366,8 +370,8 @@ key = "value"
 
         let result = add_hypervisor_initdata_overrides(&encoded);
         // This might fail depending on whether algorithm is required
-        if result.is_err() {
-            assert!(result.unwrap_err().to_string().contains("parse initdata"));
+        if let Err(error) = result {
+            assert!(error.to_string().contains("parse initdata"));
         }
     }
 
@@ -386,8 +390,8 @@ key = "value"
 
         let result = add_hypervisor_initdata_overrides(&encoded);
         // This might fail depending on whether version is required
-        if result.is_err() {
-            assert!(result.unwrap_err().to_string().contains("parse initdata"));
+        if let Err(error) = result {
+            assert!(error.to_string().contains("parse initdata"));
         }
     }
 
@@ -488,7 +492,7 @@ key = "value"
         let valid_toml = r#"
             version = "0.1.0"
             algorithm = "sha384"
-            
+
             [data]
             valid_key = "valid_value"
         "#;
@@ -497,7 +501,7 @@ key = "value"
         // Invalid TOML (missing version)
         let invalid_toml = r#"
             algorithm = "sha256"
-            
+
             [data]
             key = "value"
         "#;

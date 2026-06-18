@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::device::topology::{PCIePortBusPrefix, TopologyPortDevice, DEFAULT_PCIE_ROOT_BUS};
+use crate::device::topology::{TopologyPortDevice, DEFAULT_PCIE_ROOT_BUS};
 use crate::qemu::qmp::get_qmp_socket_path;
 use crate::utils::{
     chown_to_parent, clear_cloexec, create_vhost_net_fds, open_named_tuntap, uses_native_ccw_bus,
@@ -11,6 +11,7 @@ use crate::utils::{
 };
 
 use crate::{kernel_param::KernelParams, Address, HypervisorConfig};
+use std::borrow::Cow;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -19,11 +20,12 @@ use kata_types::rootless::is_rootless;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
-use std::fmt::Display;
+use std::fmt::{Display, Write};
 use std::fs::{read_to_string, File};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::str;
 use tokio;
 
 // These should have been called MiB and GiB for better readability but the
@@ -71,6 +73,10 @@ impl VirtioBusType {
             VirtioBusType::Pci => "pci",
             VirtioBusType::Ccw => "ccw",
         }
+    }
+
+    fn supports_disable_modern(&self) -> bool {
+        matches!(self, VirtioBusType::Pci)
     }
 }
 
@@ -179,16 +185,20 @@ impl Kernel {
         let mut kernel_params = KernelParams::new(config.debug_info.enable_debug);
 
         if config.boot_info.initrd.is_empty() {
-            // QemuConfig::validate() has already made sure that if initrd is
-            // empty, image cannot be so we don't need to re-check that here
+            // DAX is disabled on ARM due to a kernel panic in caches_clean_inval_pou.
+            #[cfg(target_arch = "aarch64")]
+            let use_dax = false;
+            #[cfg(not(target_arch = "aarch64"))]
+            let use_dax = true;
 
-            kernel_params.append(
-                &mut KernelParams::new_rootfs_kernel_params(
-                    &config.boot_info.vm_rootfs_driver,
-                    &config.boot_info.rootfs_type,
-                )
-                .context("adding rootfs params failed")?,
-            );
+            let mut rootfs_params = KernelParams::new_rootfs_kernel_params(
+                &config.boot_info.kernel_verity_params,
+                &config.boot_info.vm_rootfs_driver,
+                &config.boot_info.rootfs_type,
+                use_dax,
+            )
+            .context("adding rootfs/verity params failed")?;
+            kernel_params.append(&mut rootfs_params);
         }
 
         kernel_params.append(&mut KernelParams::from_string(
@@ -252,29 +262,8 @@ struct Memory {
 
 impl Memory {
     fn new(config: &HypervisorConfig) -> Memory {
-        // Move this to QemuConfig::adjust_config()?
-
-        let mut mem_size = config.memory_info.default_memory as u64;
-        let mut max_mem_size = config.memory_info.default_maxmemory as u64;
-
-        if let Ok(sysinfo) = nix::sys::sysinfo::sysinfo() {
-            let host_memory = sysinfo.ram_total() >> 20;
-
-            if mem_size > host_memory {
-                info!(sl!(), "'default_memory' given in configuration.toml is greater than host memory, adjusting to host memory");
-                mem_size = host_memory
-            }
-
-            if max_mem_size == 0 || max_mem_size > host_memory {
-                max_mem_size = host_memory
-            }
-        } else {
-            warn!(sl!(), "Failed to get host memory size, cannot verify or adjust configuration.toml's 'default_maxmemory'");
-
-            if max_mem_size == 0 {
-                max_mem_size = mem_size;
-            };
-        }
+        let mem_size = config.memory_info.default_memory as u64;
+        let max_mem_size = config.memory_info.default_maxmemory as u64;
 
         // Memory sizes are given in megabytes in configuration.toml so we
         // need to convert them to bytes for storage.
@@ -294,6 +283,18 @@ impl Memory {
             }
         }
         self.memory_backend_file = Some(mem_file.clone());
+        self
+    }
+
+    #[allow(dead_code)]
+    fn set_maxmem_size(&mut self, max_size: u64) -> &mut Self {
+        self.max_size = max_size;
+        self
+    }
+
+    #[allow(dead_code)]
+    fn set_num_slots(&mut self, num_slots: u32) -> &mut Self {
+        self.num_slots = num_slots;
         self
     }
 }
@@ -388,7 +389,7 @@ impl ToQemuParams for Cpu {
 /// Error type for CCW Subchannel operations
 #[derive(Debug)]
 #[allow(dead_code)]
-enum CcwError {
+pub enum CcwError {
     DeviceAlreadyExists(String), // Error when trying to add an existing device
     #[allow(dead_code)]
     DeviceNotFound(String), // Error when trying to remove a nonexistent device
@@ -419,7 +420,7 @@ impl CcwSubChannel {
     /// # Returns
     /// - `Result<u32, CcwError>`: slot index of the added device
     ///   or an error if the device already exists
-    fn add_device(&mut self, dev_id: &str) -> Result<u32, CcwError> {
+    pub fn add_device(&mut self, dev_id: &str) -> Result<u32, CcwError> {
         if self.devices.contains_key(dev_id) {
             Err(CcwError::DeviceAlreadyExists(dev_id.to_owned()))
         } else {
@@ -438,8 +439,7 @@ impl CcwSubChannel {
     /// # Returns
     /// - `Result<(), CcwError>`: Ok(()) if the device was removed
     ///   or an error if the device was not found
-    #[allow(dead_code)]
-    fn remove_device(&mut self, dev_id: &str) -> Result<(), CcwError> {
+    pub fn remove_device(&mut self, dev_id: &str) -> Result<(), CcwError> {
         if self.devices.remove(dev_id).is_some() {
             Ok(())
         } else {
@@ -447,15 +447,28 @@ impl CcwSubChannel {
         }
     }
 
-    /// Formats the CCW address for a given slot
+    /// Formats the CCW address for a given slot.
+    /// Uses the 0xfe channel subsystem ID used by QEMU.
     ///
     /// # Arguments
     /// - `slot`: slot index
     ///
     /// # Returns
     /// - `String`: formatted CCW address (e.g. `fe.0.0000`)
-    fn address_format_ccw(&self, slot: u32) -> String {
+    pub fn address_format_ccw(&self, slot: u32) -> String {
         format!("fe.{:x}.{:04x}", self.addr, slot)
+    }
+
+    /// Formats the guest-visible CCW address for a given slot.
+    /// Uses channel subsystem ID 0 (guest perspective).
+    ///
+    /// # Arguments
+    /// - `slot`: slot index
+    ///
+    /// # Returns
+    /// - `String`: formatted guest-visible CCW address (e.g. `0.0.0000`)
+    pub fn address_format_ccw_for_virt_server(&self, slot: u32) -> String {
+        format!("0.{:x}.{:04x}", self.addr, slot)
     }
 
     /// Sets the address of the subchannel.
@@ -503,7 +516,7 @@ impl Machine {
             accel: "kvm".to_owned(),
             options: config.machine_info.machine_accelerators.clone(),
             nvdimm: false,
-            kernel_irqchip: None,
+            kernel_irqchip: Some("on".to_owned()), // default to off, will be turned on if needed by VFIO devices
             confidential_guest_support: "".to_owned(),
             is_nvdimm_supported,
             memory_backend: None,
@@ -1127,7 +1140,7 @@ impl ToQemuParams for VhostVsock {
     async fn qemu_params(&self) -> Result<Vec<String>> {
         let mut params = Vec::new();
         params.push(format!("vhost-vsock-{}", self.bus_type));
-        if self.disable_modern {
+        if self.disable_modern && self.bus_type.supports_disable_modern() {
             params.push("disable-modern=true".to_owned());
         }
         if self.iommu_platform {
@@ -1357,7 +1370,7 @@ impl ToQemuParams for DeviceVirtioNet {
 
         params.push(format!("mac={:?}", self.mac_address));
 
-        if self.disable_modern {
+        if self.disable_modern && self.bus_type.supports_disable_modern() {
             params.push("disable-modern=true".to_owned());
         }
         if self.iommu_platform {
@@ -1806,7 +1819,7 @@ impl ToQemuParams for DeviceVirtioScsi {
         let mut params = Vec::new();
         params.push(format!("virtio-scsi-{}", self.bus_type));
         params.push(format!("id={}", self.id));
-        if self.disable_modern {
+        if self.disable_modern && self.bus_type.supports_disable_modern() {
             params.push("disable-modern=true".to_owned());
         }
         if !self.iothread.is_empty() {
@@ -1872,6 +1885,7 @@ struct ObjectSevSnpGuest {
     reduced_phys_bits: u32,
     kernel_hashes: bool,
     host_data: Option<String>,
+    policy: u32,
     is_snp: bool,
 }
 
@@ -1883,8 +1897,14 @@ impl ObjectSevSnpGuest {
             reduced_phys_bits,
             kernel_hashes: true,
             host_data,
+            policy: 0x30000,
             is_snp,
         }
+    }
+
+    fn set_policy(&mut self, policy: u32) -> &mut Self {
+        self.policy = policy;
+        self
     }
 }
 
@@ -1908,6 +1928,7 @@ impl ToQemuParams for ObjectSevSnpGuest {
                 "kernel-hashes={}",
                 if self.kernel_hashes { "on" } else { "off" }
             ));
+            params.push(format!("policy=0x{:x}", self.policy));
             if let Some(host_data) = &self.host_data {
                 params.push(format!("host-data={host_data}"))
             }
@@ -1997,67 +2018,91 @@ impl ToQemuParams for ObjectTdxGuest {
     }
 }
 
-/// PCIeRootPortDevice directly attached onto the root bus
-/// -device pcie-root-port,id=rp0,bus=pcie.0,chassis=0,slot=0,multifunction=off,pref64-reserve=<X>B,mem-reserve=<Y>B
-#[derive(Debug, Default)]
+const DEFAULT_START_ADDR: &str = "0x5";
+//const DEFAULT_ADDR: &str = "0x0";
+
+/// Configuration for the IOMMUFD object backend.
+#[derive(Debug, Clone)]
+pub struct ObjectIommufd {
+    id: String,
+}
+
+impl ObjectIommufd {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self { id: id.into() }
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for ObjectIommufd {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        Ok(vec![
+            "-object".to_string(),
+            format!("iommufd,id={}", self.id),
+        ])
+    }
+}
+
+/// Representation of a PCIe Root Port device in QEMU.
+#[derive(Debug, Clone)]
 pub struct PCIeRootPortDevice {
     id: String,
-    bus: String,
-    chassis: String,
-    slot: String,
-    multifunction: String,
+    bus: Cow<'static, str>,
+    port: Option<u16>,
+    /// Numerical identifier for the chassis.
+    chassis: u32,
+    /// Optional slot identifier.
+    slot: Option<u32>,
+    /// Whether the device supports multiple functions.
+    multifunction: bool,
+    /// PCI address; supports simple ("0x5") and complex multifunction ("0x5.0x1") formats.
     addr: String,
-
-    mem_reserve: String,
-    pref64_reserve: String,
 }
 
 impl PCIeRootPortDevice {
-    fn new(id: &str, bus: &str, chassis: &str, slot: &str, multifunc: bool, addr: &str) -> Self {
-        PCIeRootPortDevice {
-            id: id.to_string(),
-            bus: if bus.is_empty() {
-                DEFAULT_PCIE_ROOT_BUS.to_owned()
-            } else {
-                bus.to_string()
+    /// Creates a new PCIe Root Port device instance.
+    pub fn new(id: impl Into<String>, bus: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            bus: {
+                let bus_str = bus.into();
+                if bus_str.is_empty() {
+                    Cow::Borrowed(DEFAULT_PCIE_ROOT_BUS)
+                } else {
+                    Cow::Owned(bus_str)
+                }
             },
-            chassis: if chassis.is_empty() {
-                "0x00".to_owned()
-            } else {
-                chassis.to_owned()
-            },
-            slot: if slot.is_empty() {
-                "0x00".to_owned()
-            } else {
-                slot.to_owned()
-            },
-            multifunction: if multifunc {
-                "on".to_owned()
-            } else {
-                "off".to_owned()
-            },
-            addr: if addr.is_empty() {
-                "0x00".to_owned()
-            } else {
-                addr.to_owned()
-            },
-            ..Default::default()
+            port: None,
+            chassis: 1,
+            slot: None,
+            multifunction: false,
+            addr: DEFAULT_START_ADDR.to_string(),
         }
     }
 
-    fn set_mem_reserve(&mut self, mem_reserve: u64) -> &mut Self {
-        if mem_reserve > 0 {
-            self.mem_reserve = format!("{mem_reserve}B");
-        }
-
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
         self
     }
 
-    fn set_pref64_reserve(&mut self, pref64_reserve: u64) -> &mut Self {
-        if pref64_reserve > 0 {
-            self.pref64_reserve = format!("{pref64_reserve}B");
-        }
+    pub fn with_chassis(mut self, chassis: u32) -> Self {
+        self.chassis = chassis;
+        self
+    }
 
+    pub fn with_slot(mut self, slot: u32) -> Self {
+        self.slot = Some(slot);
+        self
+    }
+
+    pub fn with_multifunction(mut self, multifunction: bool) -> Self {
+        self.multifunction = multifunction;
+        self
+    }
+
+    /// Sets the PCI address. Supports standard ("0x5") and multifunction ("0x5.0x1") strings.
+    pub fn with_addr(mut self, addr: impl Into<String>) -> Self {
+        self.addr = addr.into();
         self
     }
 }
@@ -2065,40 +2110,53 @@ impl PCIeRootPortDevice {
 #[async_trait]
 impl ToQemuParams for PCIeRootPortDevice {
     async fn qemu_params(&self) -> Result<Vec<String>> {
-        let mut device_params = Vec::new();
+        let mut params = String::with_capacity(256);
 
-        // -device pcie-root-port,id=rp0
-        device_params.push(format!("{},id={}", "pcie-root-port", self.id));
-        device_params.push(format!("bus={}", self.bus));
-        device_params.push(format!("chassis={}", self.chassis));
-        device_params.push(format!("slot={}", self.slot));
-        device_params.push(format!("multifunction={}", self.multifunction));
-        if self.multifunction.as_str() == "on" {
-            device_params.push(format!("addr={}", self.addr));
-        }
-        if !self.mem_reserve.is_empty() {
-            device_params.push(format!("mem-reserve={}", self.mem_reserve));
-        }
-        if !self.pref64_reserve.is_empty() {
-            device_params.push(format!("pref64-reserve={}", self.pref64_reserve));
+        // Example: -device pcie-root-port,id=rp0
+        write!(params, "pcie-root-port,id={}", self.id).unwrap();
+
+        if let Some(port) = self.port {
+            write!(params, ",port={}", port).unwrap();
         }
 
-        Ok(vec!["-device".to_string(), device_params.join(",")])
+        // Match govmm: only pass `addr=` for multifunction ports, or when a concrete address
+        // is required (VFIO cold-plug uses e.g. 0x09). Placeholder pool ports use addr "0" from
+        // `add_pcie_root_ports`; emitting `addr=0` for every `pcie-root-port` collides on
+        // `pcie.0` ("slot 0 ... in use by mch").
+        if self.multifunction || self.addr != "0" {
+            write!(params, ",addr={}", self.addr).unwrap();
+        }
+        write!(params, ",chassis={}", self.chassis).unwrap();
+
+        if let Some(slot) = self.slot {
+            write!(params, ",slot={}", slot).unwrap();
+        }
+
+        write!(params, ",bus={}", self.bus).unwrap();
+        write!(
+            params,
+            ",multifunction={}",
+            if self.multifunction { "on" } else { "off" }
+        )
+        .unwrap();
+
+        Ok(vec!["-device".to_string(), params])
     }
 }
 
-/// PCIeSwitchUpstreamPortDevice is the port attached to the root port.
-#[derive(Debug, Default)]
+/// PCIe Switch Upstream Port device, which must be connected to a PCIe Root Port,
+/// and can have PCIe devices or downstream ports connected to it.
+#[derive(Debug, Clone)]
 pub struct PCIeSwitchUpstreamPortDevice {
     id: String,
     bus: String,
 }
 
 impl PCIeSwitchUpstreamPortDevice {
-    fn new(id: &str, bus: &str) -> Self {
-        PCIeSwitchUpstreamPortDevice {
-            id: id.to_string(),
-            bus: bus.to_string(),
+    pub fn new(id: impl Into<String>, bus: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            bus: bus.into(),
         }
     }
 }
@@ -2106,17 +2164,16 @@ impl PCIeSwitchUpstreamPortDevice {
 #[async_trait]
 impl ToQemuParams for PCIeSwitchUpstreamPortDevice {
     async fn qemu_params(&self) -> Result<Vec<String>> {
-        let mut device_params = Vec::new();
-
-        device_params.push(format!("{},id={}", "x3130-upstream", self.id));
-        device_params.push(format!("bus={}", self.bus));
-
-        Ok(vec!["-device".to_string(), device_params.join(",")])
+        Ok(vec![
+            "-device".to_string(),
+            format!("x3130-upstream,id={},bus={}", self.id, self.bus),
+        ])
     }
 }
 
-/// PCIeSwitchDownstreamPortDevice is the port attached to the root port.
-#[derive(Debug, Default)]
+/// PCIe Switch Downstream Port device, which must be connected to a PCIe Root Port or another downstream port,
+/// and can have PCIe devices or another switch's downstream ports connected to it.
+#[derive(Debug, Clone)]
 pub struct PCIeSwitchDownstreamPortDevice {
     // format: sup{n}, n>=0
     pub id: String,
@@ -2125,36 +2182,311 @@ pub struct PCIeSwitchDownstreamPortDevice {
     pub bus: String,
 
     // (slot, chassis) pair is mandatory and must be unique for each downstream port, >=0, default is 0x00
-    pub chassis: String,
+    pub chassis: u32,
 
     // >=0, default is 0x00
-    pub slot: String,
+    pub slot: u32,
 }
 
 impl PCIeSwitchDownstreamPortDevice {
-    fn new(bus: &str, chassis: u32, index: u32) -> Self {
-        PCIeSwitchDownstreamPortDevice {
-            // "swdp{i}"
-            id: format!("{}{}", PCIePortBusPrefix::SwitchDownstreamPort, index),
-            // "swup0"
-            bus: bus.to_string(),
-            chassis: chassis.to_string(),
-            slot: index.to_string(),
+    pub fn new(bus: impl Into<String>, chassis: u32, slot: u32) -> Self {
+        Self {
+            id: format!("swdp{}", slot),
+            bus: bus.into(),
+            chassis,
+            slot,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 }
 
 #[async_trait]
 impl ToQemuParams for PCIeSwitchDownstreamPortDevice {
     async fn qemu_params(&self) -> Result<Vec<String>> {
-        let mut device_params = Vec::new();
+        Ok(vec![
+            "-device".to_string(),
+            format!(
+                "xio3130-downstream,id={},bus={},chassis={},slot={}",
+                self.id, self.bus, self.chassis, self.slot
+            ),
+        ])
+    }
+}
 
-        device_params.push(format!("{},id={}", "xio3130-downstream", self.id));
-        device_params.push(format!("bus={}", self.bus));
-        device_params.push(format!("chassis={}", self.chassis));
-        device_params.push(format!("slot={}", self.slot));
+/// VFIO PCI device
+#[derive(Debug, Clone)]
+pub struct PCIeVfioDevice {
+    host_bdf: String,
+    bus: String,
+    addr: String,
+    iommufd: Option<String>,
+    x_pci_vendor_id: Option<String>,
+    x_pci_device_id: Option<String>,
+}
 
-        Ok(vec!["-device".to_string(), device_params.join(",")])
+impl PCIeVfioDevice {
+    pub fn new(
+        host_bdf: impl Into<String>,
+        bus: impl Into<String>,
+        iommufd: impl Into<String>,
+    ) -> Self {
+        Self {
+            host_bdf: host_bdf.into(),
+            bus: bus.into(),
+            addr: "0x0".to_string(),
+            iommufd: Some(iommufd.into()),
+            x_pci_vendor_id: None,
+            x_pci_device_id: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_addr(mut self, addr: impl Into<String>) -> Self {
+        self.addr = addr.into();
+        self
+    }
+
+    pub fn with_vendor_id(mut self, vendor_id: impl Into<String>) -> Self {
+        self.x_pci_vendor_id = Some(vendor_id.into());
+        self
+    }
+
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.x_pci_device_id = Some(device_id.into());
+        self
+    }
+}
+
+#[async_trait]
+impl ToQemuParams for PCIeVfioDevice {
+    async fn qemu_params(&self) -> Result<Vec<String>> {
+        let mut params = String::with_capacity(256);
+
+        write!(params, "vfio-pci,host={}", self.host_bdf).unwrap();
+        write!(params, ",bus={}", self.bus).unwrap();
+        write!(params, ",addr={}", self.addr).unwrap();
+
+        if let Some(iommufd) = &self.iommufd {
+            write!(params, ",iommufd={}", iommufd).unwrap();
+        }
+
+        if let Some(vendor) = &self.x_pci_vendor_id {
+            write!(params, ",x-pci-vendor-id={}", vendor).unwrap();
+        }
+
+        if let Some(device) = &self.x_pci_device_id {
+            write!(params, ",x-pci-device-id={}", device).unwrap();
+        }
+
+        Ok(vec!["-device".to_string(), params])
+    }
+}
+
+#[allow(dead_code)]
+pub struct VfioDeviceBase {
+    /// Host BDF address (e.g., "0000:21:00.0" or the short form "21:00.0").
+    pub host_bdf: String,
+
+    /// The bus to which the device is attached (e.g., "pci.1").
+    pub bus: String,
+
+    /// IOMMU file descriptor ID (e.g., "iommufd0").
+    pub iommufd: Option<String>,
+}
+
+/// Comprehensive configuration for a VFIO device.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct VfioDeviceConfig {
+    /// Host BDF address (e.g., "0000:21:00.0" or "21:00.0").
+    pub host_bdf: String,
+
+    /// The bus to which the device is attached (e.g., "pci.1").
+    pub bus: String,
+
+    /// Port number of the associated PCIe Root Port.
+    pub port: u16,
+
+    /// Chassis number of the associated PCIe Root Port.
+    pub chassis: u32,
+
+    /// Whether to enable multifunction support on the PCIe Root Port.
+    pub multifunction: bool,
+
+    /// Indicates if this is the primary device (function 0) in a multifunction group.
+    /// If true, the Root Port will be configured with `multifunction=on`.
+    pub is_multifunction_primary: bool,
+
+    /// Address of the PCIe Root Port on the system bus (e.g., "0x5" or "0x5.0x1").
+    pub root_port_addr: String,
+
+    /// Device address for the VFIO device itself (typically "0x0").
+    #[allow(dead_code)]
+    pub vfio_addr: String,
+
+    /// Optional PCI Vendor ID override.
+    pub x_pci_vendor_id: Option<String>,
+
+    /// Optional PCI Device ID override.
+    pub x_pci_device_id: Option<String>,
+}
+
+impl VfioDeviceConfig {
+    /// Creates a new VFIO device configuration.
+    pub fn new(host_bdf: impl Into<String>, port: u16, chassis: u32) -> Self {
+        let chassis_val = chassis;
+        Self {
+            host_bdf: host_bdf.into(),
+            bus: format!("pci.{}", chassis_val),
+            port,
+            chassis: chassis_val,
+            multifunction: true,
+            is_multifunction_primary: true,
+            // Defaults to 0x5 based on port offset; subsequent devices increment from here.
+            root_port_addr: format!("0x{}", port),
+            vfio_addr: format!("0x{}", port),
+            x_pci_vendor_id: None,
+            x_pci_device_id: None,
+        }
+    }
+
+    pub fn with_multifunction(mut self, multifunction: bool) -> Self {
+        self.multifunction = multifunction;
+        self
+    }
+
+    pub fn with_vfio_bus(mut self, bus: impl Into<String>) -> Self {
+        self.bus = bus.into();
+        self
+    }
+
+    /// Sets a specific root port address (used for non-multifunction modes).
+    pub fn with_root_port_addr(mut self, addr: impl Into<String>) -> Self {
+        self.root_port_addr = addr.into();
+        self.is_multifunction_primary = false;
+        self
+    }
+
+    /// Configures the device as the primary device (function 0) in a multifunction group.
+    #[allow(dead_code)]
+    pub fn as_multifunction_primary(base_addr: impl Into<String>) -> Self {
+        Self {
+            is_multifunction_primary: true,
+            root_port_addr: base_addr.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Configures the device as a secondary device (functions 1-7) in a multifunction group.
+    #[allow(dead_code)]
+    pub fn as_multifunction_secondary(base_addr: impl Into<String>, function: u8) -> Self {
+        if function == 0 || function > 7 {
+            panic!("Function number must be between 1 and 7 for secondary devices");
+        }
+        Self {
+            is_multifunction_primary: false,
+            root_port_addr: format!("{}.0x{:x}", base_addr.into(), function),
+            ..Default::default()
+        }
+    }
+    #[allow(dead_code)]
+    pub fn with_vfio_addr(mut self, addr: impl Into<String>) -> Self {
+        self.vfio_addr = addr.into();
+        self
+    }
+    #[allow(dead_code)]
+    pub fn with_vendor_id(mut self, vendor_id: impl Into<String>) -> Self {
+        self.x_pci_vendor_id = Some(vendor_id.into());
+        self
+    }
+    #[allow(dead_code)]
+    pub fn with_device_id(mut self, device_id: impl Into<String>) -> Self {
+        self.x_pci_device_id = Some(device_id.into());
+        self
+    }
+}
+
+/// Configuration for a group of VFIO devices, typically used to manage multiple
+/// devices sharing the same PCI slot via multifunction support.
+#[derive(Debug, Clone)]
+pub struct VfioDeviceGroup {
+    /// Base PCI slot address (e.g., "0x5").
+    pub base_addr: String,
+
+    /// Identifier for the IOMMU file descriptor (IOMMUFD) backend.
+    #[allow(dead_code)]
+    pub iommufd: String,
+
+    /// Starting port number for the assigned PCIe root ports.
+    pub start_port: u16,
+
+    /// Starting chassis number for the assigned PCIe root ports.
+    pub start_chassis: u32,
+
+    /// List of host BDF (Bus-Device-Function) addresses.
+    pub devices: Vec<String>,
+
+    /// Indicates whether to enable PCI multifunction support for this group.
+    pub multifunction: bool,
+}
+
+impl VfioDeviceGroup {
+    pub fn new(
+        base_addr: impl Into<String>,
+        iommufd: impl Into<String>,
+        start_port: u16,
+        start_chassis: u32,
+    ) -> Self {
+        Self {
+            base_addr: base_addr.into(),
+            iommufd: iommufd.into(),
+            start_port,
+            start_chassis,
+            devices: Vec::new(),
+            multifunction: false,
+        }
+    }
+
+    pub fn with_devices(mut self, devices: Vec<String>) -> Self {
+        self.devices = devices;
+        self
+    }
+
+    pub fn with_multifunction(mut self, multifunction: bool) -> Self {
+        self.multifunction = multifunction;
+        self
+    }
+
+    /// Generates a list of configuration objects for all devices in the group.
+    pub fn generate_configs(&self) -> Vec<VfioDeviceConfig> {
+        self.devices
+            .iter()
+            .enumerate()
+            .map(|(idx, bdf)| {
+                let port = self.start_port + idx as u16;
+                let chassis = self.start_chassis + idx as u32;
+
+                let addr = if idx == 0 && self.multifunction {
+                    // Use the base address for the primary device (function 0)
+                    self.base_addr.clone()
+                } else if self.multifunction && idx > 0 {
+                    // Map subsequent devices to specific PCI functions (e.g., 0x5.0x1)
+                    format!("{}.0x{:x}", self.base_addr, idx)
+                } else {
+                    // In non-multifunction mode, use the base address independently
+                    self.base_addr.clone()
+                };
+
+                VfioDeviceConfig::new(bdf, port, chassis)
+                    .with_multifunction(idx == 0 && self.multifunction)
+                    .with_root_port_addr(addr)
+            })
+            .collect()
     }
 }
 
@@ -2171,6 +2503,10 @@ fn is_running_in_vm() -> Result<bool> {
 }
 
 fn should_disable_modern() -> bool {
+    if !bus_type().supports_disable_modern() {
+        return false;
+    }
+
     match is_running_in_vm() {
         Ok(retval) => retval,
         Err(err) => {
@@ -2233,8 +2569,8 @@ impl<'a> QemuCmdLine<'a> {
             qemu_cmd_line.add_iommu();
         }
 
-        if config.debug_info.enable_debug && !config.debug_info.dbg_monitor_socket.is_empty() {
-            qemu_cmd_line.add_monitor(&config.debug_info.dbg_monitor_socket)?;
+        if config.debug_info.enable_debug && !config.debug_info.extra_monitor_socket.is_empty() {
+            qemu_cmd_line.add_monitor(&config.debug_info.extra_monitor_socket)?;
         }
 
         qemu_cmd_line.add_rtc();
@@ -2270,6 +2606,12 @@ impl<'a> QemuCmdLine<'a> {
         Ok(qemu_cmd_line)
     }
 
+    /// Takes ownership of the CCW subchannel, leaving `None` in its place.
+    /// Used to transfer boot-time CCW state to Qmp for hotplug allocation.
+    pub fn take_ccw_subchannel(&mut self) -> Option<CcwSubChannel> {
+        self.ccw_subchannel.take()
+    }
+
     fn add_monitor(&mut self, proto: &str) -> Result<()> {
         let monitor = QmpSocket::new(self.id.as_str(), MonitorProtocol::new(proto))?;
         self.devices.push(Box::new(monitor));
@@ -2296,6 +2638,14 @@ impl<'a> QemuCmdLine<'a> {
     }
 
     fn add_iommu(&mut self) {
+        // vIOMMU (Intel IOMMU) is not supported on the "virt" machine type (arm64)
+        if self.machine.r#type == "virt" {
+            self.kernel
+                .params
+                .append(&mut KernelParams::from_string("iommu.passthrough=0"));
+            return;
+        }
+
         let dev_iommu = DeviceIntelIommu::new();
         self.devices.push(Box::new(dev_iommu));
 
@@ -2549,13 +2899,19 @@ impl<'a> QemuCmdLine<'a> {
         firmware: &str,
         host_data: &Option<String>,
     ) {
-        let sev_snp_object =
+        // For SEV-SNP, memory overcommit is not supported. we only set the memory size.
+        self.memory.set_maxmem_size(0).set_num_slots(0);
+
+        let mut sev_snp_object =
             ObjectSevSnpGuest::new(true, cbitpos, phys_addr_reduction, host_data.clone());
+        sev_snp_object.set_policy(self.config.security_info.snp_guest_policy);
+
         self.devices.push(Box::new(sev_snp_object));
 
         self.devices.push(Box::new(Bios::new(firmware.to_owned())));
 
         self.machine
+            .set_kernel_irqchip("split")
             .set_confidential_guest_support("snp")
             .set_nvdimm(false);
 
@@ -2575,8 +2931,165 @@ impl<'a> QemuCmdLine<'a> {
         self.devices.push(Box::new(Bios::new(firmware.to_owned())));
 
         self.machine
+            .set_kernel_irqchip("split")
             .set_confidential_guest_support("tdx")
             .set_nvdimm(false);
+    }
+
+    pub fn add_iommufd(&mut self, id: impl Into<String>) -> Result<()> {
+        let id_str = id.into();
+        if !id_str.is_empty() {
+            let iommufd = ObjectIommufd::new(id_str);
+            self.devices.push(Box::new(iommufd));
+        }
+
+        Ok(())
+    }
+
+    /// add_vfio_device
+    /// "-object", "iommufd,id=iommufd0",
+    ///
+    /// -device pcie-root-port,port=24,chassis=9,id=pci.9,bus=pcie.0,multifunction=on,addr=0x4
+    /// -device vfio-pci,host=0000:21:00.0,x-pci-vendor-id=0x10de,x-pci-device-id=0x2321,bus=pci.1,addr=0x0,iommufd=iommufd0
+    pub fn add_vfio_device(&mut self, config: VfioDeviceConfig) -> Result<()> {
+        self.add_iommufd("iommufd0")?;
+
+        let root_port_id = format!("pci.{}", config.chassis);
+        let root_port = PCIeRootPortDevice::new(&root_port_id, DEFAULT_PCIE_ROOT_BUS)
+            .with_port(config.port)
+            .with_chassis(config.chassis)
+            .with_multifunction(config.multifunction)
+            .with_addr(&config.root_port_addr);
+
+        let mut vfio_device = PCIeVfioDevice::new(&config.host_bdf, root_port_id, "iommufd0");
+
+        if let Some(vendor_id) = &config.x_pci_vendor_id {
+            vfio_device = vfio_device.with_vendor_id(vendor_id);
+        }
+
+        if let Some(device_id) = &config.x_pci_device_id {
+            vfio_device = vfio_device.with_device_id(device_id);
+        }
+
+        self.devices.reserve(2);
+        self.devices.push(Box::new(root_port));
+        self.devices.push(Box::new(vfio_device));
+
+        Ok(())
+    }
+
+    /// Configures PCIe VFIO devices using multifunction Root Ports for optimized address space
+    /// -device pcie-root-port,id=root_port1,multifunction=on,chassis=x,addr=z.0 \
+    /// -device pcie-root-port,id=root_port2,chassis=x1,addr=z.1 \
+    pub fn add_pcie_vfio_device(&mut self, config: VfioDeviceConfig) -> Result<()> {
+        let machine_type = &self.config.machine_info.machine_type;
+        let (_start_addr, multi_function) = match machine_type.as_str() {
+            "q35" | "virt" => (DEFAULT_START_ADDR, false),
+            _ => {
+                info!(
+                    sl!(),
+                    "PCIe root ports not supported for machine type: {}", machine_type
+                );
+                return Ok(());
+            }
+        };
+
+        let iommufd_name = format!("iommufd{}", config.bus);
+        self.add_iommufd(&iommufd_name)?;
+
+        let root_port_id = config.bus.clone();
+        let root_port = PCIeRootPortDevice::new(&root_port_id, DEFAULT_PCIE_ROOT_BUS)
+            .with_chassis(config.chassis)
+            .with_slot(config.port as u32)
+            .with_multifunction(multi_function)
+            .with_addr(format!("0x{:02x}", config.port));
+        info!(sl!(), "PCIe Root Port: {:?}", root_port.clone());
+
+        let mut vfio_device = PCIeVfioDevice::new(&config.host_bdf, root_port_id, &iommufd_name);
+
+        if let Some(vendor_id) = &config.x_pci_vendor_id {
+            vfio_device = vfio_device.with_vendor_id(vendor_id);
+        }
+
+        if let Some(device_id) = &config.x_pci_device_id {
+            vfio_device = vfio_device.with_device_id(device_id);
+        }
+
+        self.devices.reserve(2);
+        self.devices.push(Box::new(root_port));
+        self.devices.push(Box::new(vfio_device));
+
+        Ok(())
+    }
+
+    /// Batch adds multiple VFIO devices to the QEMU command line.
+    pub fn add_vfio_devices(&mut self, configs: Vec<VfioDeviceConfig>) -> Result<()> {
+        if configs.is_empty() {
+            return Ok(());
+        }
+
+        self.devices.reserve(configs.len() * 2);
+
+        for config in configs {
+            self.add_vfio_device(config)?;
+        }
+
+        Ok(())
+    }
+
+    /// Adds a group of VFIO devices that share the same PCI slot (Multifunction configuration).
+    pub fn add_vfio_device_group(&mut self, group: VfioDeviceGroup) -> Result<()> {
+        let configs = group.generate_configs();
+        self.add_vfio_devices(configs)
+    }
+
+    /// Convenience method to configure a standard high-performance GPU and NVSwitch topology.
+    #[allow(dead_code)]
+    pub fn add_gpu_nvswitch_setup(
+        &mut self,
+        gpus: Vec<&str>,
+        nvswitches: Vec<&str>,
+        iommufd: &str,
+    ) -> Result<()> {
+        self.add_iommufd(iommufd)?;
+
+        if !gpus.is_empty() {
+            let gpu_group = VfioDeviceGroup::new("0x5", iommufd, 16, 1)
+                .with_devices(gpus.iter().map(|s| s.to_string()).collect())
+                .with_multifunction(true);
+
+            self.add_vfio_device_group(gpu_group)?;
+        }
+
+        if !nvswitches.is_empty() {
+            let nvswitch_configs: Vec<VfioDeviceConfig> = nvswitches
+                .iter()
+                .enumerate()
+                .map(|(idx, bdf)| {
+                    let port = 24 + idx as u16;
+                    let chassis = 9 + idx as u32;
+                    let addr = if idx == 0 {
+                        "0x4".to_string()
+                    } else {
+                        format!("0x4.0x{:x}", idx)
+                    };
+
+                    let full_bdf = if bdf.starts_with("0000:") {
+                        bdf.to_string()
+                    } else {
+                        format!("0000:{}", bdf)
+                    };
+
+                    VfioDeviceConfig::new(full_bdf, port, chassis)
+                        .with_multifunction(idx == 0)
+                        .with_root_port_addr(addr)
+                })
+                .collect();
+
+            self.add_vfio_devices(nvswitch_configs)?;
+        }
+
+        Ok(())
     }
 
     /// Note: add_pcie_root_port and add_pcie_switch_port follow kata-runtime's related implementations of vfio devices.
@@ -2609,15 +3122,13 @@ impl<'a> QemuCmdLine<'a> {
     pub fn add_pcie_root_ports(
         &mut self,
         root_ports: HashMap<u32, TopologyPortDevice>,
-        mem_reserve: u64,
-        pref64_reserve: u64,
     ) -> Result<()> {
         if root_ports.is_empty() {
             return Ok(());
         }
 
-        let machine_type: &str = &self.config.machine_info.machine_type;
-        let (addr, multi_function) = match machine_type {
+        let machine_type = &self.config.machine_info.machine_type;
+        let (addr, multi_function) = match machine_type.as_str() {
             "q35" | "virt" => ("0", false),
             _ => {
                 info!(
@@ -2628,20 +3139,27 @@ impl<'a> QemuCmdLine<'a> {
             }
         };
 
-        // -device pcie-root-port,id=root_port1,multifunction=on,chassis=x,addr=z.0[,slot=y][,bus=pcie.0]
-        for (index, rp) in root_ports.iter() {
-            let (chassis, slot) = (format!("{}", index + 1), format!("{index}"));
-            let mut root_port_dev = PCIeRootPortDevice::new(
-                &rp.port_id(), // rpX
-                &rp.bus,       // pcie.0
-                &chassis,
-                &slot,
-                multi_function,
-                addr,
-            );
-            root_port_dev
-                .set_mem_reserve(mem_reserve)
-                .set_pref64_reserve(pref64_reserve);
+        self.devices.reserve(root_ports.len());
+
+        for (index, rp) in root_ports {
+            // VFIO cold-plug (see `add_pcie_vfio_device`) runs before this when resource order
+            // is CDI VFIO then port pool; it already emits `pcie-root-port,id=rpN` for reserved
+            // slots (`TopologyPortDevice::allocated`). Skip placeholders for those IDs or QEMU
+            // errors with duplicate device id (e.g. two `id=rp0`).
+            if rp.allocated {
+                debug!(
+                    sl!(),
+                    "skip add_pcie_root_ports for {} (already allocated / emitted)",
+                    rp.port_id()
+                );
+                continue;
+            }
+
+            let root_port_dev = PCIeRootPortDevice::new(rp.port_id(), &rp.bus)
+                .with_chassis(index + 1)
+                .with_slot(index)
+                .with_multifunction(multi_function)
+                .with_addr(addr);
 
             self.devices.push(Box::new(root_port_dev));
         }
@@ -2662,15 +3180,13 @@ impl<'a> QemuCmdLine<'a> {
     pub fn add_pcie_switch_ports(
         &mut self,
         switch_ports: HashMap<u32, TopologyPortDevice>,
-        mem_reserve: u64,
-        pref64_reserve: u64,
     ) -> Result<()> {
         if switch_ports.is_empty() {
             return Ok(());
         }
 
         let machine_type = &self.config.machine_info.machine_type;
-        if machine_type != "q35" && machine_type != "virt" {
+        if !matches!(machine_type.as_str(), "q35" | "virt") {
             info!(
                 sl!(),
                 "PCIe switch ports not supported for machine type: {}", machine_type
@@ -2678,43 +3194,41 @@ impl<'a> QemuCmdLine<'a> {
             return Ok(());
         }
 
-        for (index, rp) in switch_ports.iter() {
-            // 1. Create Root Port
-            // -device pcie-root-port,id=root_port1,chassis=x,slot=y[,bus=pcie.0][,addr=z]
+        let estimated_devices: usize = switch_ports
+            .values()
+            .map(|rp| {
+                2 + rp
+                    .connected_switch
+                    .as_ref()
+                    .map_or(0, |s| s.switch_ports.len())
+            })
+            .sum();
+        self.devices.reserve(estimated_devices);
 
-            // (slot, chassis) pair is mandatory and must be unique for each PCI Express Root Port
-            let (slot, chassis) = (format!("{index}"), format!("{}", index + 1));
-            let mut pcie_root_port = PCIeRootPortDevice::new(
-                &rp.port_id(),
-                &rp.bus, // pcie.0
-                &chassis,
-                &slot,
-                false,
-                "0",
-            );
-            pcie_root_port
-                .set_mem_reserve(mem_reserve)
-                .set_pref64_reserve(pref64_reserve);
+        for (index, rp) in switch_ports {
+            let chassis = index + 1;
+
+            // Root Port
+            let pcie_root_port = PCIeRootPortDevice::new(rp.port_id(), &rp.bus)
+                .with_chassis(chassis)
+                .with_slot(index)
+                .with_multifunction(false)
+                .with_addr("0");
+
             self.devices.push(Box::new(pcie_root_port));
 
             if let Some(switch) = &rp.connected_switch {
-                // 2. Create Upstream Port
-                // -device x3130-upstream,id=upstream_port1,bus=root_port1[,addr=x]
-                let upstream_port_id = switch.port_id();
-                let pcie_switch_upstream_port =
-                    PCIeSwitchUpstreamPortDevice::new(&upstream_port_id, &switch.bus);
-                self.devices.push(Box::new(pcie_switch_upstream_port));
+                // Upstream Port
+                let upstream_port =
+                    PCIeSwitchUpstreamPortDevice::new(switch.port_id(), &switch.bus);
+                self.devices.push(Box::new(upstream_port));
 
-                // 3. Create Downstream Ports
-                // -device xio3130-downstream,id=downstream_port1,bus=upstream_port1,chassis=x1,slot=y1[,addr=z1]]
-                let next_chassis = chassis.parse::<u32>()? + 1;
-                for (index, swdp) in switch.switch_ports.iter() {
-                    let pcie_switch_downstream_port = PCIeSwitchDownstreamPortDevice::new(
-                        &swdp.bus,
-                        next_chassis + index,
-                        *index,
-                    );
-                    self.devices.push(Box::new(pcie_switch_downstream_port));
+                // Downstream Ports
+                let next_chassis = chassis + 1;
+                for (idx, swdp) in &switch.switch_ports {
+                    let downstream_port =
+                        PCIeSwitchDownstreamPortDevice::new(&swdp.bus, next_chassis + idx, *idx);
+                    self.devices.push(Box::new(downstream_port));
                 }
             }
         }

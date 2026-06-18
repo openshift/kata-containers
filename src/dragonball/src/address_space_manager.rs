@@ -27,6 +27,8 @@ use dbs_address_space::{
     AddressSpaceRegionType, NumaNode, NumaNodeInfo, MPOL_MF_MOVE, MPOL_PREFERRED,
 };
 use dbs_allocator::Constraint;
+#[cfg(target_arch = "x86_64")]
+use dbs_boot::layout::{BIOS_MEM_SIZE, BIOS_MEM_START};
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VmFd;
 use log::{debug, error, info, warn};
@@ -118,11 +120,15 @@ pub enum AddressManagerError {
 
     /// Failure in accessing the memory located at some address.
     #[error("address manager failed to access guest memory located at 0x{0:x}")]
-    AccessGuestMemory(u64, #[source] vm_memory::mmap::Error),
+    AccessGuestMemory(u64, #[source] vm_memory::GuestMemoryError),
 
     /// Failed to create GuestMemory
     #[error("address manager failed to create guest memory object")]
-    CreateGuestMemory(#[source] vm_memory::Error),
+    CreateGuestMemory(#[source] vm_memory::GuestMemoryError),
+
+    /// Failed to insert/manage guest memory region collection
+    #[error("address manager failed to manage guest memory region collection")]
+    GuestRegionCollection(#[source] vm_memory::GuestRegionCollectionError),
 
     /// Failure in initializing guest memory.
     #[error("address manager failed to initialize guest memory")]
@@ -160,6 +166,7 @@ pub struct AddressSpaceMgrBuilder<'a> {
     mem_prealloc: bool,
     dirty_page_logging: bool,
     vmfd: Option<Arc<VmFd>>,
+    use_firmware: bool,
 }
 
 impl<'a> AddressSpaceMgrBuilder<'a> {
@@ -176,6 +183,7 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
             mem_prealloc: false,
             dirty_page_logging: false,
             vmfd: None,
+            use_firmware: false,
         })
     }
 
@@ -195,6 +203,11 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
     /// Enable/disable KVM dirty page logging.
     pub fn toggle_dirty_page_logging(&mut self, logging: bool) {
         self.dirty_page_logging = logging;
+    }
+
+    /// Enable/disable firmware memory region.
+    pub fn toggle_use_firmware(&mut self, firmware: bool) {
+        self.use_firmware = firmware;
     }
 
     /// Set KVM [`VmFd`] handle to configure memory slots.
@@ -313,22 +326,37 @@ impl AddressSpaceMgr {
             }
         }
 
+        #[cfg(target_arch = "x86_64")]
+        if param.use_firmware {
+            let region = Arc::new(
+                AddressSpaceRegion::create_firmware_region(
+                    GuestAddress(BIOS_MEM_START),
+                    BIOS_MEM_SIZE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+                .map_err(AddressManagerError::CreateAddressSpaceRegion)?,
+            );
+            regions.push(region);
+        }
+
         // Create GuestMemory object
         let mut vm_memory = GuestMemoryMmap::new();
         for reg in regions.iter() {
-            // Allocate used guest memory addresses.
-            // These addresses are statically allocated, resource allocation/update should not fail.
-            let constraint = Constraint::new(reg.len())
-                .min(reg.start_addr().raw_value())
-                .max(reg.last_addr().raw_value());
-            let _key = res_mgr
-                .allocate_mem_address(&constraint)
-                .ok_or(AddressManagerError::NoAvailableMemAddress)?;
+            if reg.region_type() != AddressSpaceRegionType::FirmwareMemory {
+                // Allocate used guest memory addresses.
+                // These addresses are statically allocated, resource allocation/update should not fail.
+                let constraint = Constraint::new(reg.len())
+                    .min(reg.start_addr().raw_value())
+                    .max(reg.last_addr().raw_value());
+                let _key = res_mgr
+                    .allocate_mem_address(&constraint)
+                    .ok_or(AddressManagerError::NoAvailableMemAddress)?;
+            }
             let mmap_reg = self.create_mmap_region(reg.clone())?;
 
             vm_memory = vm_memory
                 .insert_region(mmap_reg.clone())
-                .map_err(AddressManagerError::CreateGuestMemory)?;
+                .map_err(AddressManagerError::GuestRegionCollection)?;
             self.map_to_kvm(res_mgr, &param, reg, mmap_reg)?;
         }
 
@@ -488,8 +516,11 @@ impl AddressSpaceMgr {
             self.configure_thp_and_prealloc(&region, &mmap_reg)?;
         }
 
-        let reg = GuestRegionImpl::new(mmap_reg, region.start_addr())
-            .map_err(AddressManagerError::CreateGuestMemory)?;
+        let reg = GuestRegionImpl::new(mmap_reg, region.start_addr()).ok_or(
+            AddressManagerError::GuestRegionCollection(
+                vm_memory::GuestRegionCollectionError::NoMemoryRegion,
+            ),
+        )?;
         Ok(Arc::new(reg))
     }
 

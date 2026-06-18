@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::NamedHypervisorConfig;
+use crate::ProtectionDevConfig;
 use crate::VmConfig;
 use crate::{
     guest_protection_is_tdx, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpuTopology,
@@ -18,7 +19,7 @@ use kata_types::config::hypervisor::{
 };
 use kata_types::config::BootInfo;
 use std::convert::TryFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::errors::*;
 
@@ -35,6 +36,17 @@ pub const DEFAULT_NUM_PCI_SEGMENTS: u16 = 1;
 
 pub const DEFAULT_DISK_QUEUES: usize = 1;
 pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
+
+const MSHV_DEVICE_PATH: &str = "/dev/mshv";
+
+fn cpu_nested_config() -> Option<bool> {
+    if Path::new(MSHV_DEVICE_PATH).exists() {
+        // Nested vCPUs are not supported on MSHV yet.
+        Some(false)
+    } else {
+        None
+    }
+}
 
 // TDX requires all rootfs's be mounted using a block device. This test
 // ensures that the user has a correct set of values for the following Kata
@@ -110,6 +122,7 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
         let fs = n.shared_fs_devices;
         let net = n.network_devices;
         let host_devices = n.host_devices;
+        let protection_dev = n.protection_device;
 
         let cpus = CpusConfig::try_from((cfg.cpu_info, guest_protection_to_use.clone()))
             .map_err(VmConfigError::CPUError)?;
@@ -118,13 +131,11 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
 
         // Note how CH handles the different image types:
         //
-        // - A standard image is specified in PmemConfig.
         // - An initrd/initramfs is specified in PayloadConfig.
-        // - A confidential guest image is specified by a DiskConfig.
+        // - An image is specified in DiskConfig.
+        //   Note: pmem is not used as it's not properly supported by Cloud Hypervisor.
         //   - If TDX is enabled, the firmware (`td-shim` [1]) must be
         //     specified in PayloadConfig.
-        // - A confidential guest initrd is specified by a PayloadConfig with
-        //   firmware.
         //
         // [1] - https://github.com/confidential-containers/td-shim
         let boot_info = cfg.boot_info;
@@ -140,26 +151,19 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             return Err(VmConfigError::NoBootFile);
         }
 
-        let pmem = if use_initrd || guest_protection_is_tdx(guest_protection_to_use.clone()) {
-            None
-        } else {
-            let pmem = PmemConfig::try_from(&boot_info).map_err(VmConfigError::PmemError)?;
-
-            Some(vec![pmem])
-        };
-
         let payload = Some(
             PayloadConfig::try_from((
                 boot_info.clone(),
                 kernel_params,
                 guest_protection_to_use.clone(),
+                protection_dev,
             ))
             .map_err(VmConfigError::PayloadError)?,
         );
 
         let mut disks: Vec<DiskConfig> = vec![];
 
-        if use_image && guest_protection_is_tdx(guest_protection_to_use.clone()) {
+        if use_image {
             let disk = DiskConfig::try_from(boot_info).map_err(VmConfigError::DiskError)?;
 
             disks.push(disk);
@@ -199,7 +203,6 @@ impl TryFrom<NamedHypervisorConfig> for VmConfig {
             fs,
             net,
             devices: host_devices,
-            pmem,
             disks,
             vsock: Some(vsock),
             rng,
@@ -362,6 +365,7 @@ impl TryFrom<(CpuInfo, GuestProtection)> for CpusConfig {
         let cfg = CpusConfig {
             boot_vcpus,
             max_vcpus,
+            nested: cpu_nested_config(),
             max_phys_bits,
             topology: Some(topology),
             features,
@@ -396,13 +400,28 @@ impl From<String> for CpuFeatures {
 //
 // - The 3rd tuple element determines if TDX is enabled.
 //
-impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
+impl
+    TryFrom<(
+        BootInfo,
+        Option<String>,
+        GuestProtection,
+        Option<ProtectionDevConfig>,
+    )> for PayloadConfig
+{
     type Error = PayloadConfigError;
 
-    fn try_from(args: (BootInfo, Option<String>, GuestProtection)) -> Result<Self, Self::Error> {
+    fn try_from(
+        args: (
+            BootInfo,
+            Option<String>,
+            GuestProtection,
+            Option<ProtectionDevConfig>,
+        ),
+    ) -> Result<Self, Self::Error> {
         let boot_info = args.0;
         let cmdline = args.1;
         let guest_protection_to_use = args.2;
+        let protection_device = args.3;
 
         // The kernel is always specified here,
         // not in the top level VmConfig.kernel.
@@ -430,11 +449,25 @@ impl TryFrom<(BootInfo, Option<String>, GuestProtection)> for PayloadConfig {
             Some(PathBuf::from(boot_info.firmware))
         };
 
+        let mrconfigid = if let Some(ref data) = protection_device {
+            data.mrconfigid.clone()
+        } else {
+            None
+        };
+
+        let host_data = if let Some(ref data) = protection_device {
+            data.host_data.clone()
+        } else {
+            None
+        };
+
         let payload = PayloadConfig {
             kernel: Some(kernel),
             initramfs,
             cmdline,
             firmware,
+            mrconfigid,
+            host_data,
         };
 
         Ok(payload)
@@ -626,6 +659,7 @@ mod tests {
         let cpus_config = CpusConfig {
             boot_vcpus: cpu_default,
             max_vcpus,
+            nested: cpu_nested_config(),
             topology: Some(CpuTopology {
                 cores_per_die: max_vcpus,
 
@@ -706,6 +740,8 @@ mod tests {
             initramfs: Some(PathBuf::from(initramfs)),
             firmware: payload_firmware,
             cmdline,
+            mrconfigid: None,
+            host_data: None,
         };
 
         (boot_info, payload_config)
@@ -1196,6 +1232,7 @@ mod tests {
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 1,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 1,
 
@@ -1216,6 +1253,7 @@ mod tests {
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 3,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 3,
 
@@ -1236,6 +1274,7 @@ mod tests {
                 result: Ok(CpusConfig {
                     boot_vcpus: 1,
                     max_vcpus: 1,
+                    nested: cpu_nested_config(),
                     topology: Some(CpuTopology {
                         cores_per_die: 1,
 
@@ -1283,6 +1322,7 @@ mod tests {
             boot_info: BootInfo,
             cmdline: Option<String>,
             guest_protection: GuestProtection,
+            protection_device: Option<ProtectionDevConfig>,
             result: Result<PayloadConfig, PayloadConfigError>,
         }
 
@@ -1319,6 +1359,7 @@ mod tests {
                 boot_info: BootInfo::default(),
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Err(PayloadConfigError::NoKernel),
             },
             TestData {
@@ -1331,6 +1372,7 @@ mod tests {
                 },
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
@@ -1350,11 +1392,14 @@ mod tests {
                 },
                 cmdline: None,
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     cmdline: None,
                     initramfs: Some(PathBuf::from(initramfs)),
                     firmware: Some(PathBuf::from(firmware)),
+                    mrconfigid: None,
+                    host_data: None,
                 }),
             },
             TestData {
@@ -1367,6 +1412,7 @@ mod tests {
                 },
                 cmdline: Some(cmdline.to_string()),
                 guest_protection: GuestProtection::NoProtection,
+                protection_device: None,
                 result: Ok(PayloadConfig {
                     kernel: Some(PathBuf::from(kernel)),
                     initramfs: Some(PathBuf::from(initramfs)),
@@ -1384,18 +1430,21 @@ mod tests {
                 },
                 cmdline: None,
                 guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Err(PayloadConfigError::TDXFirmwareMissing),
             },
             TestData {
                 boot_info: boot_info_with_initrd,
                 cmdline: Some(cmdline.to_string()),
                 guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_with_initrd),
             },
             TestData {
                 boot_info: boot_info_without_initrd,
                 cmdline: Some(cmdline.to_string()),
                 guest_protection: GuestProtection::Tdx,
+                protection_device: None,
                 result: Ok(payload_config_without_initrd),
             },
         ];
@@ -1407,6 +1456,7 @@ mod tests {
                 d.boot_info.clone(),
                 d.cmdline.clone(),
                 d.guest_protection.clone(),
+                d.protection_device.clone(),
             ));
 
             let msg = format!("{}: actual result: {:?}", msg, result);
@@ -1656,7 +1706,6 @@ mod tests {
         let (memory_info_confidential_guest, mem_config_confidential_guest) =
             make_memory_objects(79, usable_max_mem_bytes, true);
 
-        let (_, pmem_config_with_image) = make_bootinfo_pmemconfig_objects(image);
         let (machine_info, rng_config) = make_machineinfo_rngconfig_objects(entropy_source);
 
         let payload_firmware = None;
@@ -1664,6 +1713,7 @@ mod tests {
         let (boot_info_with_initrd, payload_config_with_initrd) =
             make_bootinfo_payloadconfig_objects(kernel, initramfs, payload_firmware, None);
 
+        let (_, disk_config_with_image) = make_bootinfo_diskconfig_objects(image);
         let (_, disk_config_confidential_guest_image) = make_bootinfo_diskconfig_objects(image);
 
         let boot_info_tdx_image = BootInfo {
@@ -1762,7 +1812,7 @@ mod tests {
             vsock: Some(valid_vsock.clone()),
 
             // rootfs image specific
-            pmem: Some(vec![pmem_config_with_image]),
+            disks: Some(vec![disk_config_with_image]),
 
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from(kernel)),

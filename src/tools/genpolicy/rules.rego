@@ -9,6 +9,9 @@ import future.keywords.in
 import future.keywords.every
 import future.keywords.if
 
+# GetDiagnosticDataRequest is not supported yet when using the CoCo policy unless enabled in policy_data.request_defaults.
+default GetDiagnosticDataRequest := false
+
 # Default values, returned by OPA when rules cannot be evaluated to true.
 default AddARPNeighborsRequest := false
 default AddSwapRequest := false
@@ -472,7 +475,7 @@ allow_log_directory(p_oci, i_oci) if {
 allow_devices(p_devices, i_devices, i_oci) if {
     print("allow_devices: start")
 
-    vfio_device_path := policy_data.device_annotations.vfio.device_path
+    vfio_device_path := policy_data.devices.vfio.device_path
 
     p_volume_devices := [d | d := p_devices[_]; d.container_path != vfio_device_path]
     i_volume_devices := [d | d := i_devices[_]; not startswith(d.container_path, vfio_device_path)]
@@ -515,7 +518,7 @@ allow_vfio_device(p_vfio_devices, i_vfio_device) if {
 
     some p_device in p_vfio_devices
 
-    vfio_device_path := policy_data.device_annotations.vfio.device_path
+    vfio_device_path := policy_data.devices.vfio.device_path
     startswith(i_vfio_device.container_path, vfio_device_path)
     suffix := trim_prefix(i_vfio_device.container_path, vfio_device_path)
     regex.match("^[0-9]+$", suffix)
@@ -556,7 +559,7 @@ allow_vfio_device_cdi_correlation(p_vfio_devices, i_vfio_devices, i_oci) if {
 
     count(i_vfio_devices) == count(p_vfio_devices)
 
-    vfio_device_path := policy_data.device_annotations.vfio.device_path
+    vfio_device_path := policy_data.devices.vfio.device_path
     vfio_numbers := [suffix |
         d := i_vfio_devices[_];
         suffix := trim_prefix(d.container_path, vfio_device_path);
@@ -781,9 +784,6 @@ allow_linux_sysctl(p_linux, i_linux) if {
 allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) if {
     print("allow_by_bundle_or_sandbox_id: start")
 
-    bundle_path := i_oci.Annotations["io.katacontainers.pkg.oci.bundle_path"]
-    bundle_id := replace(bundle_path, "/run/containerd/io.containerd.runtime.v2.task/k8s.io/", "")
-
     key := "io.kubernetes.cri.sandbox-id"
 
     p_regex := p_oci.Annotations[key]
@@ -792,14 +792,22 @@ allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) if {
     print("allow_by_bundle_or_sandbox_id: sandbox_id =", sandbox_id, "regex =", p_regex)
     regex.match(p_regex, sandbox_id)
 
-    allow_root_path(p_oci, i_oci, bundle_id)
+    i_root := i_oci.Root.Path
+    p_root_pattern1 := p_oci.Root.Path
+    p_root_pattern2 := replace(p_root_pattern1, "$(root_path)", policy_data.common.root_path)
+    # Bundle path segment can be a 64-char hex (OCI bundle ID) or the runtime's container/bundle identifier used in paths (e.g. short ID or CRI container ID).
+    p_root_pattern3 := replace(p_root_pattern2, "$(bundle-id)", "([0-9a-f]{64}|[a-z0-9][a-z0-9.-]*)")
+    print("allow_by_bundle_or_sandbox_id: i_root =", i_root, "regex =", p_root_pattern3)
+
+    # Verify that the root path matches the substituted pattern and extract the bundle-id.
+    bundle_id := regex.find_all_string_submatch_n(p_root_pattern3, i_root, 1)[0][1]
 
     # Match each input mount with a Policy mount.
     # Reject possible attempts to match multiple input mounts with a single Policy mount.
-    p_matches := { p_index | some i_index; p_index = allow_mount(p_oci, input.OCI.Mounts[i_index], bundle_id, sandbox_id) }
+    p_matches := { p_index | some i_index; p_index = allow_mount(p_oci, i_oci.Mounts[i_index], i_storages, bundle_id, sandbox_id) }
 
     print("allow_by_bundle_or_sandbox_id: p_matches =", p_matches)
-    count(p_matches) == count(input.OCI.Mounts)
+    count(p_matches) == count(i_oci.Mounts)
 
     allow_storages(p_storages, i_storages, bundle_id, sandbox_id)
 
@@ -1091,33 +1099,32 @@ is_ip_other_byte(component) if {
     number <= 255
 }
 
-# OCI root.Path
-allow_root_path(p_oci, i_oci, bundle_id) if {
-    i_path := i_oci.Root.Path
-    p_path1 := p_oci.Root.Path
-    print("allow_root_path: i_path =", i_path, "p_path1 =", p_path1)
-
-    p_path2 := replace(p_path1, "$(root_path)", policy_data.common.root_path)
-    print("allow_root_path: p_path2 =", p_path2)
-
-    p_path3 := replace(p_path2, "$(bundle-id)", bundle_id)
-    print("allow_root_path: p_path3 =", p_path3)
-
-    p_path3 == i_path
-
-    print("allow_root_path: true")
-}
-
-# device mounts
-# allow_mount returns the policy index (p_index) if a given input mount matches a policy mount.
-allow_mount(p_oci, i_mount, bundle_id, sandbox_id):= p_index if {
-    print("allow_mount: i_mount =", i_mount)
+allow_mount(p_oci, i_mount, i_storages, bundle_id, sandbox_id):= p_index if {
+    print("-------- allow_mount 1: i_mount =", i_mount)
 
     some p_index, p_mount in p_oci.Mounts
-    print("allow_mount: p_index =", p_index, "p_mount =", p_mount)
+
+    print("allow_mount 1: p_mount =", p_mount)
     check_mount(p_mount, i_mount, bundle_id, sandbox_id)
 
-    print("allow_mount: true, p_index =", p_index)
+    print("allow_mount 1: true, p_index =", p_index)
+}
+allow_mount(p_oci, i_mount, i_storages, bundle_id, sandbox_id):= p_index if {
+    print("-------- allow_mount 2: i_mount =", i_mount)
+
+    some p_index, p_mount in p_oci.Mounts
+    print("allow_mount 2: p_mount =", p_mount)
+
+    p_mount.destination == i_mount.destination
+    p_mount.type_ == i_mount.type_
+    p_mount.options == i_mount.options
+
+    some i_storage in i_storages
+    print("allow_mount 2: i_storage =", i_storage)
+
+    i_storage.mount_point == i_mount.source
+
+    print("allow_mount 2: true, p_index =", p_index)
 }
 
 check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
@@ -1132,6 +1139,48 @@ check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
     mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id)
 
     print("check_mount 2: true")
+}
+check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
+    # This check passes if the policy container has RW, the input container has
+    # RO and the volume type is sysfs, working around different handling of
+    # privileged containers after containerd 2.0.4.
+    i_mount.type_ == "sysfs"
+    p_mount.type_ == i_mount.type_
+    p_mount.destination == i_mount.destination
+    p_mount.source == i_mount.source
+
+    i_options := {x | x = i_mount.options[_]} | {"rw"}
+    p_options := {x | x = p_mount.options[_]} | {"ro"}
+    p_options == i_options
+
+    print("check_mount 3: true")
+}
+
+check_mount(p_mount, i_mount, bundle_id, sandbox_id) if {
+    # Unified cgroup v2 mounts on newer kernels may add flags genpolicy does not
+    # embed (e.g. nsdelegate, memory_recursiveprot). Allow extras listed in
+    # policy_data.cluster_config.cgroup_mount_extras_allowed (from genpolicy-settings.json).
+    i_mount.type_ == "cgroup"
+    p_mount.type_ == "cgroup"
+    p_mount.destination == i_mount.destination
+    p_mount.source == i_mount.source
+
+    allowed_extras := {x | x = policy_data.cluster_config.cgroup_mount_extras_allowed[_]}
+
+    p_opts := {x | x = p_mount.options[_]}
+    i_opts := {x | x = i_mount.options[_]}
+    every opt in p_mount.options {
+        opt in i_opts
+    }
+
+    extras := i_opts - p_opts
+    every extra in extras {
+        extra in allowed_extras
+    }
+
+    mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id)
+
+    print("check_mount 4: true")
 }
 
 mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
@@ -1194,14 +1243,10 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage: p_storage =", p_storage)
     print("allow_storage: i_storage =", i_storage)
 
-    p_storage.driver           == i_storage.driver
-    p_storage.driver_options   == i_storage.driver_options
-    p_storage.fs_group         == i_storage.fs_group
-    p_storage.fstype           == i_storage.fstype
-
+    p_storage.driver == i_storage.driver
     allow_storage_source(p_storage, i_storage, bundle_id)
-    allow_storage_options(p_storage, i_storage)
-    allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id)
+
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
 
     print("allow_storage: true")
 }
@@ -1210,9 +1255,53 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage with image_guest_pull: start")
     i_storage.fstype == "overlay"
     i_storage.fs_group == null
+    i_storage.shared == false
     count(i_storage.options) == 0
     # TODO: Check Mount Point, Source, Driver Options, etc.
     print("allow_storage with image_guest_pull: true")
+}
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage with scsi: start")
+
+    i_storage.driver == "scsi"
+    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
+
+    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
+
+    print("allow_storage with scsi: true")
+}
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_storage with blk: start")
+
+    i_storage.driver == "blk"
+    regex.match("^[0-9]{2}/[0-9]{2}$", i_storage.source)
+
+    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
+
+    print("allow_storage with blk: true")
+}
+
+# Validates all storage fields except driver and source.
+allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
+    # Not logging as this is reused multiple times.
+
+    p_storage.driver_options == i_storage.driver_options
+    p_storage.fs_group       == i_storage.fs_group
+    p_storage.fstype         == i_storage.fstype
+    p_storage.shared         == i_storage.shared
+
+    allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id)
+    allow_storage_options(p_storage, i_storage)
+}
+
+allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+    print("allow_block_storage: start")
+
+    some p_storage in p_storages
+
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+
+    print("allow_block_storage: true")
 }
 
 allow_storage_source(p_storage, i_storage, bundle_id) if {
@@ -1255,6 +1344,8 @@ allow_storage_options(p_storage, i_storage) if {
 }
 
 allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point 1: start")
+
     p_storage.fstype == "local"
 
     mount1 := p_storage.mount_point
@@ -1271,6 +1362,8 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     print("allow_mount_point 1: true")
 }
 allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point 2: start")
+
     p_storage.fstype == "bind"
 
     mount1 := p_storage.mount_point
@@ -1287,6 +1380,8 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     print("allow_mount_point 2: true")
 }
 allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point 3: start")
+
     p_storage.fstype == "tmpfs"
 
     mount1 := p_storage.mount_point
@@ -1295,6 +1390,39 @@ allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
     regex.match(mount1, i_storage.mount_point)
 
     print("allow_mount_point 3: true")
+}
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point 4: start")
+
+    i_storage.driver == "blk"
+    allow_mount_point_by_device_id(p_storage, i_storage)
+
+    print("allow_mount_point 4: true")
+}
+allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("allow_mount_point 5: start")
+
+    i_storage.driver == "scsi"
+    allow_mount_point_by_device_id(p_storage, i_storage)
+
+    print("allow_mount_point 5: true")
+}
+
+allow_mount_point_by_device_id(p_storage, i_storage) if {
+    print("allow_mount_point_by_device_id: start")
+
+    mount1 := p_storage.mount_point
+    print("allow_mount_point_by_device_id: mount1 =", mount1)
+
+    mount2 := replace(mount1, "$(spath)", policy_data.common.spath)
+    print("allow_mount_point_by_device_id: mount2 =", mount2)
+
+    mount3 := replace(mount2, "$(b64_device_id)", base64url.encode(i_storage.source))
+    print("allow_mount_point_by_device_id: mount3 =", mount3)
+
+    mount3 == i_storage.mount_point
+
+    print("allow_mount_point_by_device_id: true")
 }
 
 # ExecProcessRequest.process.Capabilities
@@ -1620,7 +1748,7 @@ AddARPNeighborsRequest if {
         every p_cidr in p_defaults.forbidden_cidrs_regex {
             not regex.match(p_cidr, i_neigh.toIPAddress.address)
         }
-        i_neigh.state == 128
+        i_neigh.state in p_defaults.allowed_states
         bits.or(i_neigh.flags, 136) == 136
     }
 
@@ -1641,6 +1769,10 @@ UpdateEphemeralMountsRequest if {
 
 WriteStreamRequest if {
     policy_data.request_defaults.WriteStreamRequest == true
+}
+
+GetDiagnosticDataRequest if {
+    policy_data.request_defaults.GetDiagnosticDataRequest == true
 }
 
 RemoveContainerRequest:= {"ops": ops, "allowed": true} if {

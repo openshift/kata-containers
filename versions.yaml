@@ -75,7 +75,7 @@ assets:
       url: "https://github.com/cloud-hypervisor/cloud-hypervisor"
       uscan-url: >-
         https://github.com/cloud-hypervisor/cloud-hypervisor/tags.*/v?(\d\S+)\.tar\.gz
-      version: "v48.0"
+      version: "v51.1"
 
     firecracker:
       description: "Firecracker micro-VMM"
@@ -88,8 +88,8 @@ assets:
     qemu:
       description: "VMM that uses KVM"
       url: "https://github.com/qemu/qemu"
-      version: "v10.2.0"
-      tag: "v10.2.0"
+      version: "v10.2.1"
+      tag: "v10.2.1"
       # Do not include any non-full release versions
       # Break the line *without CR or space being appended*, to appease
       # yamllint, and note the deliberate ' ' at the end of the expression.
@@ -207,19 +207,11 @@ assets:
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.18.5"
-    confidential:
-      description: "Linux kernel with x86_64 TEEs (SNP and TDX) support"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.18.5"
+    version: "v6.18.28"
     nvidia:
       description: "Linux kernel optimised for virtual machines"
       url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.18.5"
-    nvidia-confidential:
-      description: "Linux kernel with x86_64 TEEs (SNP and TDX) support"
-      url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.18.5"
+      version: "v6.18.28"
 
   kernel-arm-experimental:
     description: "Linux kernel with cpu/mem hotplug support on arm64"
@@ -234,7 +226,7 @@ assets:
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.12.47"
+    version: "v6.18.28"
 
 externals:
   description: "Third-party projects used by the system"
@@ -242,15 +234,45 @@ externals:
   nvrc:
     # yamllint disable-line rule:line-length
     desc: "The NVRC project provides a Rust binary that implements a simple init system for microVMs"
-    version: "v0.1.1"
+    version: "v0.1.4"
     url: "https://github.com/NVIDIA/nvrc/releases/download/"
 
   nvidia:
-    desc: "NVIDIA driver version"
+    desc: "NVIDIA compute stack"
     driver:
-      version: "590.48.01"
+      desc: "NVIDIA kernel driver"
+      version: "595.58.03"
       # yamllint disable-line rule:line-length
       url: "https://github.com/NVIDIA/open-gpu-kernel-modules/archive/refs/tags/"
+    cuda:
+      desc: "NVIDIA CUDA repository"
+      repo:
+        x86_64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+        aarch64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+    tools:
+      desc: "NVIDIA container toolkit and tools repository"
+      repo:
+        x86_64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+        aarch64:
+          # yamllint disable-line rule:line-length
+          url: "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa/"
+          pkg: "cuda-keyring_1.1-1_all.deb"
+    ctk:
+      version: "1.18.1-1"
+      url: "https://github.com/NVIDIA/nvidia-container-toolkit"
+    nvat:
+      desc: "NVIDIA Attestation SDK"
+      version: "2026.03.02"
+      url: "https://github.com/NVIDIA/attestation-sdk"
 
   busybox:
     desc: "The Swiss Army Knife of Embedded Linux"
@@ -270,19 +292,17 @@ externals:
   coco-guest-components:
     description: "Provides attested key unwrapping for image decryption"
     url: "https://github.com/confidential-containers/guest-components/"
-    version: "026694d44d4ec483465d2fa5f80a0376166b174d"
-    toolchain: "1.85.1"
+    version: "f1561038b9a58d309a3366cc8e25d8e6162424a0"
+    toolchain: "1.90.0"
 
   coco-trustee:
     description: "Provides attestation and secret delivery components"
     url: "https://github.com/confidential-containers/trustee"
-    version: "f342a12115c67ea3af769fcd57e450f569ff7377"
-    # image / ita_image and image_tag / ita_image_tag must be in sync
+    version: "d4e317620c4039c89779b725f74974d8f005da66"
+    # image and image_tag must be in sync
     image: "ghcr.io/confidential-containers/staged-images/kbs"
-    image_tag: "f342a12115c67ea3af769fcd57e450f569ff7377"
-    ita_image: "ghcr.io/confidential-containers/staged-images/kbs-ita-as"
-    ita_image_tag: "f342a12115c67ea3af769fcd57e450f569ff7377-x86_64"
-    toolchain: "1.85.1"
+    image_tag: "d4e317620c4039c89779b725f74974d8f005da66"
+    toolchain: "1.90.0"
 
   containerd:
     description: |
@@ -294,10 +314,7 @@ externals:
     # version older than them.
     version: "v1.7.25"
     lts: "v1.7"
-    active: "v2.1"
-    # keep the latest version to make the current PR ci work, once it was
-    # merged,we can remove the latest version.
-    latest: "v2.2"
+    active: "v2.2"
 
   critools:
     description: "CLI tool for Container Runtime Interface (CRI)"
@@ -319,7 +336,7 @@ externals:
 
   gperf:
     description: "GNU gperf is a perfect hash function generator"
-    url: "http://ftpmirror.gnu.org/gperf/"
+    url: "https://ftp.gnu.org.uk/gnu/gperf/"
     version: "3.3"
 
   hadolint:
@@ -368,12 +385,10 @@ externals:
     url: "https://github.com/dragonflyoss/image-service"
     version: "v2.2.3"
 
-  # Keep the version here aligned with the NYDUS_SNAPSHOTTER_VERSION
-  # on tools/packaging/kata-deploy/Dockerfile
   nydus-snapshotter:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
-    version: "v0.15.10"
+    version: "v0.15.15"
 
   opa:
     description: "Open Policy Agent"
@@ -453,46 +468,34 @@ languages:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
     # When updating this, also update in go.mod files.
-    version: "1.24.11"
+    version: "1.25.10"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.24.11"
+      newest-version: "1.25.10"
 
   rust:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
     # Keep in sync with rust-toolchain.toml
-    version: "1.89"
+    version: "1.93"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.89"
+      newest-version: "1.93"
 
   golangci-lint:
     description: "golangci-lint"
     notes: "'version' is the default minimum version used by this project."
     url: "github.com/golangci/golangci-lint"
-    version: "1.64.8"
+    version: "2.9.0"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.64.8"
-
-plugins:
-  description: |
-    Details of plugins required for the components or testing.
-
-  sriov-network-device:
-    description: |
-      The SR-IOV network device plugin is Kubernetes device plugin for
-      discovering and advertising SR-IOV virtual functions (VFs)
-      available on a Kubernetes host.
-    url: "https://github.com/k8snetworkplumbingwg/sriov-network-device-plugin"
-    version: "b7f6d3e0679796e907ecca88cfab0e32e326850d"
+      newest-version: "2.9.0"
 
 docker_images:
   description: "Docker images used for testing"

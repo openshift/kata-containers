@@ -100,7 +100,13 @@ impl BlockRootfs {
                 VIRTIO_BLK_MMIO => {
                     storage.source = device.config.virt_path;
                 }
-                VIRTIO_SCSI | VIRTIO_BLK_CCW | VIRTIO_PMEM => {
+                VIRTIO_BLK_CCW => {
+                    storage.source = device
+                        .config
+                        .ccw_addr
+                        .ok_or_else(|| anyhow!("CCW address missing for ccw block device"))?;
+                }
+                VIRTIO_SCSI | VIRTIO_PMEM => {
                     return Err(anyhow!(
                         "Complete support for block driver {} has not been implemented yet",
                         block_driver
@@ -131,8 +137,8 @@ impl Rootfs for BlockRootfs {
         Ok(vec![self.mount.clone()])
     }
 
-    async fn get_storage(&self) -> Option<Storage> {
-        self.storage.clone()
+    async fn get_storage(&self) -> Option<Vec<Storage>> {
+        self.storage.clone().map(|s| vec![s])
     }
 
     async fn get_device_id(&self) -> Result<Option<String>> {
