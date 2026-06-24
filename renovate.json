@@ -16,5 +16,35 @@
     },
     "cargo": {
         "enabled": false
+    },
+    "pep621": {
+        "enabled": false
+    },
+    "pip-compile": {
+        "enabled": false
+    },
+    "pip_requirements": {
+        "enabled": false
+    },
+    "pip_setup": {
+        "enabled": false
+    },
+    "pipenv": {
+        "enabled": false
+    },
+    "poetry": {
+        "enabled": false
+    },
+    "pyenv": {
+        "enabled": false
+    },
+    "runtime-version": {
+        "enabled": false
+    },
+    "setup-cfg": {
+        "enabled": false
+    },
+    "pep723": {
+        "enabled": false
     }
 }
