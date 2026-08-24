@@ -12,6 +12,7 @@ logging::logger_with_subsystem!(sl, "hypervisor");
 pub mod device;
 pub mod hypervisor_persist;
 pub use device::driver::*;
+pub use device::pci_path::PciPath;
 use device::DeviceType;
 #[cfg(all(
     feature = "dragonball",
@@ -25,6 +26,11 @@ pub mod dragonball;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod firecracker;
 mod kernel_param;
+#[cfg(all(
+    feature = "openvmm",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod openvmm;
 pub mod qemu;
 pub mod remote;
 pub mod selinux;
@@ -45,6 +51,12 @@ use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 
 pub use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
+
+#[cfg(all(
+    feature = "openvmm",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub use kata_types::config::hypervisor::HYPERVISOR_NAME_OPENVMM;
 
 // Config which driver to use as vm root dev
 const VM_ROOTFS_DRIVER_BLK: &str = "virtio-blk-pci";
@@ -161,4 +173,15 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn set_guest_memory_block_size(&self, size: u32);
     async fn guest_memory_block_size(&self) -> u32;
     async fn get_passfd_listener_addr(&self) -> Result<(String, u32)>;
+
+    /// Resolve the in-guest PCIe path for a cold-plugged physical-endpoint VF
+    /// by querying QMP (query-pci + device search by QEMU device ID).
+    /// Only meaningful after the VM has started and QMP is initialised.
+    /// Default: Err (non-QEMU hypervisors do not support this).
+    async fn resolve_vfio_device_pci_path(&self, hostdev_id: &str) -> Result<PciPath> {
+        Err(anyhow::anyhow!(
+            "resolve_vfio_device_pci_path not supported for this hypervisor (device: {})",
+            hostdev_id
+        ))
+    }
 }

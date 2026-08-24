@@ -17,7 +17,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::io::{Seek, SeekFrom};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,16 +30,23 @@ use dbs_address_space::{
 use dbs_allocator::Constraint;
 #[cfg(target_arch = "x86_64")]
 use dbs_boot::layout::{BIOS_MEM_SIZE, BIOS_MEM_START};
-use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::{
+    kvm_create_guest_memfd, kvm_userspace_memory_region, kvm_userspace_memory_region2,
+    KVM_MEM_GUEST_MEMFD,
+};
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
 use kvm_ioctls::VmFd;
 use log::{debug, error, info, warn};
 use nix::sys::mman;
 use nix::unistd::dup;
+use serde_derive::{Deserialize, Serialize};
 #[cfg(feature = "atomic-guest-memory")]
 use vm_memory::GuestMemoryAtomic;
 use vm_memory::{
-    address::Address, FileOffset, GuestAddress, GuestAddressSpace, GuestMemoryMmap,
-    GuestMemoryRegion, GuestRegionMmap, GuestUsize, MemoryRegionAddress, MmapRegion,
+    address::Address, Bytes, FileOffset, GuestAddress, GuestAddressSpace, GuestMemory,
+    GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap, GuestUsize, MemoryRegionAddress,
+    MmapRegion,
 };
 
 use crate::resource_manager::ResourceManager;
@@ -153,6 +161,41 @@ pub enum AddressManagerError {
     /// Failed to create Address Space Region
     #[error("address manager failed to create Address Space Region {0}")]
     CreateAddressSpaceRegion(#[source] AddressSpaceError),
+
+    /// Failure in accessing the memory snapshot file.
+    #[error("address manager failed to access the memory snapshot file")]
+    SnapshotFile(#[source] std::io::Error),
+
+    /// The memory snapshot layout doesn't match the current address space.
+    #[error("memory snapshot layout mismatch for guest address 0x{0:x}")]
+    SnapshotLayoutMismatch(u64),
+
+    /// The memory snapshot file is smaller than the mapped regions require.
+    #[error(
+        "memory snapshot file too small: region at guest address 0x{guest_addr:x} \
+         needs {needed} bytes but the file is only {file_len}"
+    )]
+    SnapshotFileTooSmall {
+        /// Guest address of the region that runs past the end of the file.
+        guest_addr: u64,
+        /// Byte offset the region requires the file to reach.
+        needed: u64,
+        /// Actual length of the snapshot file.
+        file_len: u64,
+    },
+
+    /// Failed to create VM-bound memfd
+    #[error("address manager failed to create VM-bound memfd: {0}")]
+    CreateVmboundMemfd(#[source] kvm_ioctls::Error),
+
+    /// Failed to set KVM memory slot with VM-bound memfd
+    #[error("address manager failed to configure KVM memory slot with VM-bound memfd: {0}")]
+    KvmSetMemorySlotWithMemfd(#[source] kvm_ioctls::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to configure KVM memory attributes
+    #[error("address manager failed to configure KVM memory attributes: {0}")]
+    KvmSetMemoryAttributes(#[source] kvm_ioctls::Error),
 }
 
 type Result<T> = std::result::Result<T, AddressManagerError>;
@@ -167,6 +210,8 @@ pub struct AddressSpaceMgrBuilder<'a> {
     dirty_page_logging: bool,
     vmfd: Option<Arc<VmFd>>,
     use_firmware: bool,
+    #[cfg(target_arch = "x86_64")]
+    kvm_mem_attr_private: bool,
 }
 
 impl<'a> AddressSpaceMgrBuilder<'a> {
@@ -184,6 +229,8 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
             dirty_page_logging: false,
             vmfd: None,
             use_firmware: false,
+            #[cfg(target_arch = "x86_64")]
+            kvm_mem_attr_private: false,
         })
     }
 
@@ -208,6 +255,12 @@ impl<'a> AddressSpaceMgrBuilder<'a> {
     /// Enable/disable firmware memory region.
     pub fn toggle_use_firmware(&mut self, firmware: bool) {
         self.use_firmware = firmware;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    /// Set KVM memory attribute to private/shared.
+    pub fn toggle_kvm_mem_attr_private(&mut self, private: bool) {
+        self.kvm_mem_attr_private = private;
     }
 
     /// Set KVM [`VmFd`] handle to configure memory slots.
@@ -431,24 +484,67 @@ impl AddressSpaceMgr {
             let host_addr = mmap_reg
                 .get_host_address(MemoryRegionAddress(0))
                 .map_err(|_e| AddressManagerError::InvalidOperation)?;
-            let flags = 0u32;
+            let mut flags = 0u32;
 
-            let mem_region = kvm_userspace_memory_region {
-                slot,
-                guest_phys_addr: reg.start_addr().raw_value(),
-                memory_size: reg.len(),
-                userspace_addr: host_addr as u64,
-                flags,
-            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let kvm_guest_memfd = false;
+            #[cfg(target_arch = "x86_64")]
+            let kvm_guest_memfd = param.kvm_mem_attr_private;
 
-            info!(
-                "VM: guest memory region {:x} starts at {:x?}",
-                reg.start_addr().raw_value(),
-                host_addr
-            );
-            // Safe because the guest regions are guaranteed not to overlap.
-            unsafe { vmfd.set_user_memory_region(mem_region) }
-                .map_err(AddressManagerError::KvmSetMemorySlot)?;
+            if !kvm_guest_memfd {
+                let mem_region = kvm_userspace_memory_region {
+                    slot,
+                    guest_phys_addr: reg.start_addr().raw_value(),
+                    memory_size: reg.len(),
+                    userspace_addr: host_addr as u64,
+                    flags,
+                };
+
+                info!(
+                    "VM: guest memory region {:x} starts at {:x?}",
+                    reg.start_addr().raw_value(),
+                    host_addr
+                );
+                // Safe because the guest regions are guaranteed not to overlap.
+                unsafe { vmfd.set_user_memory_region(mem_region) }
+                    .map_err(AddressManagerError::KvmSetMemorySlot)?;
+            } else {
+                let memfd = vmfd
+                    .create_guest_memfd(kvm_create_guest_memfd {
+                        size: reg.len(),
+                        flags: 0,
+                        ..Default::default()
+                    })
+                    .map_err(AddressManagerError::CreateVmboundMemfd)?;
+                flags |= KVM_MEM_GUEST_MEMFD;
+                let guest_phys_addr = reg.start_addr().raw_value();
+                let memory_size = reg.len();
+                unsafe {
+                    vmfd.set_user_memory_region2(kvm_userspace_memory_region2 {
+                        slot,
+                        flags,
+                        guest_phys_addr,
+                        memory_size,
+                        userspace_addr: host_addr as u64,
+                        guest_memfd_offset: 0,
+                        guest_memfd: memfd as u32,
+                        ..Default::default()
+                    })
+                    .map_err(AddressManagerError::KvmSetMemorySlotWithMemfd)?;
+                }
+
+                #[cfg(target_arch = "x86_64")]
+                if param.kvm_mem_attr_private {
+                    let attributes = KVM_MEMORY_ATTRIBUTE_PRIVATE as u64;
+                    vmfd.set_memory_attributes(kvm_memory_attributes {
+                        address: guest_phys_addr,
+                        size: memory_size,
+                        attributes,
+                        flags: 0,
+                    })
+                    .map_err(AddressManagerError::KvmSetMemoryAttributes)?;
+                }
+            }
         }
 
         self.base_to_slot
@@ -480,9 +576,9 @@ impl AddressSpaceMgr {
         // so we have to duplicate the fd here. It's really a dirty design.
         let file_offset = match region.file_offset().as_ref() {
             Some(fo) => {
-                let fd = dup(fo.file().as_raw_fd()).map_err(AddressManagerError::DupFd)?;
+                let fd = dup(fo.file()).map_err(AddressManagerError::DupFd)?;
                 // Safe because we have just duplicated the raw fd.
-                let file = unsafe { File::from_raw_fd(fd) };
+                let file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
                 let file_offset = FileOffset::new(file, fo.start());
                 Some(file_offset)
             }
@@ -527,7 +623,7 @@ impl AddressSpaceMgr {
     fn configure_anon_mem(&self, mmap_reg: &MmapRegion) -> Result<()> {
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new(mmap_reg.as_ptr() as *mut libc::c_void).unwrap(),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_DONTFORK,
             )
@@ -575,7 +671,7 @@ impl AddressSpaceMgr {
         // Safe because we just create the MmapRegion
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new(mmap_reg.as_ptr() as *mut libc::c_void).unwrap(),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_HUGEPAGE,
             )
@@ -703,6 +799,168 @@ impl AddressSpaceMgr {
     }
 }
 
+/// Location of one guest memory region's contents within the snapshot
+/// memory file.
+///
+/// Compatibility policy (see `crate::snapshot`): only append new fields, with
+/// `#[serde(default)]`; never remove or repurpose existing ones.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GuestMemoryRegionState {
+    /// Guest physical address of the region.
+    pub guest_addr: u64,
+    /// Size of the region in bytes.
+    pub size: u64,
+    /// Offset of the region's contents in the memory file.
+    pub file_offset: u64,
+}
+
+/// State of the guest RAM contents in the snapshot memory file.
+///
+/// The guest memory *layout* is not restored from this state: it is
+/// re-created from the VM configuration (which the snapshot also carries),
+/// producing an identical layout. This state maps that layout onto the
+/// memory file and is validated against it on restore.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct GuestMemoryState {
+    /// Per-region contents location, in guest address order.
+    pub regions: Vec<GuestMemoryRegionState>,
+}
+
+impl<'a> dbs_snapshot::Persist<'a> for AddressSpaceMgr {
+    type State = GuestMemoryState;
+    type SaveArgs = &'a mut File;
+    type RestoreArgs = &'a mut File;
+    type Error = AddressManagerError;
+
+    /// Dump the guest RAM contents to the snapshot memory file.
+    ///
+    /// The virtual machine must be paused when this is called. Regions are
+    /// written sequentially to `file` starting at its current beginning.
+    fn save_state(&mut self, file: &'a mut File) -> Result<GuestMemoryState> {
+        let vm_as = self
+            .get_vm_as()
+            .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        let guard = vm_as.memory();
+
+        // Make the recorded offsets match the bytes we actually write: rewind
+        // to the start and drop any pre-existing contents, so save_state is
+        // correct regardless of the file's incoming cursor/length.
+        file.seek(SeekFrom::Start(0))
+            .map_err(AddressManagerError::SnapshotFile)?;
+        file.set_len(0).map_err(AddressManagerError::SnapshotFile)?;
+
+        let mut regions = Vec::new();
+        let mut file_offset = 0u64;
+        for region in guard.iter() {
+            let size = region.len();
+            region
+                .write_all_volatile_to(MemoryRegionAddress(0), file, size as usize)
+                .map_err(|e| {
+                    AddressManagerError::AccessGuestMemory(region.start_addr().raw_value(), e)
+                })?;
+            regions.push(GuestMemoryRegionState {
+                guest_addr: region.start_addr().raw_value(),
+                size,
+                file_offset,
+            });
+            file_offset += size;
+        }
+
+        Ok(GuestMemoryState { regions })
+    }
+
+    /// Load the guest RAM contents back from the snapshot memory file.
+    ///
+    /// The address space must already have been re-created from the same VM
+    /// configuration the snapshot was taken with; `state` is validated
+    /// against the resulting layout and a mismatch is refused.
+    fn restore_state(&mut self, state: &GuestMemoryState, file: &'a mut File) -> Result<()> {
+        let vm_as = self
+            .get_vm_as()
+            .ok_or(AddressManagerError::GuestMemoryNotInitialized)?;
+        let guard = vm_as.memory();
+
+        // Validate the snapshot file is large enough for every region *before*
+        // installing any mapping. mmap(MAP_PRIVATE) happily maps past the end
+        // of a truncated file; the shortfall only surfaces later as a SIGBUS
+        // in the VMM when the guest first touches a page beyond EOF. Refuse a
+        // too-small file up front with a clear error instead.
+        let file_len = file
+            .metadata()
+            .map_err(AddressManagerError::SnapshotFile)?
+            .len();
+        for region_state in &state.regions {
+            let needed = region_state
+                .file_offset
+                .checked_add(region_state.size)
+                .ok_or(AddressManagerError::SnapshotLayoutMismatch(
+                    region_state.guest_addr,
+                ))?;
+            if needed > file_len {
+                return Err(AddressManagerError::SnapshotFileTooSmall {
+                    guest_addr: region_state.guest_addr,
+                    needed,
+                    file_len,
+                });
+            }
+        }
+
+        for region_state in &state.regions {
+            let guest_addr = GuestAddress(region_state.guest_addr);
+            let region = guard.find_region(guest_addr).ok_or(
+                AddressManagerError::SnapshotLayoutMismatch(region_state.guest_addr),
+            )?;
+            if region.start_addr() != guest_addr || region.len() != region_state.size {
+                return Err(AddressManagerError::SnapshotLayoutMismatch(
+                    region_state.guest_addr,
+                ));
+            }
+            // Back this region with a copy-on-write mapping of the template
+            // file instead of copying it in: pages fault in lazily from the
+            // template, guest writes stay private (MAP_PRIVATE), and the
+            // template file is left pristine for reuse. The KVM memory slot
+            // already points at this region's host address, so replacing the
+            // mapping in place with MAP_FIXED needs no slot update.
+            let host_addr = region
+                .get_host_address(MemoryRegionAddress(0))
+                .map_err(|e| AddressManagerError::AccessGuestMemory(region_state.guest_addr, e))?;
+            // mmap requires a page-aligned file offset. Regions are written
+            // back-to-back at page-aligned sizes, so this holds by
+            // construction; validate it anyway and refuse a malformed snapshot
+            // with a clear error rather than letting mmap fail with EINVAL.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+            if page_size == 0 || region_state.file_offset % page_size != 0 {
+                return Err(AddressManagerError::SnapshotLayoutMismatch(
+                    region_state.guest_addr,
+                ));
+            }
+            // SAFETY: `host_addr .. host_addr + size` is exactly this region's
+            // own existing mapping; we atomically replace it with a private,
+            // file-backed mapping of the same length and protection. The
+            // region retains ownership of the address range and unmaps it on
+            // drop. `file` outlives this call; a MAP_PRIVATE mapping keeps its
+            // own reference to the backing file regardless.
+            let ret = unsafe {
+                libc::mmap(
+                    host_addr as *mut libc::c_void,
+                    region_state.size as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_FIXED | libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    region_state.file_offset as libc::off_t,
+                )
+            };
+            if ret == libc::MAP_FAILED {
+                return Err(AddressManagerError::SnapshotFile(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Default for AddressSpaceMgr {
     /// Create a new empty AddressSpaceMgr
     fn default() -> Self {
@@ -721,11 +979,82 @@ impl Default for AddressSpaceMgr {
 mod tests {
     use dbs_boot::layout::GUEST_MEM_START;
     use std::ops::Deref;
+    use std::os::fd::AsRawFd;
 
     use vm_memory::{Bytes, GuestAddressSpace, GuestMemory, GuestMemoryRegion};
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+
+    #[test]
+    fn test_memory_save_restore_roundtrip() {
+        let numa_region_infos = vec![NumaRegionInfo {
+            size: 16,
+            host_numa_node_id: None,
+            guest_numa_node_id: Some(0),
+            vcpu_ids: vec![0],
+        }];
+        let create_mgr = || {
+            let res_mgr = ResourceManager::new(None);
+            AddressSpaceMgrBuilder::new("shmem", "")
+                .unwrap()
+                .build(&res_mgr, &numa_region_infos)
+                .unwrap()
+        };
+
+        // Plant recognizable values in the source guest memory.
+        let mut src_mgr = create_mgr();
+        {
+            let vm_as = src_mgr.get_vm_as().unwrap();
+            let guard = vm_as.memory();
+            guard
+                .write_obj(0xdbdbdbdbu32, GuestAddress(GUEST_MEM_START))
+                .unwrap();
+            guard
+                .write_obj(0xa5u8, GuestAddress(GUEST_MEM_START + (8 << 20)))
+                .unwrap();
+        }
+
+        let mut file = TempFile::new().unwrap().into_file();
+        let state = dbs_snapshot::Persist::save_state(&mut src_mgr, &mut file).unwrap();
+        assert_eq!(state.regions.len(), 1);
+        assert_eq!(state.regions[0].guest_addr, GUEST_MEM_START);
+        assert_eq!(state.regions[0].size, 16 << 20);
+        assert_eq!(state.regions[0].file_offset, 0);
+
+        // The state must survive a JSON round-trip.
+        let json = serde_json::to_string(&state).unwrap();
+        let state: GuestMemoryState = serde_json::from_str(&json).unwrap();
+
+        // Restore into a fresh address space with the same layout.
+        let mut dst_mgr = create_mgr();
+        dbs_snapshot::Persist::restore_state(&mut dst_mgr, &state, &mut file).unwrap();
+        let vm_as = dst_mgr.get_vm_as().unwrap();
+        let guard = vm_as.memory();
+        let val: u32 = guard.read_obj(GuestAddress(GUEST_MEM_START)).unwrap();
+        assert_eq!(val, 0xdbdbdbdb);
+        let val: u8 = guard
+            .read_obj(GuestAddress(GUEST_MEM_START + (8 << 20)))
+            .unwrap();
+        assert_eq!(val, 0xa5);
+
+        // A layout mismatch must be refused.
+        let small_infos = vec![NumaRegionInfo {
+            size: 8,
+            host_numa_node_id: None,
+            guest_numa_node_id: Some(0),
+            vcpu_ids: vec![0],
+        }];
+        let res_mgr = ResourceManager::new(None);
+        let mut small_mgr = AddressSpaceMgrBuilder::new("shmem", "")
+            .unwrap()
+            .build(&res_mgr, &small_infos)
+            .unwrap();
+        assert!(matches!(
+            dbs_snapshot::Persist::restore_state(&mut small_mgr, &state, &mut file),
+            Err(AddressManagerError::SnapshotLayoutMismatch(_))
+        ));
+    }
 
     #[test]
     fn test_create_address_space() {

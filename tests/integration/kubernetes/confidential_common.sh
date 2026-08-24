@@ -42,8 +42,6 @@ function get_remote_command_per_hypervisor() {
 		echo "dmesg | grep \"Memory Encryption Features active:.*SEV-SNP\""
 	elif is_tdx_hypervisor "${KATA_HYPERVISOR}"; then
 		echo "cpuid | grep TDX_GUEST"
-	elif is_cca_hypervisor "${KATA_HYPERVISOR}"; then
-		echo "echo 'Remote TEE verification is not implemented for qemu-cca' >&2; exit 1"
 	else
 		echo ""
 	fi
@@ -99,6 +97,9 @@ function cleanup_loop_device(){
 # - $4: guest components procs parameter
 # - $5: guest components rest api parameter
 # - $6: node
+# - $7: runAsUser
+# - $8: runAsGroup
+# - $9: supplementalGroups
 function create_coco_pod_yaml() {
 	image=$1
 	image_policy=${2:-}
@@ -106,6 +107,9 @@ function create_coco_pod_yaml() {
 	guest_components_procs=${4:-}
 	guest_components_rest_api=${5:-}
 	node=${6:-}
+	run_as_user=${7:-}
+	run_as_group=${8:-}
+	supplemental_groups=${9:-}
 
 	local CC_KBS_ADDR
 	CC_KBS_ADDR=$(kbs_k8s_svc_http_addr)
@@ -133,14 +137,17 @@ function create_coco_pod_yaml() {
 
 	kernel_params_value+=" agent.aa_kbc_params=cc_kbc::${CC_KBS_ADDR}"
 
+	local runtime_class
+	runtime_class="$(get_test_runtime_class)"
+
 	# Note: this is not local as we use it in the caller test
-	kata_pod="$(new_pod_config "${image}" "kata-${KATA_HYPERVISOR}")"
+	kata_pod="$(new_pod_config "${image}" "${runtime_class}" "${run_as_user}" "${run_as_group}" "${supplemental_groups}")"
 	set_container_command "${kata_pod}" "0" "sleep" "30"
 
 	# Set annotations
 	set_metadata_annotation "${kata_pod}" \
 		"io.containerd.cri.runtime-handler" \
-		"kata-${KATA_HYPERVISOR}"
+		"${runtime_class}"
 	set_metadata_annotation "${kata_pod}" \
 		"${kernel_params_annotation}" \
 		"${kernel_params_value}"
@@ -155,23 +162,32 @@ function create_coco_pod_yaml() {
 # - $2: annotation `io.katacontainers.config.hypervisor.kernel_params`
 # - $3: annotation `io.katacontainers.config.hypervisor.cc_init_data`
 # - $4: node
+# - $5: runAsUser
+# - $6: runAsGroup
+# - $7: supplementalGroups
 function create_coco_pod_yaml_with_annotations() {
 	image=$1
 	kernel_params_annotation_value=${2:-}
 	cc_initdata_annotation_value=${3:-}
 	node=${4:-}
+	run_as_user=${5:-}
+	run_as_group=${6:-}
+	supplemental_groups=${7:-}
 
 	kernel_params_annotation_key="io.katacontainers.config.hypervisor.kernel_params"
 	cc_initdata_annotation_key="io.katacontainers.config.hypervisor.cc_init_data"
 
+	local runtime_class
+	runtime_class="$(get_test_runtime_class)"
+
 	# Note: this is not local as we use it in the caller test
-	kata_pod="$(new_pod_config "${image}" "kata-${KATA_HYPERVISOR}")"
+	kata_pod="$(new_pod_config "${image}" "${runtime_class}" "${run_as_user}" "${run_as_group}" "${supplemental_groups}")"
 	set_container_command "${kata_pod}" "0" "sleep" "30"
 
 	# Set annotations
 	set_metadata_annotation "${kata_pod}" \
 		"io.containerd.cri.runtime-handler" \
-		"kata-${KATA_HYPERVISOR}"
+		"${runtime_class}"
 	set_metadata_annotation "${kata_pod}" \
 		"${kernel_params_annotation_key}" \
 		"${kernel_params_annotation_value}"
@@ -282,6 +298,13 @@ function get_initdata_with_cdh_image_section() {
 
 	CC_KBS_ADDRESS=$(kbs_k8s_svc_http_addr)
 
+	local cdh_proxy_section=""
+	if is_tdx_hypervisor && [[ -n "${HTTPS_PROXY}" ]]; then
+		cdh_proxy_section="
+[image.image_pull_proxy]
+https_proxy = \"${HTTPS_PROXY}\""
+	fi
+
 	 initdata_annotation=$(gzip -c << EOF | base64 -w0
 version = "0.1.0"
 algorithm = "sha256"
@@ -298,6 +321,7 @@ name = "cc_kbc"
 url = "${CC_KBS_ADDRESS}"
 
 ${CDH_IMAGE_SECTION}
+${cdh_proxy_section}
 '''
 
 "policy.rego" = '''

@@ -1,6 +1,7 @@
 # Kata Containers Dictionary
 
 # Project-Specific Terms
+devkit
 Dragonball
 genpolicy
 kata
@@ -14,24 +15,33 @@ upcall
 virtcontainers
 
 # Open source projects
-
+bootc
+distroless
 materialx
+ostree
 
 # Hardware & Architecture
 AMD
 APQN
+chiplet
 cpuid
 DCAP
 DGPU
+ioctls
 IOMMU
+IOMMUFD
 IOVA
 MDEV
+microvm
 MKVP
 MMDS
 mmio
+mshv
 NVDIMM
 OVMF
+pcilibs
 SEV
+TDVF
 SLES
 SNP
 SRIOV
@@ -42,6 +52,7 @@ VPMU
 
 # GPU & NVIDIA
 CUDA
+DGX
 Gramine
 Mellanox
 MOFED
@@ -49,6 +60,7 @@ NCCL
 NRAS
 NVCR
 NVLINK
+NVML
 nvswitch
 nvswitches
 NVRC
@@ -56,9 +68,13 @@ nvlib
 pgpu
 PPCIE
 Quadro
+RCAR
 
 # Storage & Filesystems
 AUFS
+confext
+overlayfs
+sysext
 blockfile
 devicemapper
 devmapper
@@ -66,28 +82,50 @@ hugepage
 MACVTAP
 memdisk
 pmem
+tmpfs
 Sharedfs
 Initdata
 fsmerge
 fsmerged
+Rafs
+virtiofs
+virtiofsd
+Virtiofs
+nydusd
+Lowerdir
+lowerdir
+Upperdir
+upperdir
+
 
 # Networking & Communication
 netns
 Netlink
 ttrpc
+vmservice
 vsock
 
+# Security & Encryption
+GHSA
+LUKS
+ocicrypt
+
 # Container, Runtime & Misc terms
+Burstable
 cgroupsv1
 coredump
 CPUSET
+CRIU
 crio
 nerdctl
+crictl
 dockershim
 dentries
+hexdump
 hypercalls
 inodes
 libelf-dev
+loopless
 memcg
 nydus
 patchset

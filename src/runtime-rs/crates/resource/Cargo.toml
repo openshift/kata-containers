@@ -17,7 +17,7 @@ actix-rt = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 byte-unit = "5.1.6"
-cgroups-rs = { version = "0.5.0", features = ["oci"] }
+cgroups.workspace = true
 futures = "0.3.11"
 lazy_static = { workspace = true }
 libc = { workspace = true }
@@ -39,9 +39,16 @@ flate2 = "1.1"
 tempfile = "3.19.1"
 hex = "0.4"
 base64 = { workspace = true }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyperlocal = { workspace = true }
 
 ## Dependencies from `rust-netlink`
 ## 0.30+ parses IFLA_INET6_CONF on kernels 6.17+ (240-byte blob; DEVCONF_FORCE_FORWARDING).
+futures-lite = "2"
+netlink-packet-core = "0.8"
 netlink-packet-route = "0.30"
 rtnetlink = "0.21"
 

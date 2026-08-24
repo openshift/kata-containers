@@ -37,17 +37,22 @@ source "${BATS_TEST_DIRNAME}/lib/helm-deploy.bash"
 setup() {
 	ensure_helm
 
-	# We expect 2 runtime classes because:
+	# We expect 3 runtime classes because:
 	# * `kata` is the default runtimeclass created by Helm, basically an alias for `kata-${KATA_HYPERVISOR}`.
 	# * `kata-${KATA_HYPERVISOR}` is the other one
 	#    * As part of the tests we're only deploying the specific runtimeclass that will be used (via HELM_SHIMS), instead of all of them.
 	#    * RuntimeClasses are now created by the Helm chart (runtimeClasses.enabled=true by default)
-	expected_runtime_classes=2
+	# * `kata-${KATA_HYPERVISOR}-debug` carries the guest debug settings, which are
+	#   kept off the other classes so their kernel cmdline (and its measurements)
+	#   stay stable. We deploy with `debug: true` (see lib/helm-deploy.bash).
+	expected_runtime_classes=3
 
-	# We expect both runtime classes to have the same handler: kata-${KATA_HYPERVISOR}
+	# The default and per-shim classes share the kata-${KATA_HYPERVISOR} handler;
+	# the debug class has its own handler, registered by kata-deploy as a custom runtime.
 	expected_handlers_re=( \
 		"kata\s+kata-${KATA_HYPERVISOR}" \
 		"kata-${KATA_HYPERVISOR}\s+kata-${KATA_HYPERVISOR}" \
+		"kata-${KATA_HYPERVISOR}-debug\s+kata-${KATA_HYPERVISOR}-debug" \
 	)
 }
 
@@ -108,8 +113,11 @@ EOF
 	rm -f "${verification_yaml}"
 
 	echo ""
-	echo "::group::kata-deploy logs"
-	kubectl -n kube-system logs -l name=kata-deploy
+	echo "::group::kata-deploy logs (current)"
+	kubectl -n kube-system logs -l name=kata-deploy --all-containers --tail=-1 --timestamps || true
+	echo "::endgroup::"
+	echo "::group::kata-deploy logs (previous)"
+	kubectl -n kube-system logs -l name=kata-deploy --all-containers --previous --tail=-1 --timestamps 2>/dev/null || true
 	echo "::endgroup::"
 
 	echo ""

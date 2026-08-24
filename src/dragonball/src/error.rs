@@ -16,6 +16,9 @@ use dbs_boot::tdshim::TdvfError;
 #[cfg(feature = "dbs-virtio-devices")]
 use dbs_virtio_devices::Error as VirtioError;
 
+#[cfg(target_arch = "x86_64")]
+use tdx::launch::Error as TdxError;
+
 #[cfg(feature = "host-device")]
 use crate::device_manager::vfio_dev_mgr::VfioDeviceError;
 use crate::{address_space_manager, device_manager, resource_manager, vcpu, vm};
@@ -83,6 +86,11 @@ pub enum Error {
     /// Fail to create device manager system
     #[error("failed to create device manager system: {0}")]
     DeviceMgrError(#[source] device_manager::DeviceMgrError),
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("TDX error: {0}")]
+    TdxError(TdxError),
 }
 
 /// Errors associated with starting the instance.
@@ -103,6 +111,10 @@ pub enum StartMicroVmError {
     /// The start command was issued more than once.
     #[error("the virtual machine is already running")]
     MicroVMAlreadyRunning,
+
+    /// Failed to restore the virtual machine from a snapshot.
+    #[error("cannot restore the virtual machine from snapshot: {0}")]
+    RestoreMicroVm(String),
 
     /// Cannot start the VM because the kernel was not configured.
     #[error("cannot start the virtual machine without kernel configuration")]
@@ -187,10 +199,14 @@ pub enum StartMicroVmError {
     #[error("virtio-blk errors: {0}")]
     BlockDeviceError(#[source] device_manager::blk_dev_mgr::BlockDeviceError),
 
-    #[cfg(feature = "virtio-net")]
-    /// Virtio-net errors.
-    #[error("virtio-net errors: {0}")]
-    VirtioNetDeviceError(#[source] device_manager::virtio_net_dev_mgr::VirtioNetDeviceError),
+    #[cfg(any(
+        feature = "virtio-net",
+        feature = "vhost-net",
+        feature = "vhost-user-net"
+    ))]
+    /// Network device errors.
+    #[error("network device errors: {0}")]
+    NetworkDeviceError(#[source] device_manager::net_dev_mgr::NetworkDeviceError),
 
     #[cfg(any(feature = "virtio-fs", feature = "vhost-user-fs"))]
     /// Virtio-fs errors.
@@ -201,18 +217,6 @@ pub enum StartMicroVmError {
     /// Virtio-balloon errors.
     #[error("virtio-balloon errors: {0}")]
     BalloonDeviceError(#[source] device_manager::balloon_dev_mgr::BalloonDeviceError),
-
-    /// Vhost-net device errors.
-    #[cfg(feature = "vhost-net")]
-    #[error("vhost-net errors: {0:?}")]
-    VhostNetDeviceError(#[source] device_manager::vhost_net_dev_mgr::VhostNetDeviceError),
-
-    /// Vhost-user-net device errors.
-    #[cfg(feature = "vhost-user-net")]
-    #[error("vhost-user-net errors: {0:?}")]
-    VhostUserNetDeviceError(
-        #[source] device_manager::vhost_user_net_dev_mgr::VhostUserNetDeviceError,
-    ),
     #[cfg(feature = "host-device")]
     /// Failed to create VFIO device
     #[error("cannot create VFIO device {0:?}")]
@@ -252,6 +256,20 @@ pub enum StartMicroVmError {
     /// Initrd is not supported
     #[error("Initrd is not supported")]
     InitrdNotSupported,
+
+    #[cfg(target_arch = "x86_64")]
+    /// TDX related error
+    #[error("Tdx error: {0}")]
+    TdxError(TdxError),
+
+    /// Guest memory error
+    #[error("Guest memory error: {0}")]
+    GuestMemoryError(#[source] vm_memory::guest_memory::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Cannot enable hypercall map gpa range
+    #[error("Failed to enable hypercall map gpa range: {0}")]
+    EnableHcMapGpaRange(#[source] vmm_sys_util::errno::Error),
 }
 
 /// Errors associated with starting the instance.

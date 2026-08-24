@@ -17,6 +17,10 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::str;
 
+const EMPTYDIR_TYPE_SHARED_FS: &str = "shared-fs";
+const EMPTYDIR_TYPE_BLOCK_ENCRYPTED: &str = "block-encrypted";
+const EMPTYDIR_TYPE_BLOCK_PLAIN: &str = "block-plain";
+
 pub fn get_policy_mounts(
     settings: &settings::Settings,
     p_mounts: &mut Vec<policy::KataMount>,
@@ -113,23 +117,13 @@ pub fn get_mount_and_storage(
     );
 
     if let Some(emptyDir) = &yaml_volume.emptyDir {
-        let settings_volumes = &settings.volumes;
-        let (volume, block_encrypted_emptydir) = match emptyDir.medium.as_deref() {
-            Some("Memory") => (&settings_volumes.emptyDir_memory, false),
-            _ if settings.cluster_config.encrypted_emptydir => {
-                (&settings_volumes.emptyDir_encrypted, true)
-            }
-            _ => (&settings_volumes.emptyDir, false),
-        };
-
-        get_empty_dir_mount_and_storage(
+        get_empty_dir_mount(
             settings,
             p_mounts,
             storages,
+            emptyDir,
             yaml_mount,
-            volume,
             pod_security_context,
-            block_encrypted_emptydir,
         );
     } else if yaml_volume.persistentVolumeClaim.is_some() || yaml_volume.azureFile.is_some() {
         get_shared_bind_mount(yaml_mount, p_mounts, "rprivate", "rw");
@@ -146,33 +140,80 @@ pub fn get_mount_and_storage(
     }
 }
 
-fn get_empty_dir_mount_and_storage(
+fn get_empty_dir_mount(
+    settings: &settings::Settings,
+    p_mounts: &mut Vec<policy::KataMount>,
+    storages: &mut Vec<agent::Storage>,
+    emptyDir: &volume::EmptyDirVolumeSource,
+    yaml_mount: &pod::VolumeMount,
+    pod_security_context: &Option<pod::PodSecurityContext>,
+) {
+    let settings_volumes = &settings.volumes;
+    let (volume, block_emptydir) = match emptyDir.medium.as_deref() {
+        Some("Memory") => (&settings_volumes.emptyDir_memory, false),
+        _ if settings.cluster_config.emptydir_type == EMPTYDIR_TYPE_BLOCK_ENCRYPTED => {
+            (&settings_volumes.emptyDir_encrypted, true)
+        }
+        _ if settings.cluster_config.emptydir_type == EMPTYDIR_TYPE_BLOCK_PLAIN => {
+            (&settings_volumes.emptyDir_plain, true)
+        }
+        _ if settings.cluster_config.emptydir_type == EMPTYDIR_TYPE_SHARED_FS => {
+            (&settings_volumes.emptyDir, false)
+        }
+        _ => panic!(
+            "Unsupported emptydir_type {:?}",
+            settings.cluster_config.emptydir_type
+        ),
+    };
+
+    if emptyDir.medium.as_deref() == Some("Memory") || block_emptydir {
+        get_guest_empty_dir_mount_and_storage(
+            settings,
+            p_mounts,
+            storages,
+            yaml_mount,
+            volume,
+            pod_security_context,
+            block_emptydir,
+        );
+    } else {
+        let access = if yaml_mount.readOnly == Some(true) {
+            debug!("setting read only access for emptyDir mount");
+            "ro"
+        } else {
+            "rw"
+        };
+        get_host_empty_dir_mount(yaml_mount, p_mounts, access);
+    }
+}
+
+fn get_guest_empty_dir_mount_and_storage(
     settings: &settings::Settings,
     p_mounts: &mut Vec<policy::KataMount>,
     storages: &mut Vec<agent::Storage>,
     yaml_mount: &pod::VolumeMount,
     settings_empty_dir: &settings::EmptyDirVolume,
     pod_security_context: &Option<pod::PodSecurityContext>,
-    block_encrypted_emptydir: bool,
+    block_emptydir: bool,
 ) {
     debug!("Settings emptyDir: {:?}", settings_empty_dir);
 
     if yaml_mount.subPathExpr.is_none() {
         let mut options = settings_empty_dir.options.clone();
         // Pod fsGroup in policy must mirror how the shim encodes it on Storage:
-        // - block-encrypted host emptyDirs become virtio-blk/scsi volumes; the runtime sets
+        // - block host emptyDirs become virtio-blk/scsi volumes; the runtime sets
         //   Storage.fs_group from mount metadata (handleDeviceBlockVolume in kata_agent.go).
         // - shared-fs / guest-local emptyDirs use Storage.options: the runtime appends
         //   fsgid=<host GID> when the volume is not root-owned (handleEphemeralStorage and
         //   handleLocalStorage in kata_agent.go). Genpolicy uses pod fsGroup when non-zero as
         //   the usual kubelet-applied GID for that stat.
         let pod_gid = pod_security_context.as_ref().and_then(|sc| sc.fsGroup);
-        let fs_group = if block_encrypted_emptydir {
+        let fs_group = if block_emptydir {
             match pod_gid {
                 Some(gid) if gid > 0 => protobuf::MessageField::some(agent::FSGroup {
                     group_id: u32::try_from(gid).unwrap_or_else(|_| {
                         panic!(
-                            "get_empty_dir_mount_and_storage: securityContext.fsGroup {gid} \
+                            "get_guest_empty_dir_mount_and_storage: securityContext.fsGroup {gid} \
                              must be <= {}",
                             u32::MAX
                         )
@@ -347,14 +388,43 @@ fn get_shared_bind_mount(
     propagation: &str,
     access: &str,
 ) {
-    // The Kata Shim filepath.Base() to extract the last element of this path, in
-    // https://github.com/kata-containers/kata-containers/blob/5e46f814dd79ab6b34588a83825260413839735a/src/runtime/virtcontainers/fs_share_linux.go#L305
-    // In Rust, Path::file_name() has a similar behavior.
-    let path = Path::new(&yaml_mount.mountPath);
-    let mount_path = path.file_name().unwrap().to_str().unwrap();
-
+    let mount_path = Path::new(&yaml_mount.mountPath)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let mount_path = regex::escape(mount_path);
     let source = format!("$(sfprefix){mount_path}$");
 
+    add_shared_bind_mount(yaml_mount, p_mounts, source, propagation, access);
+}
+
+fn get_host_empty_dir_mount(
+    yaml_mount: &pod::VolumeMount,
+    p_mounts: &mut Vec<policy::KataMount>,
+    access: &str,
+) {
+    let name = regex::escape(&yaml_mount.name);
+    let source = format!("^$(cpath)/sandbox-[0-9a-f]{{16}}-{name}$");
+    push_shared_bind_mount(yaml_mount, p_mounts, source, "rprivate", access);
+
+    let mount_path = Path::new(&yaml_mount.mountPath)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let mount_path = regex::escape(mount_path);
+    let source = format!("$(sfprefix){mount_path}$");
+    push_shared_bind_mount(yaml_mount, p_mounts, source, "rprivate", access);
+}
+
+fn add_shared_bind_mount(
+    yaml_mount: &pod::VolumeMount,
+    p_mounts: &mut Vec<policy::KataMount>,
+    source: String,
+    propagation: &str,
+    access: &str,
+) {
     let dest = yaml_mount.mountPath.clone();
     let type_ = "bind".to_string();
     let options = vec![
@@ -369,14 +439,29 @@ fn get_shared_bind_mount(
         policy_mount.source = source;
         policy_mount.options = options;
     } else {
-        debug!("get_shared_bind_mount: adding dest = {dest}, source = {source}");
-        p_mounts.push(policy::KataMount {
-            destination: dest,
-            type_,
-            source,
-            options,
-        });
+        push_shared_bind_mount(yaml_mount, p_mounts, source, propagation, access);
     }
+}
+
+fn push_shared_bind_mount(
+    yaml_mount: &pod::VolumeMount,
+    p_mounts: &mut Vec<policy::KataMount>,
+    source: String,
+    propagation: &str,
+    access: &str,
+) {
+    let dest = yaml_mount.mountPath.clone();
+    debug!("get_shared_bind_mount: adding dest = {dest}, source = {source}");
+    p_mounts.push(policy::KataMount {
+        destination: dest,
+        type_: "bind".to_string(),
+        source,
+        options: vec![
+            "rbind".to_string(),
+            propagation.to_string(),
+            access.to_string(),
+        ],
+    });
 }
 
 fn get_downward_api_mount(yaml_mount: &pod::VolumeMount, p_mounts: &mut Vec<policy::KataMount>) {

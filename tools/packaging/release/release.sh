@@ -19,9 +19,15 @@ KATA_DEPLOY_IMAGE_TAGS="${KATA_DEPLOY_IMAGE_TAGS:-}"
 IFS=' ' read -r -a IMAGE_TAGS <<< "${KATA_DEPLOY_IMAGE_TAGS}"
 KATA_DEPLOY_REGISTRIES="${KATA_DEPLOY_REGISTRIES:-}"
 IFS=' ' read -r -a REGISTRIES <<< "${KATA_DEPLOY_REGISTRIES}"
+# Registries for the separate job-mode dispatcher image. When unset, derived
+# from KATA_DEPLOY_REGISTRIES by inserting "-job-dispatcher" before any "-ci"
+# suffix on each entry (so the "-ci" stays last).
+KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES="${KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES:-}"
+IFS=' ' read -r -a JOB_DISPATCHER_REGISTRIES <<< "${KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES}"
 GH_TOKEN="${GH_TOKEN:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
 KATA_STATIC_TARBALL="${KATA_STATIC_TARBALL:-}"
+KATA_GO_STATIC_TARBALL="${KATA_GO_STATIC_TARBALL:-}"
 
 function _die()
 {
@@ -39,6 +45,7 @@ function _check_required_env_var()
 		GH_TOKEN) env_var="${GH_TOKEN}" ;;
 		ARCHITECTURE) env_var="${ARCHITECTURE}" ;;
 		KATA_STATIC_TARBALL) env_var="${KATA_STATIC_TARBALL}" ;;
+		KATA_GO_STATIC_TARBALL) env_var="${KATA_GO_STATIC_TARBALL}" ;;
 		KATA_DEPLOY_IMAGE_TAGS) env_var="${KATA_DEPLOY_IMAGE_TAGS}" ;;
 		KATA_DEPLOY_REGISTRIES) env_var="${KATA_DEPLOY_REGISTRIES}" ;;
 		KATA_TOOLS_STATIC_TARBALL) env_var="${KATA_TOOLS_STATIC_TARBALL}" ;;
@@ -146,11 +153,33 @@ function _publish_multiarch_manifest()
 	_check_required_env_var "KATA_DEPLOY_IMAGE_TAGS"
 	_check_required_env_var "KATA_DEPLOY_REGISTRIES"
 
+	# The dispatcher is a kata-deploy-specific sidecar image, shipped alongside
+	# kata-deploy with the same tags. It does not exist for other images (e.g.
+	# kata-monitor), so callers publishing a non-kata-deploy manifest must opt
+	# out by setting KATA_DEPLOY_PUBLISH_JOB_DISPATCHER=false.
+	#
+	# When enabled and no dedicated registries are given, derive them from each
+	# kata-deploy registry by inserting "-job-dispatcher" before any "-ci"
+	# suffix, so the "-ci" stays last:
+	#   .../kata-deploy     -> .../kata-deploy-job-dispatcher
+	#   .../kata-deploy-ci  -> .../kata-deploy-job-dispatcher-ci
+	if [[ "${KATA_DEPLOY_PUBLISH_JOB_DISPATCHER:-true}" == "true" \
+		&& ${#JOB_DISPATCHER_REGISTRIES[@]} -eq 0 ]]; then
+		JOB_DISPATCHER_REGISTRIES=()
+		for registry in "${REGISTRIES[@]}"; do
+			if [[ "${registry}" == *-ci ]]; then
+				JOB_DISPATCHER_REGISTRIES+=("${registry%-ci}-job-dispatcher-ci")
+			else
+				JOB_DISPATCHER_REGISTRIES+=("${registry}-job-dispatcher")
+			fi
+		done
+	fi
+
 	# Per-arch images are built without provenance/SBOM so each tag is a single image manifest;
 	# quay.io rejects pushing multi-arch manifest lists that include attestation manifests
 	# ("manifest invalid"), so we do not enable them for this workflow.
 	# imagetools create pushes to --tag by default.
-	for registry in "${REGISTRIES[@]}"; do
+	for registry in "${REGISTRIES[@]}" "${JOB_DISPATCHER_REGISTRIES[@]}"; do
 		for tag in "${IMAGE_TAGS[@]}"; do
 			docker buildx imagetools create --tag "${registry}:${tag}" \
 				"${registry}:${tag}-amd64" \
@@ -171,6 +200,20 @@ function _upload_kata_static_tarball()
 
 	new_tarball_name="kata-static-${RELEASE_VERSION}-${ARCHITECTURE}.tar.zst"
 	mv "${KATA_STATIC_TARBALL}" "${new_tarball_name}"
+	echo "uploading asset '${new_tarball_name}' (${ARCHITECTURE}) for tag: ${RELEASE_VERSION}"
+	gh release upload "${RELEASE_VERSION}" "${new_tarball_name}"
+}
+
+function _upload_kata_go_static_tarball()
+{
+	_check_required_env_var "GH_TOKEN"
+	_check_required_env_var "ARCHITECTURE"
+	_check_required_env_var "KATA_GO_STATIC_TARBALL"
+
+	RELEASE_VERSION="$(_release_version)"
+
+	new_tarball_name="kata-go-static-${RELEASE_VERSION}-${ARCHITECTURE}.tar.zst"
+	mv "${KATA_GO_STATIC_TARBALL}" "${new_tarball_name}"
 	echo "uploading asset '${new_tarball_name}' (${ARCHITECTURE}) for tag: ${RELEASE_VERSION}"
 	gh release upload "${RELEASE_VERSION}" "${new_tarball_name}"
 }
@@ -235,7 +278,6 @@ function _upload_helm_chart_tarball()
 
 	RELEASE_VERSION="$(_release_version)"
 
-	helm dependencies update "${repo_root_dir}"/tools/packaging/kata-deploy/helm-chart/kata-deploy
 	helm package "${repo_root_dir}"/tools/packaging/kata-deploy/helm-chart/kata-deploy
 	gh release upload "${RELEASE_VERSION}" "kata-deploy-${RELEASE_VERSION}.tgz"
 }
@@ -249,6 +291,7 @@ function main()
 		release-version) _release_version;;
 		create-new-release) _create_new_release ;;
 		upload-kata-static-tarball) _upload_kata_static_tarball ;;
+		upload-kata-go-static-tarball) _upload_kata_go_static_tarball ;;
 		upload-kata-tools-static-tarball) _upload_kata_tools_static_tarball ;;
 		upload-versions-yaml-file) _upload_versions_yaml_file ;;
 		upload-vendored-code-tarball) _upload_vendored_code_tarball ;;

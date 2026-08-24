@@ -21,9 +21,16 @@ setup() {
     fi
 
     setup_common || die "setup_common failed"
+    runtime_class="$(get_test_runtime_class)"
     unencrypted_image="quay.io/prometheus/busybox:latest"
     image_pulled_time_less_than_default_time="ghcr.io/confidential-containers/test-container:rust-1.79.0" # unpacked size: 1.41GB
     large_image="quay.io/confidential-containers/test-images:largeimage" # unpacked size: 2.15GB
+    unencrypted_image_supplemental_groups=""
+    large_image_supplemental_groups=""
+    if auto_generate_policy_enabled; then
+        unencrypted_image_supplemental_groups="10"
+        large_image_supplemental_groups="1, 2, 3, 4, 6, 10, 11, 20, 26, 27"
+    fi
     pod_config_template="${pod_config_dir}/pod-guest-pull-in-trusted-storage.yaml.in"
     storage_config_template="${pod_config_dir}/confidential/trusted-storage.yaml.in"
     policy_settings_dir="$(create_tmp_policy_settings_dir "${pod_config_dir}")"
@@ -49,14 +56,15 @@ setup() {
     kubectl delete -f "$runc_pod_config"
 
     # 2. Create one kata pod with the $unencrypted_image image and nydus annotation
-    kata_pod_with_nydus_config="$(new_pod_config "$unencrypted_image" "kata-${KATA_HYPERVISOR}")"
+    kata_pod_with_nydus_config="$(new_pod_config "$unencrypted_image" "${runtime_class}" \
+        "" "" "$unencrypted_image_supplemental_groups")"
     set_node "$kata_pod_with_nydus_config" "$node"
     set_container_command "$kata_pod_with_nydus_config" "0" "sleep" "30"
 
     # Set annotation to pull image in guest
     set_metadata_annotation "$kata_pod_with_nydus_config" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $kata_pod_with_nydus_config file:"
@@ -74,14 +82,14 @@ setup() {
     # However, the unpacked size of image "ghcr.io/confidential-containers/test-container:rust-1.79.0" is 1.41GB.
     # It will fail to run the pod with pulling the image in the memory in the guest by default.
 
-    pod_config="$(new_pod_config "$image_pulled_time_less_than_default_time" "kata-${KATA_HYPERVISOR}")"
+    pod_config="$(new_pod_config "$image_pulled_time_less_than_default_time" "${runtime_class}")"
     set_node "$pod_config" "$node"
     set_container_command "$pod_config" "0" "sleep" "30"
 
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -131,7 +139,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -162,6 +170,8 @@ setup() {
 
     pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXXXXX.yaml")
     IMAGE="$large_image" NODE_NAME="$node" envsubst < "$pod_config_template" > "$pod_config"
+    ! auto_generate_policy_enabled || set_pod_spec_security_context "$pod_config" ".spec" \
+        "" "" "$large_image_supplemental_groups"
 
     # Set a short CreateContainerRequest timeout in the annotation to fail to pull image in guest
     create_container_timeout=10
@@ -172,7 +182,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"
@@ -218,6 +228,8 @@ setup() {
 
     pod_config=$(mktemp "${BATS_FILE_TMPDIR}/$(basename "${pod_config_template}").XXXXXX.yaml")
     IMAGE="$large_image" NODE_NAME="$node" envsubst < "$pod_config_template" > "$pod_config"
+    ! auto_generate_policy_enabled || set_pod_spec_security_context "$pod_config" ".spec" \
+        "" "" "$large_image_supplemental_groups"
 
     # Set CreateContainerRequest timeout in the annotation to pull large image in guest
     # Bare-metal CI runners' kubelets are configured with an equivalent runtimeRequestTimeout of 600s
@@ -229,7 +241,7 @@ setup() {
     # Set annotation to pull image in guest
     set_metadata_annotation "${pod_config}" \
         "io.containerd.cri.runtime-handler" \
-        "kata-${KATA_HYPERVISOR}"
+        "${runtime_class}"
 
     # For debug sake
     echo "Pod $pod_config file:"

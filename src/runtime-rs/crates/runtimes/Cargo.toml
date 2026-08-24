@@ -5,6 +5,10 @@ authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
+
 [dependencies]
 anyhow = { workspace = true }
 lazy_static = { workspace = true }
@@ -26,9 +30,12 @@ opentelemetry-jaeger = { version = "0.17.0", features = [
     "collector_client",
 ] }
 tracing-subscriber = { version = "0.3", features = ["registry", "std"] }
-hyper = { workspace = true, features = ["stream", "server", "http1"] }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 serde_json = { workspace = true }
-nix = "0.25.0"
+nix = { workspace = true }
 url = { workspace = true }
 procfs = "0.12.0"
 prometheus = { version = "0.14.0", features = ["process"] }
@@ -61,3 +68,4 @@ wasm = ["wasm_container"]
 
 dragonball = ["virt_container/dragonball"]
 cloud-hypervisor = ["virt_container/cloud-hypervisor"]
+openvmm = ["virt_container/openvmm"]

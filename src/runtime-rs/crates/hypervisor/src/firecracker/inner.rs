@@ -10,7 +10,9 @@ use crate::{device::DeviceType, VmmState};
 use crate::{selinux, HypervisorState};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use hyper::Client;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector};
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
@@ -18,7 +20,6 @@ use kata_types::{
 };
 use nix::sched::{setns, CloneFlags};
 use persist::sandbox_persist::Persist;
-use std::os::unix::io::AsRawFd;
 use std::process::Stdio;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
@@ -38,7 +39,7 @@ pub struct FcInner {
     pub(crate) pid: Option<u32>,
     pub(crate) vm_path: String,
     pub(crate) netns: Option<String>,
-    pub(crate) client: Client<UnixConnector>,
+    pub(crate) client: Client<UnixConnector, Full<Bytes>>,
     pub(crate) jailer_root: String,
     pub(crate) jailed: bool,
     pub(crate) run_dir: String,
@@ -115,8 +116,7 @@ impl FcInner {
                 if let Some(netns_path) = &netns {
                     debug!(sl(), "set netns for vmm master {:?}", &netns_path);
                     let netns_fd = std::fs::File::open(netns_path);
-                    let _ = setns(netns_fd?.as_raw_fd(), CloneFlags::CLONE_NEWNET)
-                        .context("set netns failed");
+                    let _ = setns(&netns_fd?, CloneFlags::CLONE_NEWNET).context("set netns failed");
                 }
                 if let Some(label) = selinux_label.as_ref() {
                     if let Err(e) = selinux::set_exec_label(label) {

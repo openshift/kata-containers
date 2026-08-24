@@ -13,8 +13,8 @@ edition = "2018"
 [dependencies]
 bitmask-enum = "2.1.0"
 anyhow = "1.0"
-base64 = "0.13.0"
-byte-unit = "5.1.6"
+base64 = { workspace = true }
+byte-unit = "5.2.3"
 glob = "0.3.0"
 lazy_static = "1.4.0"
 num_cpus = "1.13.1"
@@ -23,27 +23,31 @@ serde = { version = "1.0.100", features = ["derive"] }
 slog = "2.5.2"
 slog-scope = "4.4.0"
 serde_json = "1.0.73"
-thiserror = "1.0"
-toml = "0.5.8"
+thiserror = { workspace = true }
+toml = { workspace = true }
 serde-enum-str = "0.5"
-sysinfo = "0.34.2"
-sha2 = "0.10.8"
+sysinfo = { workspace = true }
+sha2 = { workspace = true }
 flate2 = "1.1"
-nix = "0.26.4"
-oci-spec = { version = "0.8.1", features = ["runtime"] }
-
+nix = { workspace = true }
+oci-spec = { workspace = true }
+gpt = "4.1.0"
+scopeguard = "1.0.0"
+crc = "3.4.0"
 safe-path = { path = "../safe-path", optional = true }
-
+devicemapper = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time", "rt"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 sysctl = "0.7.1"
 
 [dev-dependencies]
 tempfile = "3.19.1"
 test-utils = { path = "../test-utils" }
-nix = "0.26.4"
-rstest = "0.18"
+nix = { workspace = true }
+rstest = { workspace = true }
 
 [features]
 default = []
 enable-vendor = []
 safe-path = ["dep:safe-path"] # safe-path is platform-specific
+devicemapper = ["dep:devicemapper", "dep:tokio"]

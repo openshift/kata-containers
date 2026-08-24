@@ -14,7 +14,7 @@ use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_SCSI};
 use kata_types::rootless::is_rootless;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use qapi_qmp::{
-    self as qmp, BlockdevAioOptions, BlockdevOptions, BlockdevOptionsBase,
+    self as qmp, BlockdevAioOptions, BlockdevDiscardOptions, BlockdevOptions, BlockdevOptionsBase,
     BlockdevOptionsGenericCOWFormat, BlockdevOptionsGenericFormat, BlockdevOptionsRaw, BlockdevRef,
     MigrationInfo, PciDeviceInfo,
 };
@@ -39,6 +39,8 @@ const DEFAULT_QMP_INIT_READ_TIMEOUT: u64 = 5000;
 const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
 
+const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub struct Qmp {
     qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
 
@@ -58,6 +60,10 @@ pub struct Qmp {
     // Transferred from QemuCmdLine after boot so that hotplug allocations
     // continue from where boot-time allocations left off.
     ccw_subchannel: Option<CcwSubChannel>,
+
+    // Hot-plug slot tracking for cold-plugged pci-bridge-N devices. Mirrors
+    // virtcontainers/types/bridges.go Bridge.Devices (slots 1..30).
+    pci_bridge_devices: HashMap<String, HashMap<i64, String>>,
 }
 
 // We have to implement Debug since the Hypervisor trait requires it and Qmp
@@ -85,6 +91,7 @@ impl Qmp {
                 )),
                 guest_memory_block_size: 0,
                 ccw_subchannel: None,
+                pci_bridge_devices: HashMap::new(),
             };
 
             let info = qmp.qmp.handshake().context("qmp handshake failed")?;
@@ -113,6 +120,14 @@ impl Qmp {
 
     pub fn set_ccw_subchannel(&mut self, subchannel: CcwSubChannel) {
         self.ccw_subchannel = Some(subchannel);
+    }
+
+    /// Initialise PCI bridge slot maps for cold-plugged `pci-bridge-N` devices.
+    pub fn init_pci_bridges(&mut self, count: u32) {
+        for idx in 0..count {
+            self.pci_bridge_devices
+                .insert(format!("pci-bridge-{idx}"), HashMap::new());
+        }
     }
 
     pub fn set_ignore_shared_memory_capability(&mut self) -> Result<()> {
@@ -270,35 +285,115 @@ impl Qmp {
 
         let mut hotplugged_mem_size = 0_u64;
 
-        info!(sl!(), "hotplugged_memory_size(): iterating over dimms");
+        info!(
+            sl!(),
+            "hotplugged_memory_size(): iterating over memory devices"
+        );
         for mem_frontend in &memory_frontends {
-            if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = mem_frontend {
-                let id = match dimm_info.data.id {
-                    Some(ref id) => id.clone(),
-                    None => "".to_owned(),
-                };
+            match mem_frontend {
+                qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) => {
+                    let id = match dimm_info.data.id {
+                        Some(ref id) => id.clone(),
+                        None => "".to_owned(),
+                    };
 
-                info!(
-                    sl!(),
-                    "dimm id: {} size={}, hotplugged: {}",
-                    id,
-                    dimm_info.data.size,
-                    dimm_info.data.hotplugged
-                );
+                    info!(
+                        sl!(),
+                        "dimm id: {} size={}, hotplugged: {}",
+                        id,
+                        dimm_info.data.size,
+                        dimm_info.data.hotplugged
+                    );
 
-                if dimm_info.data.hotpluggable && dimm_info.data.hotplugged {
-                    hotplugged_mem_size += dimm_info.data.size as u64;
+                    if dimm_info.data.hotpluggable && dimm_info.data.hotplugged {
+                        hotplugged_mem_size += dimm_info.data.size as u64;
+                    }
                 }
+                qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) => {
+                    // For virtio-mem, the 'size' field is the requested-size
+                    info!(
+                        sl!(),
+                        "virtio-mem device: requested-size={} bytes ({} MB)",
+                        vm_info.data.size,
+                        vm_info.data.size / (1024 * 1024)
+                    );
+                    hotplugged_mem_size += vm_info.data.size;
+                }
+                _ => {}
             }
         }
+
+        info!(
+            sl!(),
+            "Total hotplugged memory: {} bytes ({} MB)",
+            hotplugged_mem_size,
+            hotplugged_mem_size / (1024 * 1024)
+        );
 
         Ok(hotplugged_mem_size)
     }
 
+    /// Hotplug memory into the VM.
+    /// Automatically detects if virtio-mem is available and uses it; otherwise falls back to pc-dimm.
     pub fn hotplug_memory(&mut self, size: u64) -> Result<()> {
-        let memdev_idx = self
-            .qmp
-            .execute(&qapi_qmp::query_memory_devices {})?
+        // Query existing memory devices to detect virtio-mem
+        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+
+        // Check if virtio-mem device exists
+        let has_virtio_mem = memory_devices
+            .iter()
+            .any(|memdev| matches!(memdev, qapi_qmp::MemoryDeviceInfo::virtio_mem(_)));
+
+        if has_virtio_mem {
+            self.hotplug_virtio_mem(size, memory_devices)
+        } else {
+            self.hotplug_pc_dimm(size, memory_devices)
+        }
+    }
+
+    /// Hotplug memory using virtio-mem resize method.
+    fn hotplug_virtio_mem(
+        &mut self,
+        size: u64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "Detected virtio-mem device, using resize method");
+
+        // Calculate current hotplugged memory from virtio-mem device
+        let current_hotplugged_mb = memory_devices
+            .iter()
+            .filter_map(|memdev| {
+                if let qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) = memdev {
+                    Some(vm_info.data.size / (1024 * 1024))
+                } else {
+                    None
+                }
+            })
+            .sum::<u64>();
+
+        let size_mb = size / (1024 * 1024);
+        let new_total_mb = (current_hotplugged_mb + size_mb) as i64;
+
+        info!(
+            sl!(),
+            "Hotplugging {} MB using virtio-mem (current: {} MB, new total: {} MB)",
+            size_mb,
+            current_hotplugged_mb,
+            new_total_mb
+        );
+
+        self.resize_virtio_mem(new_total_mb)
+    }
+
+    /// Hotplug memory using pc-dimm device.
+    fn hotplug_pc_dimm(
+        &mut self,
+        size: u64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "No virtio-mem detected, using pc-dimm hotplug");
+
+        let memdev_idx = memory_devices
             .into_iter()
             .filter(|memdev| {
                 if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
@@ -351,27 +446,278 @@ impl Qmp {
         Ok(())
     }
 
+    /// Cleanup virtio-mem resources on setup failure
+    fn cleanup_virtio_mem_setup(&mut self, device_id: &str) {
+        // Remove memory backend object
+        let _ = self.qmp.execute(&qmp::object_del {
+            id: "virtiomem".to_owned(),
+        });
+
+        // Remove CCW device slot
+        if let Some(ccw) = self.ccw_subchannel.as_mut() {
+            ccw.remove_device(device_id).ok();
+        }
+    }
+
+    pub fn setup_virtio_mem(
+        &mut self,
+        default_memory: u32,
+        default_maxmemory: u32,
+        machine_type: &str,
+        shared_fs: Option<&str>,
+    ) -> Result<()> {
+        // Calculate virtio-mem size: (default_maxmemory - default_memory) aligned to 4MB
+        // default_maxmemory is already validated during sandbox initialization
+        let diff_mb = default_maxmemory
+            .checked_sub(default_memory)
+            .ok_or_else(|| {
+                anyhow!(
+                    "default_maxmemory ({}) must be >= default_memory ({}) for virtio-mem setup",
+                    default_maxmemory,
+                    default_memory
+                )
+            })?;
+        let size_mb = u64::from(diff_mb & !3u32);
+
+        if size_mb == 0 {
+            info!(sl!(), "virtio-mem size is 0, skipping setup");
+            return Ok(());
+        }
+
+        // Validate machine type for virtio-mem support
+        // TODO: support more architectures
+        if machine_type != "s390-ccw-virtio" {
+            return Err(anyhow!(
+                "virtio-mem supports multiple architectures, the current implementation is only for s390x (s390-ccw-virtio). Current machine type: {}",
+                machine_type
+            ));
+        }
+
+        // Determine memory backend based on shared filesystem
+        let uses_virtio_fs = shared_fs
+            .map(|fs| fs == "virtio-fs" || fs == "virtio-fs-nydus")
+            .unwrap_or(false);
+
+        let (qomtype, mempath, share) = if uses_virtio_fs {
+            ("memory-backend-file", "/dev/shm", true)
+        } else {
+            ("memory-backend-ram", "", false)
+        };
+
+        let size_bytes = size_mb * 1024 * 1024;
+
+        // Allocate CCW slot and format address
+        // Use same ID for both CCW subchannel tracking and QMP device
+        let device_id = "virtiomem0";
+        let ccw = self
+            .ccw_subchannel
+            .as_mut()
+            .ok_or_else(|| anyhow!("CCW subchannel not initialized for s390x"))?;
+        let slot = ccw
+            .add_device(device_id)
+            .map_err(|e| anyhow!("Failed to add CCW device: {:?}", e))?;
+        let devno = ccw.address_format_ccw(slot);
+
+        info!(
+            sl!(),
+            "Setting up virtio-mem-ccw: backend={}, path={}, share={}, devno={}",
+            qomtype,
+            if mempath.is_empty() { "none" } else { mempath },
+            share,
+            devno
+        );
+
+        // Helper to create common MemoryBackendProperties
+        let create_backend_props = || qapi_qmp::MemoryBackendProperties {
+            dump: None,
+            host_nodes: None,
+            merge: None,
+            policy: None,
+            prealloc: None,
+            prealloc_context: None,
+            prealloc_threads: None,
+            reserve: None,
+            share: Some(share),
+            x_use_canonical_path_for_ramblock_id: None,
+            size: size_bytes,
+        };
+
+        // STEP 1: Create memory backend
+        let memory_backend = if mempath.is_empty() {
+            qmp::object_add(qapi_qmp::ObjectOptions::memory_backend_ram {
+                id: "virtiomem".to_owned(),
+                memory_backend_ram: create_backend_props(),
+            })
+        } else {
+            qmp::object_add(qapi_qmp::ObjectOptions::memory_backend_file {
+                id: "virtiomem".to_owned(),
+                memory_backend_file: qapi_qmp::MemoryBackendFileProperties {
+                    base: create_backend_props(),
+                    align: None,
+                    discard_data: None,
+                    offset: None,
+                    pmem: None,
+                    readonly: None,
+                    rom: None,
+                    mem_path: mempath.to_owned(),
+                },
+            })
+        };
+
+        // Execute backend creation with cleanup on error
+        if let Err(e) = self.qmp.execute(&memory_backend) {
+            self.cleanup_virtio_mem_setup(device_id);
+            return if e.to_string().contains("Cannot allocate memory") {
+                Err(anyhow!("Failed to allocate {} MB for virtio-mem: {}. \
+                            Please use command 'echo 1 > /proc/sys/vm/overcommit_memory' to handle it.",
+                            size_mb, e))
+            } else {
+                Err(e.into())
+            };
+        }
+
+        // STEP 2: Create virtio-mem-ccw device
+        let mut device_args = Dictionary::new();
+        device_args.insert("memdev".to_owned(), "virtiomem".into());
+        device_args.insert("devno".to_owned(), devno.into());
+
+        if let Err(e) = self.qmp.execute(&qmp::device_add {
+            bus: None,
+            id: Some(device_id.to_owned()),
+            driver: "virtio-mem-ccw".to_owned(),
+            arguments: device_args,
+        }) {
+            self.cleanup_virtio_mem_setup(device_id);
+            return Err(anyhow!("Failed to add virtio-mem-ccw device: {}", e));
+        }
+
+        info!(
+            sl!(),
+            "Successfully set up virtio-mem-ccw with max capacity {} MB", size_mb
+        );
+        Ok(())
+    }
+
+    /// Resize virtio-mem device to the specified size in MB.
+    /// This uses QMP qom-set to change the requested-size property.
+    ///
+    /// # Arguments
+    /// * `new_size_mb` - New size in MB for the virtio-mem device
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if resize fails or size is negative
+    pub fn resize_virtio_mem(&mut self, new_size_mb: i64) -> Result<()> {
+        // Validate and convert size from MB to bytes
+        if new_size_mb < 0 {
+            return Err(anyhow!(
+                "cannot resize virtio-mem device to negative size ({}) memory",
+                new_size_mb
+            ));
+        }
+        let size_bytes = (new_size_mb as u64) * 1024 * 1024;
+
+        info!(
+            sl!(),
+            "Resizing virtio-mem device to {} MB ({} bytes)", new_size_mb, size_bytes
+        );
+
+        // Use qom-set to change the requested-size property of virtiomem0
+        self.qmp.execute(&qmp::qom_set {
+            path: "virtiomem0".to_owned(),
+            property: "requested-size".to_owned(),
+            value: serde_json::json!(size_bytes),
+        })?;
+
+        info!(
+            sl!(),
+            "Successfully resized virtio-mem to {} MB", new_size_mb
+        );
+        Ok(())
+    }
+
     pub fn hotunplug_memory(&mut self, size: i64) -> Result<()> {
-        let frontend = self
-            .qmp
-            .execute(&qapi_qmp::query_memory_devices {})?
-            .into_iter()
-            .find(|memdev| {
-                if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
-                    let dimm_id = match dimm_info.data.id {
-                        Some(ref id) => id,
-                        None => return false,
-                    };
-                    if dimm_info.data.hotpluggable
-                        && dimm_info.data.hotplugged
-                        && dimm_info.data.size == size
-                        && dimm_id.starts_with("frontend-to-hotplugged-")
-                    {
-                        return true;
-                    }
+        // Query existing memory devices to detect virtio-mem
+        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+
+        // Check if virtio-mem device exists
+        let has_virtio_mem = memory_devices
+            .iter()
+            .any(|memdev| matches!(memdev, qapi_qmp::MemoryDeviceInfo::virtio_mem(_)));
+
+        if has_virtio_mem {
+            self.hotunplug_virtio_mem(size, memory_devices)
+        } else {
+            self.hotunplug_pc_dimm(size, memory_devices)
+        }
+    }
+
+    /// Hotunplug memory using virtio-mem resize method.
+    fn hotunplug_virtio_mem(
+        &mut self,
+        size: i64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        // Validate size is non-negative before casting
+        if size < 0 {
+            return Err(anyhow!(
+                "cannot hotunplug negative memory size: {} bytes",
+                size
+            ));
+        }
+
+        // Get current size from virtio-mem device (this is the requested-size, not actual size)
+        let current_size_bytes = memory_devices
+            .iter()
+            .filter_map(|memdev| {
+                if let qapi_qmp::MemoryDeviceInfo::virtio_mem(vm_info) = memdev {
+                    Some(vm_info.data.size)
+                } else {
+                    None
                 }
-                false
-            });
+            })
+            .sum::<u64>();
+
+        // size parameter is the amount to REMOVE (in bytes)
+        let new_size_bytes = current_size_bytes.saturating_sub(size as u64);
+        let new_size_mb = (new_size_bytes / (1024 * 1024)) as i64;
+
+        info!(
+            sl!(),
+            "Decreasing virtio-mem by {} bytes (current: {} bytes, new: {} bytes = {} MB)",
+            size,
+            current_size_bytes,
+            new_size_bytes,
+            new_size_mb
+        );
+
+        self.resize_virtio_mem(new_size_mb)
+    }
+
+    /// Hotunplug memory using pc-dimm device removal.
+    fn hotunplug_pc_dimm(
+        &mut self,
+        size: i64,
+        memory_devices: Vec<qapi_qmp::MemoryDeviceInfo>,
+    ) -> Result<()> {
+        info!(sl!(), "No virtio-mem detected, using pc-dimm hotunplug");
+
+        let frontend = memory_devices.into_iter().find(|memdev| {
+            if let qapi_qmp::MemoryDeviceInfo::dimm(dimm_info) = memdev {
+                let dimm_id = match dimm_info.data.id {
+                    Some(ref id) => id,
+                    None => return false,
+                };
+                if dimm_info.data.hotpluggable
+                    && dimm_info.data.hotplugged
+                    && dimm_info.data.size == size
+                    && dimm_id.starts_with("frontend-to-hotplugged-")
+                {
+                    return true;
+                }
+            }
+            false
+        });
 
         if let Some(frontend) = frontend {
             if let qapi_qmp::MemoryDeviceInfo::dimm(frontend) = frontend {
@@ -408,44 +754,58 @@ impl Qmp {
     }
 
     fn find_free_slot(&mut self) -> Result<(String, i64)> {
-        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
-        for pci_info in &pci {
-            for pci_dev in &pci_info.devices {
-                let pci_bridge = match &pci_dev.pci_bridge {
-                    Some(bridge) => bridge,
-                    None => continue,
-                };
+        // Prefer in-memory bridge state (matches Go virtcontainers/types/bridges.go).
+        let mut bridge_ids: Vec<&str> =
+            self.pci_bridge_devices.keys().map(String::as_str).collect();
+        bridge_ids.sort_by(|a, b| {
+            let parse_idx = |id: &str| {
+                id.strip_prefix("pci-bridge-")
+                    .and_then(|n| n.parse::<u32>().ok())
+            };
+            match (parse_idx(a), parse_idx(b)) {
+                (Some(ai), Some(bi)) => ai.cmp(&bi),
+                _ => a.cmp(b),
+            }
+        });
 
-                info!(sl!(), "found PCI bridge: {}", pci_dev.qdev_id);
-
-                if let Some(bridge_devices) = &pci_bridge.devices {
-                    let occupied_slots = bridge_devices
-                        .iter()
-                        .map(|pci_dev| pci_dev.slot)
-                        .collect::<Vec<_>>();
-
-                    info!(
-                        sl!(),
-                        "already occupied slots on bridge {}: {:#?}",
-                        pci_dev.qdev_id,
-                        occupied_slots
-                    );
-
-                    // from virtcontainers' bridges.go
-                    let pci_bridge_max_capacity = 30;
-                    for slot in 0..pci_bridge_max_capacity {
-                        if !occupied_slots.contains(&slot) {
-                            info!(
-                                sl!(),
-                                "found free slot on bridge {}: {}", pci_dev.qdev_id, slot
-                            );
-                            return Ok((pci_dev.qdev_id.clone(), slot));
-                        }
-                    }
+        for bridge_id in bridge_ids {
+            let occupied = self.pci_bridge_devices.get(bridge_id).unwrap();
+            for slot in PCI_BRIDGE_FIRST_HOTPLUG_SLOT..=PCI_BRIDGE_MAX_CAPACITY {
+                if !occupied.contains_key(&slot) {
+                    info!(sl!(), "found free slot on bridge {}: {}", bridge_id, slot);
+                    return Ok((bridge_id.to_string(), slot));
                 }
             }
         }
+
+        // Fallback: walk query-pci tree. Under OVMF, pcie-pci-bridge (pci-bridge-N)
+        // is nested under rp-pci-bridge-N, not at the root of the PCI tree.
+        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
+        for pci_info in &pci {
+            if let Some((bus, slot)) = find_free_slot_in_pci_devices(&pci_info.devices) {
+                info!(
+                    sl!(),
+                    "found free slot on bridge {} via query-pci: {}", bus, slot
+                );
+                return Ok((bus, slot));
+            }
+        }
+
         Err(anyhow!("no free slots on PCI bridges"))
+    }
+
+    fn record_pci_bridge_slot(&mut self, bridge_id: &str, slot: i64, device_id: &str) {
+        if let Some(devices) = self.pci_bridge_devices.get_mut(bridge_id) {
+            devices.insert(slot, device_id.to_owned());
+        } else {
+            warn!(
+                sl!(),
+                "record_pci_bridge_slot: bridge {} not in pci_bridge_devices, slot {} for device {} not tracked",
+                bridge_id,
+                slot,
+                device_id
+            );
+        }
     }
 
     fn pass_fd(&mut self, fd: RawFd, fdname: &str) -> Result<()> {
@@ -500,7 +860,7 @@ impl Qmp {
 
         let frontend_id = format!("frontend-{}", virtio_net_device.get_netdev_id());
 
-        let bus = if use_ccw_bus {
+        let pci_hotplug = if use_ccw_bus {
             let subchannel = self.ccw_subchannel.as_mut().ok_or_else(|| {
                 anyhow!("CCW subchannel not available for virtio-net-ccw hotplug")
             })?;
@@ -520,11 +880,18 @@ impl Qmp {
                 "vectors".to_owned(),
                 (2 * virtio_net_device.get_num_queues() + 2).into(),
             );
-            if virtio_net_device.get_disable_modern() {
-                netdev_frontend_args.insert("disable-modern".to_owned(), true.into());
-            }
-            Some(bus)
+            // Never force legacy (disable-modern) virtio on a hot-plugged PCI
+            // NIC.  A legacy-only virtio device needs an I/O BAR, but the NIC is
+            // hot-plugged behind a pcie-pci-bridge whose I/O window can be
+            // exhausted (e.g. by the GPU root-port pool), making the I/O BAR
+            // unassignable and the guest virtio-pci probe fail with -EIO.  The
+            // Go runtime hot-plugs NICs with disable-modern=false for the same
+            // reason; modern/transitional virtio uses MMIO and has no such
+            // dependency.  disable-modern is only meaningful for cold-plug.
+            Some((bus, slot))
         };
+
+        let bus = pci_hotplug.as_ref().map(|(bus, _)| bus.clone());
 
         let mut fd_names = vec![];
         for (idx, fd) in netdev.get_fds().iter().enumerate() {
@@ -614,6 +981,10 @@ impl Qmp {
             "hotplug_network_device(): successfully added {}", frontend_id
         );
 
+        if let Some((bridge_id, slot)) = pci_hotplug {
+            self.record_pci_bridge_slot(&bridge_id, slot, &frontend_id);
+        }
+
         Ok(())
     }
 
@@ -635,6 +1006,86 @@ impl Qmp {
         }
 
         Err(anyhow!("no target device found"))
+    }
+
+    /// Execute device_add for a block device. On failure, automatically
+    /// rolls back the blockdev node added earlier to avoid orphaned resources.
+    fn device_add_with_rollback(
+        &mut self,
+        node_name: &str,
+        bus: Option<String>,
+        driver: &str,
+        arguments: Dictionary,
+    ) -> Result<()> {
+        if let Err(e) = self.qmp.execute(&qmp::device_add {
+            bus,
+            id: Some(node_name.to_owned()),
+            driver: driver.to_owned(),
+            arguments,
+        }) {
+            if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_del {
+                node_name: node_name.to_owned(),
+            }) {
+                warn!(
+                    sl!(),
+                    "device_add_with_rollback(): blockdev_del failed for {}: {:?}", node_name, e
+                );
+            }
+            return Err(anyhow!("device_add {:?}", e));
+        }
+        Ok(())
+    }
+
+    fn wait_for_device_deleted(&mut self, device_id: &str, timeout: Duration) -> Result<()> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+        let deadline = Instant::now() + timeout;
+
+        self.qmp
+            .inner_mut()
+            .get_mut_write()
+            .set_read_timeout(Some(timeout))?;
+
+        let result = loop {
+            if let Err(e) = self.qmp.nop() {
+                warn!(sl!(), "The QMP nop() failed for {}: {:?}", device_id, e);
+            }
+
+            let found = self.qmp.events().any(|event| {
+                matches!(event, qapi_qmp::Event::DEVICE_DELETED { ref data, .. }
+                    if data.device.as_deref() == Some(device_id))
+            });
+            if found {
+                info!(
+                    sl!(),
+                    "The QMP received DEVICE_DELETED event for {}", device_id
+                );
+                break Ok(());
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break Err(anyhow!(
+                    "timed out ({:?}) waiting for DEVICE_DELETED event for {}",
+                    timeout,
+                    device_id
+                ));
+            }
+            thread::sleep(POLL_INTERVAL.min(deadline - now));
+        };
+
+        // Reset the default read timeout for subsequent QMP operations.
+        // Failure here is non-fatal — a stale timeout only affects the next
+        // QMP read, not the already-completed device removal.
+        if let Err(e) = self
+            .qmp
+            .inner_mut()
+            .get_mut_write()
+            .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
+        {
+            warn!(sl!(), "Failed to reset read timeout: {:?}", e);
+        }
+
+        result
     }
 
     /// Hotplug block device:
@@ -685,12 +1136,15 @@ impl Qmp {
         is_direct: Option<bool>,
         is_readonly: bool,
         no_drop: bool,
+        discard_unmap: bool,
         logical_block_size: u32,
         physical_block_size: u32,
         format: &BlockDeviceFormat,
+        iothread: Option<&str>,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
-        let node_name = format!("drive-{index}");
+        let node_name = block_node_name(index);
+        let discard_option = || discard_unmap.then_some(BlockdevDiscardOptions::unmap);
 
         let create_base_options = || qapi_qmp::BlockdevOptionsBase {
             auto_read_only: None,
@@ -703,7 +1157,7 @@ impl Qmp {
                 })
             },
             detect_zeroes: None,
-            discard: None,
+            discard: discard_option(),
             force_share: None,
             node_name: None,
             read_only: Some(is_readonly),
@@ -741,7 +1195,7 @@ impl Qmp {
                 base: BlockdevOptionsBase {
                     detect_zeroes: None,
                     cache: None,
-                    discard: None,
+                    discard: discard_option(),
                     force_share: if is_readonly { Some(true) } else { None },
                     auto_read_only: None,
                     node_name: Some(node_name.clone()),
@@ -766,7 +1220,7 @@ impl Qmp {
                     base: BlockdevOptionsBase {
                         detect_zeroes: None,
                         cache: None,
-                        discard: None,
+                        discard: discard_option(),
                         force_share: Some(true),
                         auto_read_only: None,
                         node_name: Some(node_name.clone()),
@@ -791,6 +1245,9 @@ impl Qmp {
         // `device_add`
         let mut blkdev_add_args = Dictionary::new();
         blkdev_add_args.insert("drive".to_owned(), node_name.clone().into());
+        if discard_unmap && block_driver != VIRTIO_SCSI {
+            blkdev_add_args.insert("discard".to_owned(), true.into());
+        }
 
         if logical_block_size > 0 {
             blkdev_add_args.insert("logical_block_size".to_owned(), logical_block_size.into());
@@ -828,15 +1285,12 @@ impl Qmp {
                 "scsi-hd",
                 blkdev_add_args
             );
-            self.qmp
-                .execute(&qmp::device_add {
-                    bus: Some("scsi0.0".to_string()),
-                    id: Some(node_name.clone()),
-                    driver: "scsi-hd".to_string(),
-                    arguments: blkdev_add_args,
-                })
-                .map_err(|e| anyhow!("device_add {:?}", e))
-                .map(|_| ())?;
+            self.device_add_with_rollback(
+                &node_name,
+                Some("scsi0.0".to_string()),
+                "scsi-hd",
+                blkdev_add_args,
+            )?;
 
             info!(
                 sl!(),
@@ -845,13 +1299,29 @@ impl Qmp {
 
             Ok((None, Some(scsi_addr)))
         } else if block_driver == VIRTIO_BLK_CCW {
-            let subchannel = self.ccw_subchannel.as_mut().ok_or_else(|| {
-                anyhow!("CCW subchannel not available for virtio-blk-ccw hotplug")
-            })?;
+            let subchannel = match self.ccw_subchannel.as_mut() {
+                Some(sub) => sub,
+                None => {
+                    self.qmp.execute(&qapi_qmp::blockdev_del {
+                        node_name: node_name.to_owned(),
+                    })?;
 
-            let slot = subchannel
-                .add_device(&node_name)
-                .map_err(|e| anyhow!("CCW subchannel add_device failed: {:?}", e))?;
+                    return Err(anyhow!(
+                        "CCW subchannel not available for virtio-blk-ccw hotplug"
+                    ));
+                }
+            };
+
+            let slot = match subchannel.add_device(&node_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.qmp.execute(&qapi_qmp::blockdev_del {
+                        node_name: node_name.to_owned(),
+                    })?;
+
+                    return Err(anyhow!("CCW subchannel add_device failed: {:?}", e));
+                }
+            };
             let devno = subchannel.address_format_ccw(slot);
             let ccw_addr = subchannel.address_format_ccw_for_virt_server(slot);
 
@@ -868,16 +1338,14 @@ impl Qmp {
                 blkdev_add_args,
                 ccw_addr
             );
-            let device_add_result = self.qmp.execute(&qmp::device_add {
-                bus: None,
-                id: Some(node_name.clone()),
-                driver: block_driver.to_string(),
-                arguments: blkdev_add_args,
-            });
-            if let Err(e) = device_add_result {
-                // Roll back CCW subchannel state if QMP device_add fails
-                let _ = subchannel.remove_device(&node_name);
-                return Err(anyhow!("device_add {:?}", e));
+            if let Err(e) =
+                self.device_add_with_rollback(&node_name, None, block_driver, blkdev_add_args)
+            {
+                if let Some(ref mut sub) = self.ccw_subchannel {
+                    // Roll back CCW subchannel state if QMP device_add fails
+                    let _ = sub.remove_device(&node_name);
+                }
+                return Err(e);
             }
 
             info!(
@@ -893,6 +1361,15 @@ impl Qmp {
                 blkdev_add_args.insert("share-rw".to_string(), true.into());
             }
 
+            // Add iothread parameter for virtio-blk devices if specified
+            if let Some(iothread_id) = iothread {
+                info!(
+                    sl!(),
+                    "hotplug_block_device(): attaching to iothread: {}", iothread_id
+                );
+                blkdev_add_args.insert("iothread".to_owned(), iothread_id.to_string().into());
+            }
+
             info!(
                 sl!(),
                 "hotplug_block_device(): device_add arguments: bus: {}, id: {}, driver: {}, blkdev_add_args: {:#?}",
@@ -901,19 +1378,18 @@ impl Qmp {
                 block_driver,
                 blkdev_add_args
             );
-            self.qmp
-                .execute(&qmp::device_add {
-                    bus: Some(bus),
-                    id: Some(node_name.clone()),
-                    driver: block_driver.to_string(),
-                    arguments: blkdev_add_args,
-                })
-                .map_err(|e| anyhow!("device_add {:?}", e))
-                .map(|_| ())?;
+
+            self.device_add_with_rollback(
+                &node_name,
+                Some(bus.clone()),
+                block_driver,
+                blkdev_add_args,
+            )?;
 
             let pci_path = self
                 .get_device_by_qdev_id(&node_name)
                 .context("get device by qdev_id failed")?;
+            self.record_pci_bridge_slot(&bus, slot, &node_name);
             info!(
                 sl!(),
                 "hotplug block device return pci path: {:?}", &pci_path
@@ -921,6 +1397,60 @@ impl Qmp {
 
             Ok((Some(pci_path), None))
         }
+    }
+
+    /// Hotunplug block device.
+    pub fn hotunplug_block_device(&mut self, block_driver: &str, index: u64) -> Result<()> {
+        let node_name = block_node_name(index);
+
+        let result = (|| -> Result<()> {
+            // Remove the frontend device (virtio-blk-pci / scsi-hd / virtio-blk-ccw).
+            self.qmp
+                .execute(&qmp::device_del {
+                    id: node_name.clone(),
+                })
+                .map_err(|e| anyhow!("device_del for block device {}: {:?}", node_name, e))?;
+
+            // device_del is asynchronous — wait for the guest to acknowledge removal
+            // before tearing down the backend, otherwise blockdev_del may fail with
+            // "Node is still in use".
+            self.wait_for_device_deleted(&node_name, DEVICE_DELETED_TIMEOUT)
+                .context("hotunplug_block_device(): waiting for DEVICE_DELETED")?;
+
+            // Remove the blockdev backend node.
+            self.qmp
+                .execute(&qapi_qmp::blockdev_del {
+                    node_name: node_name.clone(),
+                })
+                .map_err(|e| anyhow!("blockdev_del for block device {}: {:?}", node_name, e))?;
+
+            Ok(())
+        })();
+
+        if let Err(ref e) = result {
+            warn!(
+                sl!(),
+                "hotunplug_block_device(): failed for {}, cleaning up CCW state: {:?}",
+                node_name,
+                e
+            );
+        }
+
+        // Clean up CCW subchannel state (s390x) on all paths.
+        if block_driver == VIRTIO_BLK_CCW {
+            if let Some(ref mut subchannel) = self.ccw_subchannel {
+                let _ = subchannel.remove_device(&node_name);
+            }
+        }
+
+        result?;
+
+        info!(
+            sl!(),
+            "hotunplug_block_device(): successfully removed {}", node_name
+        );
+
+        Ok(())
     }
 
     pub fn hotplug_vfio_device(
@@ -1083,6 +1613,43 @@ fn is_flat_cpu_topology(driver: &str) -> bool {
     matches!(driver, "host-s390x-cpu" | "host-powerpc64-cpu")
 }
 
+const PCI_BRIDGE_MAX_CAPACITY: i64 = 30;
+const PCI_BRIDGE_FIRST_HOTPLUG_SLOT: i64 = 1;
+
+fn free_slot_on_pci_bridge(pci_dev: &PciDeviceInfo) -> Option<i64> {
+    if !pci_dev.qdev_id.starts_with("pci-bridge-") {
+        return None;
+    }
+
+    let occupied_slots: Vec<i64> = pci_dev
+        .pci_bridge
+        .as_ref()
+        .and_then(|bridge| bridge.devices.as_ref())
+        .map(|devices| devices.iter().map(|dev| dev.slot).collect())
+        .unwrap_or_default();
+
+    (PCI_BRIDGE_FIRST_HOTPLUG_SLOT..=PCI_BRIDGE_MAX_CAPACITY)
+        .find(|slot| !occupied_slots.contains(slot))
+}
+
+fn find_free_slot_in_pci_devices(devices: &[PciDeviceInfo]) -> Option<(String, i64)> {
+    for pci_dev in devices {
+        if let Some(slot) = free_slot_on_pci_bridge(pci_dev) {
+            return Some((pci_dev.qdev_id.clone(), slot));
+        }
+
+        if let Some(ref bridge) = pci_dev.pci_bridge {
+            if let Some(ref children) = bridge.devices {
+                if let Some(found) = find_free_slot_in_pci_devices(children) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 // The get_pci_path_by_qdev_id function searches a device list for a device matching a given qdev_id,
 // tracking the device's path. It recursively explores bridge devices and returns the found device along
 // with its updated path.
@@ -1117,4 +1684,9 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
     } else {
         QMP_SOCKET_FILE.to_string()
     }
+}
+
+/// Generate a blockdev node name based on the given index.
+fn block_node_name(index: u64) -> String {
+    format!("drive-{index}")
 }

@@ -19,8 +19,10 @@ use std::thread;
 use dbs_interrupt::{InterruptManager, IOAPIC_BASE, IOAPIC_SIZE};
 use dbs_utils::metric::IncMetric;
 use dbs_utils::time::TimestampUs;
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::{kvm_memory_attributes, KVM_MEMORY_ATTRIBUTE_PRIVATE};
 use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-use kvm_ioctls::{VcpuExit, VcpuFd};
+use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
 use libc::{c_int, c_void, siginfo_t};
 use log::{error, info};
 use seccompiler::{apply_filter, BpfProgram, Error as SecError};
@@ -36,9 +38,15 @@ use crate::IoManagerCached;
 #[path = "x86_64.rs"]
 mod x86_64;
 
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::{VcpuState, KVM_HC_MAP_GPA_RANGE, KVM_MAP_GPA_RANGE_ENCRYPTED};
+
 #[cfg(target_arch = "aarch64")]
 #[path = "aarch64.rs"]
 mod aarch64;
+
+#[cfg(target_arch = "aarch64")]
+pub use self::aarch64::VcpuState;
 
 #[cfg(target_arch = "x86_64")]
 const MAGIC_IOPORT_BASE: u16 = 0xdbdb;
@@ -119,6 +127,23 @@ pub enum VcpuError {
     /// The call to KVM_SET_CPUID2 failed on x86_64.
     #[error("failure while calling KVM_SET_CPUID2 on x86_64")]
     SetSupportedCpusFailed(#[source] kvm_ioctls::Error),
+
+    #[cfg(target_arch = "x86_64")]
+    /// Fail to set memory attributes for hypercall
+    #[error("failure while setting memory attributes")]
+    SetMemoryAttributes(#[source] kvm_ioctls::Error),
+
+    /// KVM processed fewer MSRs than requested while saving or restoring
+    /// vCPU state; continuing would silently corrupt the remaining MSRs.
+    #[error("vCPU {id}: KVM processed only {processed} of {requested} MSRs")]
+    MsrsIncomplete {
+        /// vCPU id.
+        id: u8,
+        /// Number of MSRs actually processed by KVM.
+        processed: usize,
+        /// Number of MSRs requested.
+        requested: usize,
+    },
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -199,6 +224,11 @@ pub enum VcpuEvent {
 
     /// Event to revalidate vcpu IoManager cache
     RevalidateCache,
+
+    /// Event to save the vCPU state. The vCPU must be paused. Carries the
+    /// indices of the MSRs to save.
+    #[cfg(target_arch = "x86_64")]
+    SaveState(Vec<u32>),
 }
 
 /// List of responses that the Vcpu reports.
@@ -215,6 +245,9 @@ pub enum VcpuResponse {
     Error(VcpuError),
     /// Vcpu IoManager cache is revalidated
     CacheRevalidated,
+    /// Saved vCPU state.
+    #[cfg(target_arch = "x86_64")]
+    SavedState(Box<super::VcpuState>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -283,6 +316,8 @@ pub struct Vcpu {
     io_mgr: IoManagerCached,
     // Records vCPU create time stamp
     create_ts: TimestampUs,
+    // VM fd that current vCPU belongs to
+    vm_fd: Arc<VmFd>,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -529,6 +564,30 @@ impl Vcpu {
                             Err(VcpuError::VcpuUnhandledKvmExit)
                         }
                     },
+                    #[cfg(target_arch = "x86_64")]
+                    VcpuExit::Hypercall(hc_exit) => {
+                        if hc_exit.nr == KVM_HC_MAP_GPA_RANGE {
+                            let gpa = hc_exit.args[0];
+                            let size = hc_exit.args[1] * dbs_boot::PAGE_SIZE as u64;
+                            let attributes = hc_exit.args[2];
+                            let mem_attr = if (attributes & KVM_MAP_GPA_RANGE_ENCRYPTED) != 0 {
+                                KVM_MEMORY_ATTRIBUTE_PRIVATE
+                            } else {
+                                0
+                            };
+                            self.vm_fd
+                                .set_memory_attributes(kvm_memory_attributes {
+                                    address: gpa,
+                                    size,
+                                    attributes: mem_attr as u64,
+                                    flags: 0,
+                                })
+                                .map_err(VcpuError::SetMemoryAttributes)?;
+                            Ok(VcpuEmulation::Handled)
+                        } else {
+                            Err(VcpuError::VcpuUnhandledKvmExit)
+                        }
+                    }
                     r => {
                         self.metrics.failures.inc();
                         // TODO: Are we sure we want to finish running a vcpu upon
@@ -692,6 +751,13 @@ impl Vcpu {
                     .map_err(|e| self.response_sender.send(VcpuResponse::Error(e)))
                     .expect("failed to revalidate vcpu IoManager cache");
             }
+            // Saving state requires a paused vCPU.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed)
+                    .expect("failed to send save state status");
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -743,6 +809,17 @@ impl Vcpu {
                     .map_err(|e| self.response_sender.send(VcpuResponse::Error(e)))
                     .expect("failed to revalidate vcpu IoManager cache");
 
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState(msr_index_list)) => {
+                let response = match dbs_snapshot::Persist::save_state(self, &msr_index_list) {
+                    Ok(state) => VcpuResponse::SavedState(Box::new(state)),
+                    Err(e) => VcpuResponse::Error(e),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send saved vcpu state");
                 StateMachine::next(Self::paused)
             }
             // Unhandled exit of the other end.
@@ -815,6 +892,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     use dbs_interrupt::KvmIrqManager;
     use lazy_static::lazy_static;
+    use serial_test::serial;
     use test_utils::skip_if_kvm_unaccessable;
 
     use super::*;
@@ -865,7 +943,7 @@ pub mod tests {
     #[cfg(target_arch = "x86_64")]
     fn create_vcpu() -> (Vcpu, Receiver<VcpuStateEvent>) {
         let kvm_context = KvmContext::new(None).unwrap();
-        let vm = kvm_context.kvm().create_vm().unwrap();
+        let vm = Arc::new(kvm_context.kvm().create_vm().unwrap());
         let vcpu_fd = vm.create_vcpu(0).unwrap();
         let io_manager = IoManagerCached::new(Arc::new(ArcSwap::new(Arc::new(IoManager::new()))));
         let supported_cpuid = kvm_context
@@ -876,11 +954,12 @@ pub mod tests {
         let (tx, rx) = channel();
         let time_stamp = TimestampUs::default();
         let irq_manager: Arc<Box<dyn InterruptManager>> =
-            Arc::new(Box::new(KvmIrqManager::new(Arc::new(vm))));
+            Arc::new(Box::new(KvmIrqManager::new(vm.clone())));
 
         let vcpu = Vcpu::new_x86_64(
             0,
             vcpu_fd,
+            vm,
             io_manager,
             supported_cpuid,
             reset_event_fd,
@@ -915,6 +994,7 @@ pub mod tests {
         let vcpu = Vcpu::new_aarch64(
             0,
             vcpu_fd,
+            vm,
             io_manager,
             reset_event_fd,
             vcpu_state_event,
@@ -928,6 +1008,7 @@ pub mod tests {
     }
 
     #[test]
+    #[serial(emulate_res)]
     fn test_vcpu_run_emulation() {
         skip_if_kvm_unaccessable!();
 

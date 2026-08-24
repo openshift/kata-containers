@@ -11,9 +11,9 @@ package containerdshim
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/user"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -50,6 +50,8 @@ var defaultStartManagementServerFunc startManagementServerFunc = func(s *service
 	go s.startManagementServer(ctx, ociSpec)
 	shimLog.Info("management server started")
 }
+
+var configureNonRootHypervisorFunc = configureNonRootHypervisor
 
 func copyLayersToMounts(rootFs *virtcontainers.RootFs, spec *specs.Spec) error {
 	for _, o := range rootFs.Options {
@@ -101,7 +103,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 	disableOutput := noNeedForOutput(detach, ociSpec.Process.Terminal)
 	rootfs := filepath.Join(r.Bundle, "rootfs")
 
-	runtimeConfig, err := loadRuntimeConfig(s, r, ociSpec.Annotations)
+	runtimeConfig, err := loadRuntimeConfig(s, r)
 	if err != nil {
 		return nil, err
 	}
@@ -170,10 +172,17 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 
 		katautils.HandleFactory(ctx, vci, s.config)
 		rootless.SetRootless(s.config.HypervisorConfig.Rootless)
+		var rollbackRootlessSetup func()
 		if rootless.IsRootless() {
-			if err := configureNonRootHypervisor(s.config, r.ID); err != nil {
+			rollbackRootlessSetup, err = configureNonRootHypervisorFunc(s.config, r.ID)
+			if err != nil {
 				return nil, err
 			}
+			defer func() {
+				if rollbackRootlessSetup != nil {
+					rollbackRootlessSetup()
+				}
+			}()
 		}
 
 		// config.WithCDI() has used the CDI annotations to inject
@@ -192,6 +201,7 @@ func create(ctx context.Context, s *service, r *taskAPI.CreateTaskRequest) (*con
 			return nil, err
 		}
 		s.sandbox = sandbox
+		rollbackRootlessSetup = nil
 		pid, err := s.sandbox.GetHypervisorPid()
 		if err != nil {
 			return nil, err
@@ -258,15 +268,14 @@ func loadSpec(r *taskAPI.CreateTaskRequest) (*specs.Spec, string, error) {
 }
 
 // Config override ordering(high to low):
-// 1. podsandbox annotation
-// 2. shimv2 create task option
-// 3. environment
-func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string]string) (*oci.RuntimeConfig, error) {
+// 1. shimv2 create task option
+// 2. environment
+func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest) (*oci.RuntimeConfig, error) {
 	if s.config != nil {
 		return s.config, nil
 	}
-	configPath := oci.GetSandboxConfigPath(anno)
-	if configPath == "" && r.Options != nil {
+	configPath := ""
+	if r.Options != nil {
 		v, err := typeurl.UnmarshalAny(r.Options)
 		if err != nil {
 			return nil, err
@@ -291,7 +300,14 @@ func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string
 
 	// Try to get the config file from the env KATA_CONF_FILE
 	if configPath == "" {
-		configPath = os.Getenv("KATA_CONF_FILE")
+		envConfigPath := os.Getenv("KATA_CONF_FILE")
+		if envConfigPath != "" {
+			if isShippedKataConfigPath(envConfigPath) {
+				configPath = envConfigPath
+			} else {
+				return nil, fmt.Errorf("invalid KATA_CONF_FILE %q: only shipped Kata configuration files are accepted", envConfigPath)
+			}
+		}
 	}
 
 	_, runtimeConfig, err := katautils.LoadConfiguration(configPath, false)
@@ -305,6 +321,26 @@ func loadRuntimeConfig(s *service, r *taskAPI.CreateTaskRequest, anno map[string
 	}
 
 	return &runtimeConfig, nil
+}
+
+func isShippedKataConfigPath(configPath string) bool {
+	resolvedConfigPath, err := katautils.ResolvePath(configPath)
+	if err != nil {
+		return false
+	}
+
+	for _, defaultConfigPath := range katautils.GetDefaultConfigFilePaths() {
+		resolvedDefaultPath, err := katautils.ResolvePath(defaultConfigPath)
+		if err != nil {
+			continue
+		}
+
+		if resolvedConfigPath == resolvedDefaultPath {
+			return true
+		}
+	}
+
+	return false
 }
 
 func checkAndMount(s *service, r *taskAPI.CreateTaskRequest) (bool, error) {
@@ -360,83 +396,105 @@ func doMount(mounts []*containerd_types.Mount, rootfs string) error {
 	return nil
 }
 
-func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxID string) error {
+func configureNonRootHypervisor(runtimeConfig *oci.RuntimeConfig, sandboxID string) (rollback func(), err error) {
 	userName, err := utils.CreateVmmUser()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer func() {
-		if err != nil {
+	var runtimeUID *uint32
+	rollback = func() {
+		if runtimeUID != nil {
+			if err := rootless.RemoveVmmUserRuntimeDir(*runtimeUID); err != nil {
+				shimLog.WithFields(logrus.Fields{
+					"path":       rootless.VmmUserRuntimeDir(*runtimeUID),
+					"sandbox_id": sandboxID,
+				}).WithError(err).Warn("failed to remove rootless runtime directory")
+			}
+		}
+
+		if err := utils.RemoveVmmUser(userName); err != nil {
 			shimLog.WithFields(logrus.Fields{
 				"user_name":  userName,
 				"sandbox_id": sandboxID,
-			}).WithError(err).Warn("configure non root hypervisor failed, delete the user")
-			if err2 := utils.RemoveVmmUser(userName); err2 != nil {
-				shimLog.WithField("userName", userName).WithError(err).Warn("failed to remove user")
-			}
+			}).WithError(err).Warn("failed to remove rootless VMM user")
+		}
+	}
+	defer func() {
+		if err != nil {
+			rollback()
 		}
 	}()
 
 	u, err := user.Lookup(userName)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	uid, err := strconv.Atoi(u.Uid)
+	parsedUID, err := strconv.ParseInt(u.Uid, 10, 64)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	gid, err := strconv.Atoi(u.Gid)
+	if parsedUID < 0 || parsedUID > math.MaxUint32 {
+		return nil, fmt.Errorf("rootless UID %q is outside the uint32 range", u.Uid)
+	}
+	if parsedUID > math.MaxInt {
+		return nil, fmt.Errorf("rootless UID %q exceeds the platform int range", u.Uid)
+	}
+	parsedGID, err := strconv.ParseInt(u.Gid, 10, 64)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	runtimeConfig.HypervisorConfig.Uid = uint32(uid)
+	if parsedGID < 0 || parsedGID > math.MaxUint32 {
+		return nil, fmt.Errorf("rootless GID %q is outside the uint32 range", u.Gid)
+	}
+	if parsedGID > math.MaxInt {
+		return nil, fmt.Errorf("rootless GID %q exceeds the platform int range", u.Gid)
+	}
+	runtimeUIDValue := uint32(parsedUID)
+	runtimeGIDValue := uint32(parsedGID)
+	chownUID := int(parsedUID)
+	chownGID := int(parsedGID)
+	runtimeConfig.HypervisorConfig.Uid = runtimeUIDValue
 	runtimeConfig.HypervisorConfig.User = userName
-	runtimeConfig.HypervisorConfig.Gid = uint32(gid)
+	runtimeConfig.HypervisorConfig.Gid = runtimeGIDValue
+	runtimeUID = &runtimeUIDValue
 	shimLog.WithFields(logrus.Fields{
 		"user_name":  userName,
-		"uid":        uid,
-		"gid":        gid,
+		"uid":        runtimeUIDValue,
+		"gid":        runtimeGIDValue,
 		"sandbox_id": sandboxID,
 	}).Debug("successfully created a non root user for the hypervisor")
 
-	userTmpDir := path.Join("/run/user/", fmt.Sprint(uid))
+	userTmpDir := rootless.VmmUserRuntimeDir(runtimeConfig.HypervisorConfig.Uid)
 	_, err = os.Stat(userTmpDir)
 	// Clean up the directory created by the previous run
 	if !os.IsNotExist(err) {
 		if err = os.RemoveAll(userTmpDir); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	if err = os.Mkdir(userTmpDir, virtcontainers.DirMode); err != nil {
-		return err
+		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			if err = os.RemoveAll(userTmpDir); err != nil {
-				shimLog.WithField("userTmpDir", userTmpDir).WithError(err).Warn("failed to remove userTmpDir")
-			}
-		}
-	}()
-	if err = syscall.Chown(userTmpDir, uid, gid); err != nil {
-		return err
+	if err = syscall.Chown(userTmpDir, chownUID, chownGID); err != nil {
+		return nil, err
 	}
 
-	if err := os.Setenv("XDG_RUNTIME_DIR", userTmpDir); err != nil {
-		return err
+	if err = os.Setenv("XDG_RUNTIME_DIR", userTmpDir); err != nil {
+		return nil, err
 	}
 
 	info, err := os.Stat("/dev/kvm")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		// Add the kvm group to the hypervisor supplemental group so that the hypervisor process can access /dev/kvm
 		runtimeConfig.HypervisorConfig.Groups = append(runtimeConfig.HypervisorConfig.Groups, stat.Gid)
-		return nil
+		return rollback, nil
 	}
-	return fmt.Errorf("failed to get the gid of /dev/kvm")
+	return nil, fmt.Errorf("failed to get the gid of /dev/kvm")
 }
 
 func removeCDIAnnotations(annotations map[string]string) {

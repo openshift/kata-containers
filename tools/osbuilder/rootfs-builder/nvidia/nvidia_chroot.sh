@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
-[[ -n "${DEBUG}" ]] && set -x
+[[ -n "${DEBUG:-}" ]] && set -x
 
 shopt -s nullglob
 shopt -s extglob
@@ -61,7 +61,8 @@ install_userspace_components() {
 	eval "${APT_INSTALL}" nvidia-imex nvidia-firmware    \
 		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
 		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
-		libnvidia-nscq libnvidia-compute nvidia-settings
+		libnvidia-nscq libnvidia-compute nvidia-settings \
+		ocl-icd-libopencl1
 
 	apt-mark hold nvidia-imex nvidia-firmware            \
 		libnvidia-cfg1 libnvidia-gl libnvidia-extra      \
@@ -74,6 +75,13 @@ install_userspace_components() {
 
 	apt-mark hold cryptsetup-bin dmsetup libargon2-1     \
 		e2fsprogs libxml2
+
+	# NVRC loads the NVIDIA driver modules from the gpu extension's self-contained
+	# module tree via `modprobe --dirname <extension>`, a kmod feature the base
+	# busybox lacks. Install the real kmod here so the nvidia base chisel can
+	# pull /usr/bin/kmod (and its libzstd/liblzma deps) from this stage.
+	eval "${APT_INSTALL}" kmod
+	apt-mark hold kmod
 }
 
 setup_apt_repositories() {
@@ -116,10 +124,13 @@ setup_apt_repositories() {
 	curl -fsSL -O "${cuda_repo_url}/${cuda_repo_pkg}"
 	dpkg -i "${cuda_repo_pkg}" && rm -f "${cuda_repo_pkg}"
 
-	# Copy keyring if local repo was installed
-	keyring="/var/cuda-repo-*-local/cuda-*-keyring.gpg"
-	# shellcheck disable=SC2128 # Intentional: expect exactly one match
-	[[ -e "${keyring}" ]] && cp "${keyring}" /usr/share/keyrings/
+	# A local repo ships its signing key inside its own tree, but apt only
+	# trusts keys under /usr/share/keyrings - without this copy `apt update`
+	# rejects the repo as unsigned. A loop because [[ -e ]] would test the
+	# glob literally (nullglob: remote-repo flow matches nothing, skips).
+	for keyring in /var/cuda-repo-*-local/cuda-*-keyring.gpg; do
+		cp "${keyring}" /usr/share/keyrings/
+	done
 
 	# Set priorities: CUDA repos highest, Ubuntu non-driver next, Ubuntu blocked for driver packages
 	cat <<-CHROOT_EOF > /etc/apt/preferences.d/nvidia-priority
@@ -187,7 +198,7 @@ cleanup_rootfs() {
 }
 
 # Start of script
-echo "chroot: Setup NVIDIA GPU rootfs stage one"
+echo "chroot: Setup NVIDIA GPU package rootfs"
 
 setup_apt_repositories
 install_userspace_components

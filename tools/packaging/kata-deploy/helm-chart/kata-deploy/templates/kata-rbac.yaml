@@ -1,3 +1,9 @@
+{{- if eq (.Values.deploymentMode | default "daemonset") "daemonset" }}
+{{- /*
+  Only daemonset mode needs this: its pod labels its own node and reads its own
+  kubelet config. Job mode creates no such identity, because its per-node Jobs
+  mount no token.
+*/}}
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -26,15 +32,11 @@ rules:
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["get", "patch"]
-- apiGroups: ["node.k8s.io"]
-  resources: ["runtimeclasses"]
-  verbs: ["get", "list", "patch"]
-- apiGroups: ["apiextensions.k8s.io"]
-  resources: ["customresourcedefinitions"]
-  verbs: ["get", "list"]
-- apiGroups: ["nfd.k8s-sigs.io"]
-  resources: ["nodefeaturerules"]
-  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+# Read kubelet /configz via the apiserver node proxy during host-checks, for
+# example to warn about runtimeRequestTimeout values that may be too low.
+- apiGroups: [""]
+  resources: ["nodes/proxy"]
+  verbs: ["get"]
 - apiGroups: ["apps"]
   resources: ["daemonsets"]
   verbs: ["get", "list", "watch"]
@@ -65,6 +67,77 @@ subjects:
   name: {{ .Chart.Name }}-sa
 {{- end }}
   namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- if eq (.Values.deploymentMode | default "daemonset") "job" }}
+---
+# The only long-lived identity job mode has. All the node-level API work is
+# gathered here so that it runs in one unprivileged pod, which can be kept on a
+# trusted node, instead of in a privileged pod on every node.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kata-deploy.dispatcherServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ .Chart.Name }}-dispatcher-noderole{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+rules:
+# Enumerating nodes is inherently cluster-scoped. `get` re-reads one node (its
+# readiness, and the label back after patching it); `patch` sets the
+# katacontainers.io/kata-runtime label and lifts start-up taints, which is the
+# work the per-node Jobs used to do with a token of their own.
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["list", "get", "patch"]
+{{- if include "kata-deploy.kubeletTimeoutWarnSecs" . | trim }}
+# Granted only when this configuration pulls or converts images inside
+# CreateContainer, which is the one case where the kubelet's
+# runtimeRequestTimeout is worth reading and warning about.
+- apiGroups: [""]
+  resources: ["nodes/proxy"]
+  verbs: ["get"]
+{{- end }}
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ .Chart.Name }}-dispatcher-noderb{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Chart.Name }}-dispatcher-noderole{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kata-deploy.dispatcherServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ .Chart.Name }}-dispatcher-role{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+  namespace: {{ .Release.Namespace }}
+rules:
+# The dispatcher only ever creates, polls, and deletes per-node Jobs in its own namespace.
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["create", "get", "list", "delete"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ .Chart.Name }}-dispatcher-rb{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Chart.Name }}-dispatcher-role{{ with .Values.env.multiInstallSuffix }}-{{ . }}{{ end }}
+subjects:
+- kind: ServiceAccount
+  name: {{ include "kata-deploy.dispatcherServiceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
 ---
 # ServiceAccount and RBAC for the post-delete Job that removes the kept RBAC above.
 # Created as post-delete hooks with lower weight than the Job so they exist when the Job runs.
@@ -96,7 +169,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 rules:
 - apiGroups: ["rbac.authorization.k8s.io"]
-  resources: ["clusterroles", "clusterrolebindings"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
   verbs: ["delete"]
 - apiGroups: [""]
   resources: ["serviceaccounts"]

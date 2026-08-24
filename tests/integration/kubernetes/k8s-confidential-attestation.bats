@@ -10,8 +10,7 @@ load "${BATS_TEST_DIRNAME}/confidential_common.sh"
 
 export KBS="${KBS:-false}"
 export test_key="aatest"
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
-export RUNTIME_CLASS_NAME="kata-${KATA_HYPERVISOR}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 export AA_KBC="${AA_KBC:-cc_kbc}"
 
 setup() {
@@ -22,6 +21,10 @@ setup() {
 	fi
 
 	setup_common || die "setup_common failed"
+
+	# Consumed by the pod templates below through envsubst.
+	RUNTIME_CLASS_NAME="$(get_test_runtime_class)"
+	export RUNTIME_CLASS_NAME
 
 	# install SNP measurement dependencies
 	if [[ "${KATA_HYPERVISOR}" == *snp* ]]; then
@@ -41,8 +44,8 @@ setup() {
 	local pod_yaml_in="${pod_config_dir}/${POD_TEMPLATE_BASENAME}.yaml.in"
 	export K8S_TEST_YAML="${pod_config_dir}/${POD_TEMPLATE_BASENAME}.yaml"
 
-	# Substitute environment variables in the YAML template
-	envsubst < "${pod_yaml_in}" > "${K8S_TEST_YAML}"
+	# Substitute the runtime class name variable in the YAML template
+	envsubst '${RUNTIME_CLASS_NAME}' < "${pod_yaml_in}" > "${K8S_TEST_YAML}"
 
 	# Schedule on a known node so that later it can print the system's logs for
 	# debugging.
@@ -80,16 +83,23 @@ setup() {
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout="$timeout" pod "${pod_name}"
 
-	# Wait 5s for connecting with remote KBS
-	sleep 5
+	# On confidential GPU, CDH fetch and GPU attestation (e.g. remote NRAS)
+	# routinely exceed a short fixed sleep after Ready. Poll until both
+	# containers have produced the expected output (or timeout).
+	if is_confidential_gpu_hardware; then
+		waitForProcess "180" "5" "kubectl logs --all-containers=true ${pod_name} 2>/dev/null | grep -q \"${test_key}\""
+		waitForProcess "120" "5" "kubectl logs --all-containers=true ${pod_name} 2>/dev/null | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
+	else
+		sleep 5
+	fi
 
-	kubectl logs aa-test-cc
-	cmd="kubectl logs aa-test-cc | grep -q ${test_key}"
+	kubectl logs --all-containers=true "${pod_name}"
+	cmd="kubectl logs --all-containers=true ${pod_name} | grep -q ${test_key}"
 	run bash -c "$cmd"
 	[ "$status" -eq 0 ]
 
 	if is_confidential_gpu_hardware; then
-		cmd="kubectl logs aa-test-cc | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
+		cmd="kubectl logs --all-containers=true ${pod_name} | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
 		run bash -c "$cmd"
 		[ "$status" -eq 0 ]
 	fi
@@ -107,8 +117,8 @@ setup() {
 
 	sleep 5
 
-	kubectl logs aa-test-cc
-	cmd="kubectl logs aa-test-cc | grep -q ${test_key}"
+	kubectl logs --all-containers=true "${pod_name}"
+	cmd="kubectl logs --all-containers=true ${pod_name} | grep -q ${test_key}"
 	run bash -c "$cmd"
 	[ "$status" -eq 1 ]
 }
@@ -141,8 +151,8 @@ setup() {
 
 	sleep 5
 
-	kubectl logs aa-test-cc
-	cmd="kubectl logs aa-test-cc | grep -q ${test_key}"
+	kubectl logs --all-containers=true "${pod_name}"
+	cmd="kubectl logs --all-containers=true ${pod_name} | grep -q ${test_key}"
 	run bash -c "$cmd"
 	[ "$status" -eq 1 ]
 }
@@ -212,10 +222,17 @@ setup() {
 	# Check pod creation
 	kubectl wait --for=condition=Ready --timeout="$timeout" pod "${pod_name}"
 
-	sleep 5
+	# Same as "Get CDH resource": on confidential GPU, CDH fetch and GPU attestation
+	# can exceed a short fixed sleep after Ready.
+	if is_confidential_gpu_hardware; then
+		waitForProcess "180" "5" "kubectl logs --all-containers=true ${pod_name} 2>/dev/null | grep -q \"${test_key}\""
+		waitForProcess "120" "5" "kubectl logs --all-containers=true ${pod_name} 2>/dev/null | grep -iq 'Confidential Compute GPUs Ready state:[[:space:]]*ready'"
+	else
+		sleep 5
+	fi
 
-	kubectl logs aa-test-cc
-	cmd="kubectl logs aa-test-cc | grep -q ${test_key}"
+	kubectl logs --all-containers=true "${pod_name}"
+	cmd="kubectl logs --all-containers=true ${pod_name} | grep -q ${test_key}"
 	run bash -c "$cmd"
 	result=$status
 

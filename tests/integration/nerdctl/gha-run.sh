@@ -53,8 +53,14 @@ function install_dependencies() {
 
 	# Create the default containerd configuration
 	sudo mkdir -p /etc/containerd
-	containerd config default > sudo tee /etc/containerd/config.toml
+	PATH="${PATH}:/usr/local/bin:/usr/local/sbin" containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+	ensure_containerd_conf_d_rootful_api_sockets
 	sudo systemctl restart containerd
+
+	if kata_hypervisor_runs_without_shared_fs; then
+		install_erofs_utils
+		configure_containerd_erofs_snapshotter
+	fi
 }
 
 function collect_artifacts() {
@@ -76,6 +82,12 @@ function collect_artifacts() {
 }
 
 function run() {
+	# Runtime classes without a shared filesystem take their rootfs as a block
+	# device, which is what the erofs snapshotter hands over.  nerdctl only
+	# uses it when told to, per command.
+	local -a snapshotter=()
+	kata_hypervisor_runs_without_shared_fs && snapshotter=(--snapshotter erofs)
+
 	info "Running nerdctl smoke test tests using RunC"
 
 	info "Running nerdctl with runc"
@@ -110,16 +122,16 @@ function run() {
 	info "Running nerdctl smoke test tests using ${KATA_HYPERVISOR} hypervisor"
 
 	info "Running nerdctl with Kata Containers (${KATA_HYPERVISOR})"
-	sudo nerdctl run --rm --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" --entrypoint nping instrumentisto/nmap --tcp-connect -c 2 -p 80 www.github.com
+	sudo nerdctl "${snapshotter[@]}" run --rm --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" --entrypoint nping instrumentisto/nmap --tcp-connect -c 2 -p 80 www.github.com
 
 	info "Running nerdctl with Kata Containers (${KATA_HYPERVISOR}) and multiple bridge nwtorks"
-	sudo nerdctl run --rm --net "${net1}" --net "${net2}" --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a
+	sudo nerdctl "${snapshotter[@]}" run --rm --net "${net1}" --net "${net2}" --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a
 
 	info "Running nerdctl with Kata Containers (${KATA_HYPERVISOR}) and ipvlan network"
-	sudo nerdctl run  --rm --net "${ipvlan_net_name}"  --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a | grep "eth0"
+	sudo nerdctl "${snapshotter[@]}" run  --rm --net "${ipvlan_net_name}"  --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a | grep "eth0"
 
 	info "Running nerdctl with Kata Containers (${KATA_HYPERVISOR}) and macvlan network"
-	sudo nerdctl run  --rm --net "${macvlan_net_name}"  --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a | grep "eth0"
+	sudo nerdctl "${snapshotter[@]}" run  --rm --net "${macvlan_net_name}"  --runtime "io.containerd.kata-${KATA_HYPERVISOR}.v2" alpine ip a | grep "eth0"
 
 	info "Removing networks"
 	sudo nerdctl network rm "${macvlan_net_name}" "${ipvlan_net_name}"

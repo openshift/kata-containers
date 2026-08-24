@@ -54,6 +54,13 @@ pub mod rootless;
 /// machine type
 pub mod machine_type;
 
+/// GPT (GUID Partition Table) disk layout and metadata generation.
+pub mod gpt_disk;
+
+/// dm-verity related constants and data types.
+#[cfg(feature = "devicemapper")]
+pub mod dmverity;
+
 use std::path::Path;
 
 use crate::rootless::{is_rootless, rootless_dir};
@@ -107,8 +114,10 @@ macro_rules! validate_path {
     }};
 }
 
-/// Helper function that builds paths based on the vmm's rootless state.
-pub fn build_path(path: &str) -> String {
+/// Prefix a path with the VMM's rootless runtime directory.
+///
+/// The path is returned unchanged when the VMM is not running rootless.
+pub fn prefix_with_rootless_dir(path: &str) -> String {
     if is_rootless() {
         let path = Path::new(path);
         let path = if path.is_absolute() {

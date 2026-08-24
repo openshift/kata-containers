@@ -16,7 +16,7 @@
 [hypervisor.qemu]
 path = "@QEMUSNPPATH@"
 kernel = "@KERNELPATH_CONFIDENTIAL_NV@"
-image = "@IMAGEPATH_CONFIDENTIAL_NV@"
+image = "@IMAGEPATH_NV_BASE@"
 machine_type = "@MACHINETYPE@"
 
 # Enable confidential guest support.
@@ -79,7 +79,7 @@ rootless = false
 # List of valid annotation names for the hypervisor
 # Each member of the list is a regular expression, which is the base name
 # of the annotation, e.g. "path" for io.katacontainers.config.hypervisor.path"
-enable_annotations = @DEFENABLEANNOTATIONS_COCO@
+enable_annotations = @DEFENABLEANNOTATIONS_COCO_NVIDIA@
 
 # List of valid annotations values for the hypervisor
 # Each member of the list is a path pattern as described by glob(3).
@@ -102,7 +102,7 @@ kernel_params = "@KERNELPARAMS_CONFIDENTIAL_NV@"
 # Optional dm-verity parameters (comma-separated key=value list):
 # root_hash=...,salt=...,data_blocks=...,data_block_size=...,hash_block_size=...
 # These are used by the runtime to assemble dm-verity kernel params.
-kernel_verity_params = "@KERNELVERITYPARAMS_CONFIDENTIAL_NV@"
+kernel_verity_params = "@KERNELVERITYPARAMS_NV@"
 
 # Path to the firmware.
 # If you want that qemu uses the default firmware leave this option empty
@@ -121,11 +121,10 @@ machine_accelerators = "@MACHINEACCELERATORS@"
 
 # Qemu seccomp sandbox feature
 # comma-separated list of seccomp sandbox features to control the syscall access.
-# For example, `seccompsandbox= "on,obsolete=deny,spawn=deny,resourcecontrol=deny"`
-# Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
+# For example, `seccomp_sandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"`
 # Another note: enabling this feature may reduce performance, you may enable
 # /proc/sys/net/core/bpf_jit_enable to reduce the impact. see https://man7.org/linux/man-pages/man8/bpfc.8.html
-# Recommended value when enabling: "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
+# Recommended value when enabling: "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
 seccomp_sandbox = "@DEFSECCOMPSANDBOXPARAM@"
 
 # CPU features
@@ -139,6 +138,15 @@ cpu_features = "@CPUFEATURES@"
 # > 0 <= number of physical cores --> will be set to the specified number
 # > number of physical cores      --> will be set to the actual number of physical cores
 default_vcpus = @DEFAULTVCPUS_NV@
+
+# Guest-side vCPU overhead budget (fractional) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_vcpus = requested_vcpus + overhead_vcpus
+# (rounded up at boot). If a workload limit is set on another dimension (for example
+# memory) but CPU is missing, requested_vcpus is treated as 0 and vm_vcpus equals
+# overhead_vcpus (minimum 1 at boot). When no workload limits are present,
+# default_vcpus is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_vcpus = @DEFOVERHEADVCPUS_NV@
 
 # Default maximum number of vCPUs per SB/VM:
 # unspecified or == 0             --> will be set to the actual number of physical cores or to the maximum number
@@ -182,6 +190,14 @@ reclaim_guest_freed_memory = false
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFAULTMEMORY_NV@
+
+# Guest-side memory overhead budget (MiB) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_memory = requested_memory + overhead_memory.
+# If a workload limit is set on another dimension (for example CPU) but memory is
+# missing, requested_memory is treated as 0, so vm_memory equals overhead_memory.
+# When no workload limits are present, default_memory is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_memory = @DEFOVERHEADMEMSZ_NV@
 #
 # Default memory slots per SB/VM.
 # If unspecified then it will be set @DEFMEMSLOTS@.
@@ -300,10 +316,18 @@ block_device_cache_direct = false
 block_device_cache_noflush = false
 
 # Enable iothreads (data-plane) to be used. This causes IO to be
-# handled in a separate IO thread. This is currently only implemented
-# for SCSI.
+# handled in a separate IO thread. This is currently implemented
+# for virtio-scsi. For virtio-blk-pci hotplug, use indep_iothreads instead.
 #
 enable_iothreads = @DEFENABLEIOTHREADS@
+
+# Number of independent IO threads for virtio-blk-pci devices.
+# When set to a value greater than 0, creates dedicated IO threads
+# that are attached to virtio-blk-pci devices during hotplug.
+# Requires enable_iothreads = true; has no effect otherwise.
+# Default 0 (disabled).
+#
+indep_iothreads = @DEFINDEPIOTHREADS@
 
 # Virtio queue size. Size: byte. default 128
 queue_size = 128
@@ -359,17 +383,6 @@ valid_vhost_user_store_paths = @DEFVALIDVHOSTUSERSTOREPATHS@
 # Zero disables reconnecting, and the default is zero.
 vhost_user_reconnect_timeout_sec = 0
 
-# Enable file based guest memory support. The default is an empty string which
-# will disable this feature. In the case of virtio-fs, this is enabled
-# automatically and '/dev/shm' is used as the backing folder.
-# This option will be ignored if VM templating is enabled.
-file_mem_backend = "@DEFFILEMEMBACKEND@"
-
-# List of valid annotations values for the file_mem_backend annotation
-# The default if not set is empty (all annotations rejected.)
-# Your distribution recommends: @DEFVALIDFILEMEMBACKENDS@
-valid_file_mem_backends = @DEFVALIDFILEMEMBACKENDS@
-
 # -pflash can add image file to VM. The arguments of it should be in format
 # of ["/path/to/flash0.img", "/path/to/flash1.img"]
 pflashes = []
@@ -409,13 +422,6 @@ disable_nesting_checks = true
 # Default is false
 disable_image_nvdimm = true
 
-# VFIO devices are hotplugged on a bridge by default.
-# Enable hotplugging on root bus. This may be required for devices with
-# a large PCI bar, as this is a current limitation with hotplugging on
-# a bridge.
-# Default false
-hotplug_vfio_on_root_bus = false
-
 # Enable cold-plugging of VFIO devices to a PCIe port type.
 # Accepted values: "no-port" (default, disabled), "root-port".
 # When set to "root-port", devices discovered via CDI / Pod Resources
@@ -425,14 +431,14 @@ cold_plug_vfio = "root-port"
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means the number of pcie_root_port
-# This value is valid when hotplug_vfio_on_root_bus is true and machine_type is "q35"
+# This value is valid when machine_type is "q35"
 # Default 0
 pcie_root_port = @DEFAULTPCIEROOTPORT_NV@
 
 # Before hot plugging a PCIe device onto a switch port, you need add a pcie_switch_port device fist.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means how many devices attached onto pcie_switch_port will be created.
-# This value is valid when hotplug_vfio_on_root_bus is true, and machine_type is "q35"
+# This value is valid when machine_type is "q35"
 # Default 0
 pcie_switch_port = 0
 
@@ -598,6 +604,29 @@ reconnect_timeout_ms = @DEFRECONNECTTIMEOUTMS_NV@
 # Defaults to @DEFCREATECONTAINERTIMEOUT@ second(s)
 create_container_timeout = @DEFAULTTIMEOUT_NV@
 
+# If enabled, the agent translates a container's VISIBLE_CDI_DEVICES
+# environment variable into CDI GPU device requests (nvidia.com/gpu), resolved
+# against the GPUs present in the VM via the CDI spec generated in the guest at
+# /var/run/cdi/. The format of VISIBLE_CDI_DEVICES is:
+#
+#   <cdi-kind>=<devices>[:<cdi-kind>=<devices>[...]]
+#
+# For example, you may set something like:
+#
+#   VISIBLE_CDI_DEVICES="nvidia.com/gpu=all:nvidia.com/ib=0,1"
+#
+# The devices can be referenced by explicit CDI index or through the "all"
+# keyword.
+#
+# This parameter is useful in the case where multiple containers in a pod need
+# access to the same GPU and do not want to request additional GPUs from the
+# outer runtime. This is especially useful with GPU observability where one
+# workload container performs the CDI request to the outer runtime, and the
+# sidecar observability containers would get access to the same resources by
+# setting VISIBLE_CDI_DEVICES="nvidia.com/gpu=all".
+# (default: false)
+visible_cdi_devices = false
+
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
 # system log
@@ -619,6 +648,14 @@ enable_debug = false
 #   - tcfilter
 #     Uses tc filter rules to redirect traffic from the network interface
 #     provided by plugin to a tap interface connected to the VM.
+#
+#   - l3forwarding
+#     Uses L3 routing and proxy ARP to forward traffic between the network
+#     interface provided by the plugin and a tap interface connected to the
+#     VM.
+#     Useful for Istio Ambient-style service mesh integration with node
+#     proxies. Supports a single network interface per network namespace.
+#     Experimental feature, IPv4 only.
 #
 internetworking_model = "@DEFNETWORKMODEL_QEMU@"
 
@@ -655,8 +692,7 @@ jaeger_password = ""
 
 # If enabled, the runtime will not create a network namespace for shim and hypervisor processes.
 # This option may have some potential impacts to your host. It should only be used when you know what you're doing.
-# `disable_new_netns` conflicts with `internetworking_model=tcfilter` and `internetworking_model=macvtap`. It works only
-# with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
+# `disable_new_netns` only works with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
 # (default: false)
 disable_new_netns = false
@@ -705,10 +741,6 @@ sandbox_bind_mounts = @DEFBINDMOUNTS@
 #
 vfio_mode = "@DEFVFIOMODE_NV@"
 
-# If enabled, the runtime will not create Kubernetes emptyDir mounts on the guest filesystem. Instead, emptyDir mounts will
-# be created on the host and shared via virtio-fs. This is potentially slower, but allows sharing of files from host to guest.
-disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
-
 # Specifies how Kubernetes emptyDir volumes are handled.
 # Options:
 #
@@ -719,18 +751,33 @@ disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 #   - block-encrypted
 #     Plugs a block device to be encrypted in the guest.
 #
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
+#
 emptydir_mode = "@DEFEMPTYDIRMODE_COCO@"
 
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
 # Supported experimental features:
+# for example:
+#       experimental = ["force_guest_pull"]
+# which enables force_guest_pull mode in CoCo scenarios.
 # (default: [])
 experimental = @DEFAULTEXPFEATURES@
 
 # If enabled, user can run pprof tools with shim v2 process through kata-monitor.
 # (default: false)
 enable_pprof = false
+
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"
 
 # kubelet_root_dir is the kubelet root directory used to match ConfigMap/Secret
 # volume paths for propagation. Override for distros that use a different path
@@ -741,3 +788,19 @@ kubelet_root_dir = "@DEFKUBELETROOTDIR@"
 # When set (together with a non-"no-port" cold_plug_vfio), the runtime can cold-plug
 # devices discovered via the Pod Resources API. Path is typically under kubelet root-dir.
 pod_resource_api_sock = "@DEFPODRESOURCEAPISOCK_NV@"
+
+# The GPU driver stack (userspace binaries, libraries, configs, firmware and the
+# NVIDIA kernel modules) ships in a separate, driver-versioned extension image that
+# is cold-plugged alongside the nvidia base boot image.  NVRC mounts it at
+# /run/kata-extensions/gpu and resolves the GPU stack from there.
+[[hypervisor.qemu.guest_extension_images]]
+name = "gpu"
+path = "@IMAGEPATH_NV_EXTENSION@"
+verity_params = "@NVIDIAGPUEXTENSIONVERITYPARAMS@"
+
+# Confidential guests additionally cold-plug the CoCo guest-components extension
+# (attestation-agent, confidential-data-hub, ...) mounted at /run/kata-extensions/coco.
+[[hypervisor.qemu.guest_extension_images]]
+name = "coco"
+path = "@COCOIMAGEPATH@"
+verity_params = "@COCOVERITYPARAMS@"

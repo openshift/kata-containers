@@ -622,9 +622,9 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 	// iterate all mounts and create block device if it's block based.
 	for i := range c.mounts {
 		// If block devices are disabled, we selectively only hotplug if
-		// the mount is an encrypted block-based emptyDir, to avoid
+		// the mount is a block-based emptyDir, to avoid
 		// cases that could regress 20ca4d2.
-		if !c.checkBlockDeviceSupport(ctx) && (c.sandbox.config.EmptyDirMode != EmptyDirModeVirtioBlkEncrypted || !Isk8sHostEmptyDir(c.mounts[i].Source)) {
+		if !c.checkBlockDeviceSupport(ctx) && (!isBlockEmptyDirMode(c.sandbox.config.EmptyDirMode) || !IsDiskEmptyDir(c.mounts[i].Source)) {
 			c.Logger().Warn("Block device not supported")
 			continue
 		}
@@ -679,6 +679,13 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 				switch key {
 				case volume.EncryptionKeyMetadataKey:
 					c.mounts[i].EncryptionKey = value
+				case volume.CreateFilesystemMetadataKey:
+					createFs, err := strconv.ParseBool(value)
+					if err != nil {
+						c.Logger().WithError(err).Errorf("invalid create filesystem value %s provided for key %s", value, volume.CreateFilesystemMetadataKey)
+						continue
+					}
+					c.mounts[i].BlockDeviceCreateFs = createFs
 				case volume.FSGroupMetadataKey:
 					gid, err := strconv.Atoi(value)
 					if err != nil {
@@ -702,6 +709,8 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 		// instead of passing this as a shared mount.
 		di, err := c.createDeviceInfo(c.mounts[i].Source, c.mounts[i].Destination, c.mounts[i].ReadOnly, isBlockFile)
 		if err == nil && di != nil {
+			di.DiscardUnmap = c.mounts[i].BlockDeviceCreateFs && slices.Contains(c.mounts[i].Options, blockVolumeDiscardOption)
+
 			b, err := c.sandbox.devManager.NewDevice(*di)
 			if err != nil {
 				// Do not return an error, try to create
@@ -814,6 +823,18 @@ func (c *Container) createDeviceInfo(source, destination string, readonly, isBlo
 	var err error
 
 	if stat.Mode&unix.S_IFMT == unix.S_IFBLK {
+		// Honor the host block device's own read-only flag in addition to the
+		// mount-derived intent, so a device marked read-only on the host is
+		// exposed read-only to the guest.
+		if !readonly {
+			if ro, roErr := config.BlockDeviceIsReadOnly(source); roErr != nil {
+				c.Logger().WithError(roErr).WithField("mount-source", source).
+					Warn("could not query block device read-only flag")
+			} else {
+				readonly = ro
+			}
+		}
+
 		di = &config.DeviceInfo{
 			HostPath:      source,
 			ContainerPath: destination,
@@ -866,12 +887,12 @@ func getFilesystemCapacity(path string) (uint64, error) {
 }
 
 func (c *Container) createEphemeralDisks() error {
-	if c.sandbox.config.EmptyDirMode != EmptyDirModeVirtioBlkEncrypted {
+	if !isBlockEmptyDirMode(c.sandbox.config.EmptyDirMode) {
 		return nil
 	}
 
 	for i := range c.mounts {
-		if !Isk8sHostEmptyDir(c.mounts[i].Source) {
+		if !IsDiskEmptyDir(c.mounts[i].Source) {
 			continue
 		}
 
@@ -884,7 +905,7 @@ func (c *Container) createEphemeralDisks() error {
 			continue
 		}
 
-		diskPath, err := c.setupEphemeralDisk(c.mounts[i].Source)
+		diskPath, err := c.setupEphemeralDisk(c.mounts[i].Source, c.sandbox.config.EmptyDirMode)
 		if err != nil {
 			return err
 		}
@@ -902,7 +923,7 @@ func (c *Container) createEphemeralDisks() error {
 // inside the given emptyDir. It returns the path to the created disk
 // image. The fd is always closed and the disk image is removed if any
 // step after creation fails.
-func (c *Container) setupEphemeralDisk(emptyDirPath string) (diskPath string, err error) {
+func (c *Container) setupEphemeralDisk(emptyDirPath, emptyDirMode string) (diskPath string, err error) {
 	// Create the disk file in the same folder as the original
 	// emptyDir mount so that Kubelet can enforce the sizeLimit.
 	diskPath = filepath.Join(emptyDirPath, "disk.img")
@@ -938,8 +959,15 @@ func (c *Container) setupEphemeralDisk(emptyDirPath string) (diskPath string, er
 		return
 	}
 
-	metadata := map[string]string{
-		volume.EncryptionKeyMetadataKey: "ephemeral",
+	metadata := map[string]string{}
+	var options []string
+	if isBlockEmptyDirMode(emptyDirMode) {
+		metadata[volume.CreateFilesystemMetadataKey] = strconv.FormatBool(true)
+	}
+	if emptyDirMode == EmptyDirModeVirtioBlkEncrypted {
+		metadata[volume.EncryptionKeyMetadataKey] = "ephemeral"
+	} else if emptyDirMode == EmptyDirModeVirtioBlkPlain {
+		options = []string{blockVolumeDiscardOption}
 	}
 	if sourceStat.Gid != 0 {
 		metadata[volume.FSGroupMetadataKey] = strconv.FormatUint(uint64(sourceStat.Gid), 10)
@@ -950,6 +978,7 @@ func (c *Container) setupEphemeralDisk(emptyDirPath string) (diskPath string, er
 		Device:     diskPath,
 		FsType:     "ext4",
 		Metadata:   metadata,
+		Options:    options,
 	}); err != nil {
 		c.Logger().WithError(err).Errorf("failed to assign direct volume for mount %s", emptyDirPath)
 		return
@@ -1043,6 +1072,69 @@ func (c *Container) createErofsDevices(ctx context.Context) ([]config.DeviceInfo
 	return deviceInfos, nil
 }
 
+// physicalEndpointBDFs returns the set of host PCI BDFs backing physical
+// network endpoints already cold-plugged into the sandbox.
+func (c *Container) physicalEndpointBDFs() map[string]struct{} {
+	bdfs := map[string]struct{}{}
+	if c.sandbox == nil || c.sandbox.network == nil {
+		return bdfs
+	}
+	for _, ep := range c.sandbox.network.Endpoints() {
+		if ep.Type() != PhysicalEndpointType {
+			continue
+		}
+		if pe, ok := ep.(*PhysicalEndpoint); ok && pe.BDF != "" {
+			bdfs[pe.BDF] = struct{}{}
+		}
+	}
+	return bdfs
+}
+
+// vfioDeviceIsPhysicalEndpoint reports whether the VFIO device at devPath
+// resolves to a BDF owned by a physical network endpoint.
+func (c *Container) vfioDeviceIsPhysicalEndpoint(devPath string, endpointBDFs map[string]struct{}) bool {
+	for _, bdf := range vfioDeviceBDFs(devPath) {
+		if _, ok := endpointBDFs[bdf]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// vfioDeviceBDFs resolves a VFIO device path to the host PCI BDF(s) it exposes.
+// Handles both the iommufd cdev (/dev/vfio/devices/vfio<N>) and the legacy
+// group node (/dev/vfio/<group>, which may contain multiple devices).
+func vfioDeviceBDFs(devPath string) []string {
+	if strings.HasPrefix(filepath.Base(devPath), "vfio") {
+		// IOMMUFD device (/dev/vfio/devices/vfio<NUM>): single device per char dev
+		major, minor, err := deviceUtils.GetMajorMinorFromDevPath(devPath)
+		if err != nil {
+			return nil
+		}
+		bdf, err := deviceUtils.GetBDFFromVFIODev(major, minor)
+		if err != nil {
+			return nil
+		}
+		return []string{bdf}
+	}
+	// Legacy VFIO group (/dev/vfio/<GROUP>): may contain multiple devices
+	vfioGroup := filepath.Base(devPath)
+	iommuDevicesPath := filepath.Join(config.SysIOMMUGroupPath, vfioGroup, "devices")
+	deviceFiles, err := os.ReadDir(iommuDevicesPath)
+	if err != nil {
+		return nil
+	}
+	var bdfs []string
+	for _, deviceFile := range deviceFiles {
+		bdf, _, _, err := deviceUtils.GetVFIODetails(deviceFile.Name(), iommuDevicesPath)
+		if err != nil {
+			continue
+		}
+		bdfs = append(bdfs, bdf)
+	}
+	return bdfs
+}
+
 func (c *Container) createDevices(ctx context.Context, contConfig *ContainerConfig) error {
 	// If devices were not found in storage, create Device implementations
 	// from the configuration. This should happen at create.
@@ -1069,24 +1161,29 @@ func (c *Container) createDevices(ctx context.Context, contConfig *ContainerConf
 	hotPlugDevices := []config.DeviceInfo{}
 	vfioColdPlugDevices := []config.DeviceInfo{}
 
-	for i, vfio := range deviceInfos {
-		// If device is already attached during sandbox creation, e.g.
-		// with an CDI annotation, skip it in the container creation and
-		// only create the proper CDI annotation for the kata-agent
-		for _, dev := range config.PCIeDevicesPerPort["root-port"] {
-			if dev.HostPath == vfio.ContainerPath {
-				c.Logger().Warnf("device %s already attached to the sandbox, skipping", vfio.ContainerPath)
-			}
-		}
-		for _, dev := range config.PCIeDevicesPerPort["switch-port"] {
-			if dev.HostPath == vfio.ContainerPath {
-				c.Logger().Warnf("device %s already attached to the sandbox, skipping", vfio.ContainerPath)
-			}
-		}
+	// VFs that back a physical network endpoint are already cold-plugged into
+	// QEMU during sandbox network setup (PhysicalEndpoint.Attach -> AddDevice).
+	// The SR-IOV device plugin sometimes ALSO lists the same VF in the
+	// container's linux.devices.  Attaching it again here fails ("port is not
+	// set" / already present), so build the set of BDFs owned by physical
+	// endpoints and skip any container VFIO device that resolves to one of
+	// them.  Exposing these VFs to the agent is handled separately by
+	// kata_agent.appendPhysicalEndpointDevices().
+	physicalEndpointBDFs := c.physicalEndpointBDFs()
 
+	for i, vfio := range deviceInfos {
 		// Only considering VFIO updates for Port and ColdPlug or
 		// HotPlug updates
 		isVFIODevice := deviceManager.IsVFIODevice(vfio.ContainerPath)
+
+		if isVFIODevice && len(physicalEndpointBDFs) > 0 {
+			if c.vfioDeviceIsPhysicalEndpoint(vfio.ContainerPath, physicalEndpointBDFs) {
+				c.Logger().WithField("device", vfio.ContainerPath).Info(
+					"skipping VFIO device already cold-plugged as a physical network endpoint")
+				continue
+			}
+		}
+
 		if hotPlugVFIO && isVFIODevice {
 			deviceInfos[i].ColdPlug = false
 			deviceInfos[i].Port = c.sandbox.config.HypervisorConfig.HotPlugVFIO
@@ -1102,17 +1199,22 @@ func (c *Container) createDevices(ctx context.Context, contConfig *ContainerConf
 		hotPlugDevices = append(hotPlugDevices, deviceInfos[i])
 	}
 
-	// If modeVFIO is enabled we need 1st to attach the VFIO control group
-	// device /dev/vfio/vfio an 2nd the actuall device(s) afterwards.
-	// Sort the devices starting with device #1 being the VFIO control group
-	// device and the next the actuall device(s) /dev/vfio/<group>
-	if coldPlugVFIO && c.sandbox.config.VfioMode == config.VFIOModeVFIO {
-		// DeviceInfo should still be added to the sandbox's device manager
-		// if vfio_mode is VFIO and coldPlugVFIO is true (e.g. vfio-ap-cold).
-		// This ensures that ociSpec.Linux.Devices is updated with
-		// this information before the container is created on the guest.
+	// Cold-plugged devices are already attached to the VM, but workload
+	// containers keep them in their device list because the agent needs
+	// the entries: to create the in-guest /dev/vfio nodes (vfio_mode =
+	// "vfio") and to build the host->guest PCI mapping that
+	// PCIDEVICE_<RES> env var translation relies on (vfio_mode =
+	// "guest-kernel"). FindDevice matches the sandbox-level device, so
+	// nothing double-attaches.
+	//
+	// The CRI sandbox (pause) container never owns any VFIO device, and
+	// the guest rejects a pause CreateContainer that carries one.
+	isCriSandbox := ContainerType(c.config.Annotations[vcAnnotations.ContainerTypeKey]).IsCriSandbox()
+	if coldPlugVFIO && !isCriSandbox {
 		sortedVFIODevices := sortContainerVFIODevices(vfioColdPlugDevices)
-		// Combine sorted VFIO devices with hot-plug devices
+		// The container needs the cold-plug VFIO devices AND the hot-plug
+		// devices (e.g. disks, network) for proper functioning, see
+		// https://github.com/kata-containers/kata-containers/issues/11288
 		deviceInfos = append(sortedVFIODevices, hotPlugDevices...)
 	} else {
 		deviceInfos = sortContainerVFIODevices(hotPlugDevices)
@@ -1742,12 +1844,17 @@ func (c *Container) update(ctx context.Context, resources specs.LinuxResources) 
 		return err
 	}
 
-	// There currently isn't a notion of cpusets.cpus or mems being tracked
-	// inside of the guest. Make sure we clear these before asking agent to update
-	// the container's cgroups.
+	// Cpus/Mems in cgroup cpuset are host-relative; clear Cpus since vCPU
+	// numbering differs inside the guest. For Mems, translate host NUMA node
+	// IDs to guest node IDs when multi-NUMA is configured, otherwise clear.
 	if resources.CPU != nil {
-		resources.CPU.Mems = ""
 		resources.CPU.Cpus = ""
+		numaNodes := c.sandbox.config.HypervisorConfig.GuestNUMANodes
+		if len(numaNodes) > 1 && resources.CPU.Mems != "" {
+			resources.CPU.Mems = translateHostMemsToGuest(resources.CPU.Mems, numaNodes)
+		} else {
+			resources.CPU.Mems = ""
+		}
 	}
 
 	return c.sandbox.agent.updateContainer(ctx, c.sandbox, *c, resources)

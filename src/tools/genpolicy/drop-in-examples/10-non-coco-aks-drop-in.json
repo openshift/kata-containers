@@ -6,13 +6,8 @@
   },
   {
     "op": "replace",
-    "path": "/cluster_config/encrypted_emptydir",
-    "value": false
-  },
-  {
-    "op": "replace",
-    "path": "/cluster_config/pause_container_id_policy",
-    "value": "v2"
+    "path": "/cluster_config/emptydir_type",
+    "value": "shared-fs"
   },
   {
     "op": "replace",
@@ -28,16 +23,6 @@
     "op": "replace",
     "path": "/kata_config/enable_configmap_secret_storages",
     "value": true
-  },
-  {
-    "op": "replace",
-    "path": "/pause_container/Process/User/UID",
-    "value": 0
-  },
-  {
-    "op": "replace",
-    "path": "/pause_container/Process/User/GID",
-    "value": 0
   },
   {
     "op": "replace",

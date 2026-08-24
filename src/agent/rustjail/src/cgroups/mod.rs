@@ -9,6 +9,7 @@ use oci_spec::runtime::{LinuxDeviceCgroup, LinuxDeviceType, LinuxResources};
 use protocols::agent::CgroupStats;
 use std::any::Any;
 
+use crate::cgroups_rs as cgroups;
 use cgroups::freezer::FreezerState;
 
 pub mod fs;
@@ -42,7 +43,7 @@ pub trait Manager {
         Err(anyhow!("not supported!"))
     }
 
-    fn destroy(&mut self) -> Result<()> {
+    fn destroy(&self) -> Result<()> {
         Err(anyhow!("not supported!"))
     }
 

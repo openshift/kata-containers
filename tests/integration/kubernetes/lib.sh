@@ -168,6 +168,51 @@ exec_host() {
 	kubectl exec -qi -n kube-system "${pod_name}" -- chroot /host bash -c "${command}" | tr -d '\r'
 }
 
+# Return the sandbox id of a pod, as the container runtime knows it. For Kata
+# that is also the id the shim, the guest and kata-ctl go by.
+#
+# Only ready sandboxes count: a pod name can be reused once the pod that had it
+# is gone, and the runtime remembers the dead sandbox for a while afterwards.
+#
+# Parameters:
+#	$1 - pod name in the current Kubernetes namespace
+get_pod_sandbox_id() {
+	local pod_name="$1"
+	local node
+
+	node="$(kubectl get pod "${pod_name}" -o jsonpath='{.spec.nodeName}')"
+	[[ -n "${node}" ]] || die "No node found for pod ${pod_name}"
+	exec_host "${node}" "command -v crictl >/dev/null" || \
+		die "crictl is required on Kubernetes node ${node}"
+
+	exec_host "${node}" \
+		"crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
+		pods --name \"${pod_name}\" --state ready -q | head -1"
+}
+
+# Return the QEMU PID for a running pod.
+#
+# Parameters:
+#	$1 - pod name in the current Kubernetes namespace
+get_qemu_pid_for_pod() {
+	local pod_name="$1"
+	local node
+	local qemu_pid
+	local sandbox_id
+
+	sandbox_id="$(get_pod_sandbox_id "${pod_name}")"
+	[[ -n "${sandbox_id}" ]] || die "No sandbox ID found for pod ${pod_name}"
+
+	node="$(kubectl get pod "${pod_name}" -o jsonpath='{.spec.nodeName}')"
+	[[ -n "${node}" ]] || die "No node found for pod ${pod_name}"
+
+	qemu_pid="$(exec_host "${node}" \
+		"pgrep -f \"qemu.*${sandbox_id}\" | head -1")"
+	[[ -n "${qemu_pid}" ]] || die "No QEMU PID found for sandbox ${sandbox_id}"
+
+	echo "${qemu_pid}"
+}
+
 # Check the logged messages on host have a given message.
 #
 # Parameters:
@@ -316,7 +361,9 @@ assert_rootfs_count() {
 # Parameters:
 #	$1 - the container image.
 #	$2 - the runtimeclass, is not optional.
-#	$3 - the specific node name, optional.
+#	$3 - runAsUser, optional.
+#	$4 - runAsGroup, optional.
+#	$5 - supplementalGroups, optional.
 #
 # Return:
 # 	the path to the configuration file. The caller should not care about
@@ -329,6 +376,9 @@ new_pod_config() {
 	local base_config="${FIXTURES_DIR}/pod-config.yaml.in"
 	local image="${1}"
 	local runtimeclass="${2}"
+	local run_as_user="${3:-}"
+	local run_as_group="${4:-}"
+	local supplemental_groups="${5:-}"
 	local new_config
 
 	[[ -n "${runtimeclass}" ]] || return 1
@@ -337,7 +387,40 @@ new_pod_config() {
 	new_config=$(mktemp "${BATS_FILE_TMPDIR}/pod-config.XXXXXX.yaml")
 	IMAGE="${image}" RUNTIMECLASS="${runtimeclass}" envsubst < "${base_config}" > "${new_config}"
 
+	if [[ -n "${run_as_user}${run_as_group}${supplemental_groups}" ]]; then
+		set_pod_spec_security_context "${new_config}" ".spec" "${run_as_user}" "${run_as_group}" "${supplemental_groups}"
+	fi
+
 	echo "${new_config}"
+}
+
+set_pod_spec_security_context() {
+	local yaml="${1}"
+	local spec_path="${2}"
+	local run_as_user="${3}"
+	local run_as_group="${4}"
+	local supplemental_groups="${5:-}"
+	local expression
+
+	expression=""
+
+	if [[ -n "${run_as_user}" ]]; then
+		expression+="${spec_path}.securityContext.runAsUser = ${run_as_user}"
+	fi
+
+	if [[ -n "${run_as_group}" ]]; then
+		[[ -n "${expression}" ]] && expression+=" | "
+		expression+="${spec_path}.securityContext.runAsGroup = ${run_as_group}"
+	fi
+
+	if [[ -n "${supplemental_groups}" ]]; then
+		[[ -n "${expression}" ]] && expression+=" | "
+		expression+="${spec_path}.securityContext.supplementalGroups = [${supplemental_groups}]"
+	fi
+
+	[[ -n "${expression}" ]] || return 0
+
+	yq -i "${expression}" "${yaml}"
 }
 
 # Set an annotation on configuration metadata.
@@ -375,6 +458,18 @@ set_metadata_annotation() {
 		if [[ -z "${IBM_SE_CREDS_DIR:-}" ]]; then
 			>&2 echo "ERROR: IBM_SE_CREDS_DIR is empty"
 			return 1
+		fi
+		if [[ "${KATA_HYPERVISOR}" == "qemu-se-runtime-rs" ]]; then
+			export SE_COMPOSABLE="yes"
+			# Seed the CoCo extension verity params so the rebuilt SE image seals
+			# the actual root hash into its kernel cmdline.  The file is absent on
+			# s390x (unmeasured extension); the bare-key fallback in lib_se.sh
+			# handles that case correctly.
+			local root_hash_file="/opt/kata/share/kata-containers/root_hash_coco-extension.txt"
+			if [[ -f "${root_hash_file}" ]]; then
+				COCO_VERITY_PARAMS="$(< "${root_hash_file}")"
+				export COCO_VERITY_PARAMS
+			fi
 		fi
 		repack_secure_image "${value}" "${IBM_SE_CREDS_DIR}" "true"
 	fi
@@ -423,30 +518,4 @@ set_node() {
   yq -i \
     "${spec} = \"${node}\"" \
     "${yaml}"
-}
-
-# Get the sandbox id for kata container from a worker node
-#
-# Parameters:
-#	$1 - the k8s worker node name
-#
-get_node_kata_sandbox_id() {
-	local node="$1"
-	local kata_sandbox_id=""
-	local local_wait_time="${wait_time}"
-	# Max loop 3 times to get kata_sandbox_id
-	while [[ "${local_wait_time}" -gt 0 ]];
-	do
-		kata_sandbox_id=$(exec_host "${node}" "ps -ef |\
-		  grep containerd-shim-kata-v2" |\
-		  grep -oP '(?<=-id\s)[a-f0-9]+' |\
-		  tail -1)
-		if [[ -n "${kata_sandbox_id}" ]]; then
-			break
-		else
-			sleep "${sleep_time}"
-			local_wait_time=$((local_wait_time-sleep_time))
-		fi
-	done
-	echo "${kata_sandbox_id}"
 }

@@ -68,6 +68,15 @@ firmware = "@FIRMWAREPATH@"
 # > number of physical cores      --> will be set to the actual number of physical cores
 default_vcpus = @DEFVCPUS@
 
+# Guest-side vCPU overhead budget (fractional) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_vcpus = requested_vcpus + overhead_vcpus
+# (rounded up at boot). If a workload limit is set on another dimension (for example
+# memory) but CPU is missing, requested_vcpus is treated as 0 and vm_vcpus equals
+# overhead_vcpus (minimum 1 at boot). When no workload limits are present,
+# default_vcpus is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_vcpus = @DEFOVERHEADVCPUS_DB@
+
 
 # Default maximum number of vCPUs per SB/VM:
 # unspecified or == 0             --> will be set to the actual number of physical cores or to the maximum number
@@ -111,6 +120,14 @@ reclaim_guest_freed_memory = false
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFMEMSZ@
+
+# Guest-side memory overhead budget (MiB) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_memory = requested_memory + overhead_memory.
+# If a workload limit is set on another dimension (for example CPU) but memory is
+# missing, requested_memory is treated as 0, so vm_memory equals overhead_memory.
+# When no workload limits are present, default_memory is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_memory = @DEFOVERHEADMEMSZ_DB@
 
 # Default maximum memory in MiB per SB / VM
 # unspecified or == 0           --> will be set to the actual amount of physical RAM
@@ -255,6 +272,18 @@ guest_swap_size_percent = 100
 # Default 60.
 guest_swap_create_threshold_secs = 60
 
+[hypervisor.dragonball.factory]
+# VM templating support. Once enabled, new VMs are restored from the template
+# initialized with `kata-ctl factory init`.
+#
+# Default false
+enable_template = false
+
+# Specifies the path of the template memory and device-state files.
+#
+# Default "/run/vc/vm/template"
+template_path = "/run/vc/vm/template"
+
 [agent.@PROJECT_TYPE@]
 container_pipe_size = @PIPESIZE@
 # If enabled, make the agent display debug-level messages.
@@ -293,11 +322,11 @@ enable_tracing = false
 
 debug_console_enabled = false
 
-# Agent dial timeout in millisecond.
+# Sleep between agent connection retries, in milliseconds.
 # (default: 10)
 dial_timeout_ms = 10
 
-# Agent reconnect timeout in millisecond.
+# Overall time budget for establishing the agent connection, in milliseconds.
 # Retry times = reconnect_timeout_ms / dial_timeout_ms (default: 300)
 # If you find pod cannot connect to the agent when starting, please
 # consider increasing this value to increase the retry times.
@@ -462,6 +491,14 @@ keep_abnormal = false
 #     Uses tc filter rules to redirect traffic from the network interface
 #     provided by plugin to a tap interface connected to the VM.
 #
+#   - l3forwarding
+#     Uses L3 routing and proxy ARP to forward traffic between the network
+#     interface provided by the plugin and a tap interface connected to the
+#     VM.
+#     Useful for Istio Ambient-style service mesh integration with node
+#     proxies. Supports a single network interface per network namespace.
+#     Experimental feature, IPv4 only.
+#
 internetworking_model = "@DEFNETWORKMODEL_DB@"
 
 name = "@RUNTIMENAME@"
@@ -492,8 +529,7 @@ jaeger_password = ""
 
 # If enabled, the runtime will not create a network namespace for shim and hypervisor processes.
 # This option may have some potential impacts to your host. It should only be used when you know what you're doing.
-# `disable_new_netns` conflicts with `internetworking_model=bridged` and `internetworking_model=macvtap`. It works only
-# with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
+# `disable_new_netns` only works with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
 # (default: false)
 disable_new_netns = false
@@ -506,10 +542,28 @@ disable_new_netns = false
 # See: https://pkg.go.dev/github.com/kata-containers/kata-containers/src/runtime/virtcontainers#ContainerType
 sandbox_cgroup_only = @DEFSANDBOXCGROUPONLY_DB@
 
+# Specifies how Kubernetes emptyDir volumes are handled.
+# Options:
+#
+#   - shared-fs (default)
+#     Shares the emptyDir folder with the guest using the method given
+#     by the `shared_fs` setting.
+#
+#   - block-encrypted
+#     Plugs a block device to be encrypted in the guest.
+#
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
+#
+emptydir_mode = "@DEFEMPTYDIRMODE@"
+
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
 # Supported experimental features:
+# for example:
+#       experimental = ["force_guest_pull"]
+# which enables force_guest_pull mode in CoCo scenarios.
 # (default: [])
 experimental = @DEFAULTEXPFEATURES@
 

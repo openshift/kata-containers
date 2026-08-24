@@ -8,10 +8,14 @@ mod vcpu_impl;
 mod vcpu_manager;
 
 use dbs_arch::VpmuFeatureLevel;
+pub use vcpu_impl::VcpuState;
 pub use vcpu_manager::{VcpuManager, VcpuManagerError, VcpuResizeInfo};
 
 #[cfg(feature = "hotplug")]
 pub use vcpu_manager::VcpuResizeError;
+
+#[cfg(target_arch = "x86_64")]
+pub use vcpu_impl::{KVM_HC_MAP_GPA_RANGE, KVM_MAP_GPA_RANGE_ENCRYPTED};
 
 /// vcpu config collection
 pub struct VcpuConfig {

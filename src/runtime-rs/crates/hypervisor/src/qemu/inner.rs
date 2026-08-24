@@ -5,7 +5,6 @@
 
 use super::cmdline_generator::{get_network_device, QemuCmdLine};
 use super::qmp::Qmp;
-use crate::device::driver::BlockDeviceFormat;
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
@@ -18,14 +17,14 @@ use crate::{
 
 use crate::utils::{
     bytes_to_megs, create_dir_all_with_inherit_owner, enter_netns, get_jailer_root, megs_to_bytes,
-    set_groups, vm_cleanup,
+    set_groups, uses_native_ccw_bus, vm_cleanup,
 };
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::netns::NetnsGuard;
-use kata_types::build_path;
-use kata_types::config::hypervisor::{RootlessUser, VIRTIO_BLK_CCW};
+use kata_types::config::hypervisor::{RootlessUser, VIRTIO_BLK_CCW, VIRTIO_BLK_PCI};
+use kata_types::prefix_with_rootless_dir;
 use kata_types::rootless::is_rootless;
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
@@ -36,6 +35,8 @@ use persist::sandbox_persist::Persist;
 use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
 use std::convert::{TryFrom, TryInto};
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -99,7 +100,8 @@ impl QemuInner {
             }
         }
 
-        let vm_path = Path::new(build_path(KATA_PATH).as_str()).join(self.id.as_str());
+        let vm_path =
+            Path::new(prefix_with_rootless_dir(KATA_PATH).as_str()).join(self.id.as_str());
         create_dir_all_with_inherit_owner(vm_path, 0o750)?;
 
         Ok(())
@@ -108,6 +110,14 @@ impl QemuInner {
     pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
         info!(sl!(), "Starting QEMU VM");
         let netns = self.netns.clone().unwrap_or_default();
+
+        // Create the runtime directory (side-effect of get_jailer_root) before
+        // QemuCmdLine::new() binds qmp.sock inside it. With shared_fs=none,
+        // prepare_before_start_vm() never calls get_jailer_root(), so it must
+        // be done here explicitly. In rootless mode the path is under XDG_RUNTIME_DIR.
+        let jailer_root = self.get_jailer_root().await?;
+
+        check_bpf_enabled(self.config.security_info.seccomp_sandbox.as_deref());
 
         // CAUTION: since 'cmdline' contains file descriptors that have to stay
         // open until spawn() is called to launch qemu later in this function,
@@ -129,28 +139,58 @@ impl QemuInner {
                     let fd = vsock_dev.init_config().await?;
                     cmdline.add_vsock(fd, vsock_dev.config.guest_cid)?;
                 }
-                DeviceType::Block(block_dev) => {
-                    if block_dev.config.path_on_host == self.config.boot_info.initrd {
+                DeviceType::BlockModern(ref block_device) => {
+                    info!(sl!(), "Starting QMP hotplug for BlockModern device");
+
+                    // First, snapshot parameters within the lock.
+                    // Do not hold the lock across the 'await' point of the hotplug operation to avoid blocking.
+                    let (
+                        device_id,
+                        path_on_host,
+                        is_direct,
+                        is_readonly,
+                        discard_unmap,
+                        serial_override,
+                        driver_option,
+                    ) = {
+                        let device_locked = block_device.lock().await;
+                        let device_id = device_locked.device_id.clone();
+                        let cfg = &device_locked.config;
+                        (
+                            device_id,
+                            cfg.path_on_host.clone(),
+                            cfg.is_direct
+                                .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
+                            cfg.is_readonly,
+                            cfg.discard_unmap,
+                            cfg.serial_override.clone(),
+                            cfg.driver_option.clone(),
+                        )
+                    };
+                    if path_on_host == self.config.boot_info.initrd {
                         // If this block device represents initrd we ignore it here, it
                         // will be handled elsewhere by adding `-initrd` to the qemu
                         // command line.
                         continue;
                     }
-                    match block_dev.config.driver_option.as_str() {
-                        KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(
-                            &block_dev.config.path_on_host,
-                            block_dev.config.is_readonly,
-                        )?,
-                        KATA_CCW_DEV_TYPE | KATA_BLK_DEV_TYPE | KATA_SCSI_DEV_TYPE => cmdline
-                            .add_block_device(
-                                block_dev.device_id.as_str(),
-                                &block_dev.config.path_on_host,
-                                block_dev
-                                    .config
-                                    .is_direct
-                                    .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
-                                block_dev.config.driver_option.as_str() == KATA_SCSI_DEV_TYPE,
-                            )?,
+                    match driver_option.as_str() {
+                        KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(&path_on_host, is_readonly)?,
+                        KATA_CCW_DEV_TYPE | KATA_BLK_DEV_TYPE | KATA_SCSI_DEV_TYPE => {
+                            let serial = if serial_override.is_empty() {
+                                None
+                            } else {
+                                Some(serial_override.as_str())
+                            };
+                            cmdline.add_block_device(
+                                device_id.as_str(),
+                                &path_on_host,
+                                is_direct,
+                                is_readonly,
+                                driver_option.as_str() == KATA_SCSI_DEV_TYPE,
+                                discard_unmap,
+                                serial,
+                            )?
+                        }
                         unsupported => {
                             info!(sl!(), "unsupported block device driver: {}", unsupported)
                         }
@@ -163,6 +203,7 @@ impl QemuInner {
                     cmdline.add_network_device(
                         &network.config.host_dev_name,
                         network.config.guest_mac.clone().unwrap(),
+                        network.config.queue_num.max(1) as u32,
                     )?;
                 }
                 DeviceType::Protection(prot_dev) => match &prot_dev.config {
@@ -202,50 +243,123 @@ impl QemuInner {
                     }
                 }
                 DeviceType::VfioModern(vfio_dev) => {
-                    // To avoid holding the lock for too long, we first snapshot the necessary VFIO parameters,
-                    // then release the lock before doing the coldplug via cmdline,
-                    // and finally re-acquire the lock to update the guest PCI path after coldplug.
-                    let (devices, bus_port_id) = {
+                    // Snapshot parameters under the lock; release before doing cmdline work.
+                    let (device_type, ap_sysfs_path, devices, bus_port_id) = {
                         let vfio_device = vfio_dev.lock().await;
+                        let device_type = vfio_device.device.device_type.clone();
+                        let ap_sysfs_path =
+                            vfio_device.device.primary.sysfs_path.display().to_string();
+                        // Legacy path: take devices from the IOMMU group.
+                        // IOMMUFD path: iommu_group is None; fall back to
+                        // VfioDevice::devices which holds the single cdev device.
                         let devices = vfio_device
                             .device
                             .iommu_group
                             .as_ref()
-                            .map(|g| g.clone().devices)
-                            .unwrap_or_default();
-
-                        (devices, vfio_device.config.bus_port_id.clone())
+                            .map(|g| g.devices.clone())
+                            .unwrap_or_else(|| vfio_device.device.devices.clone());
+                        (
+                            device_type,
+                            ap_sysfs_path,
+                            devices,
+                            vfio_device.config.bus_port_id.clone(),
+                        )
                     };
 
-                    // Cold plug devices
-                    for dev in devices.iter() {
-                        let host_bdf = dev.addr.to_string();
+                    if device_type == VfioDeviceType::MediatedAp {
+                        // s390x VFIO-AP: -device vfio-ap,sysfsdev=<path>
+                        // No PCIe root port, no guest_pci_path.
+                        cmdline.add_vfio_ap_device(&ap_sysfs_path)?;
+                        info!(
+                            sl!(),
+                            "Completed VFIOModern AP coldplug for sysfsdev: {}", ap_sysfs_path
+                        );
+                    } else {
+                        // PCI cold plug devices
+                        for dev in devices.iter() {
+                            let host_bdf = dev.addr.to_string();
 
-                        let vfio_cfg = VfioDeviceConfig::new(
+                            let vfio_cfg = VfioDeviceConfig::new(
+                                host_bdf,
+                                bus_port_id.1 as u16,
+                                bus_port_id.1 + 1,
+                            )
+                            .with_vfio_bus(bus_port_id.0.clone());
+
+                            cmdline.add_pcie_vfio_device(vfio_cfg)?;
+                        }
+
+                        // Write back guest PCI path
+                        let pci_path =
+                            PciPath::try_from(format!("{:02x}/00", bus_port_id.1).as_str())?;
+                        {
+                            let mut vfio_device = vfio_dev.lock().await;
+                            vfio_device.config.guest_pci_path = Some(pci_path.clone());
+                        }
+                        info!(
+                            sl!(),
+                            "Completed VFIOModern coldplug with returned guest pci path: {:?}",
+                            pci_path
+                        );
+                    }
+                }
+                DeviceType::Vfio(vfio_dev) => {
+                    // Cold-plug physical-endpoint VFs (non-IOMMUFD VFIO) onto
+                    // pre-allocated PCIe root ports.  The bus assignment and
+                    // guest PCI path were computed by do_add_pcie_endpoint()
+                    // at device-registration time.
+                    //
+                    // We must emit BOTH:
+                    //   1. the pcie-root-port for vfio_dev.bus (e.g. "rp1")
+                    //   2. the vfio-pci device on that bus
+                    //
+                    // add_pcie_root_ports() skips allocated ports assuming
+                    // VfioModern already emitted them.  For regular Vfio
+                    // (physical endpoints) we have to emit the root port here.
+                    let port_index = vfio_dev
+                        .bus
+                        .strip_prefix("rp")
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+                    cmdline.add_physical_endpoint_root_port(&vfio_dev.bus, port_index);
+
+                    for hostdev in &vfio_dev.devices {
+                        let host_bdf = format!("{}:{}", hostdev.domain, hostdev.bus_slot_func);
+                        let (vendor_id, device_id) =
+                            hostdev
+                                .device_vendor_class
+                                .as_ref()
+                                .map_or((None, None), |dvc| {
+                                    let (dev, vendor) = dvc.get_device_vendor().unwrap_or((0, 0));
+                                    let v = if vendor != 0 {
+                                        Some(format!("0x{:04x}", vendor))
+                                    } else {
+                                        None
+                                    };
+                                    let d = if dev != 0 {
+                                        Some(format!("0x{:04x}", dev))
+                                    } else {
+                                        None
+                                    };
+                                    (v, d)
+                                });
+                        cmdline.add_physical_vfio_device(
+                            &host_bdf,
+                            &hostdev.hostdev_id,
+                            &vfio_dev.bus,
+                            vendor_id.as_deref(),
+                            device_id.as_deref(),
+                        );
+                        info!(
+                            sl!(),
+                            "cold-plug physical VFIO device: host={} id={} bus={} \
+                             guest_pci_path={:?}",
                             host_bdf,
-                            bus_port_id.1 as u16,
-                            bus_port_id.1 + 1,
-                        )
-                        .with_vfio_bus(bus_port_id.0.clone());
-
-                        cmdline.add_pcie_vfio_device(vfio_cfg)?;
+                            hostdev.hostdev_id,
+                            vfio_dev.bus,
+                            hostdev.guest_pci_path,
+                        );
                     }
-
-                    // Write back with lock
-                    let pci_path = PciPath::try_from(format!("{:02x}/00", bus_port_id.1).as_str())?;
-
-                    {
-                        let mut vfio_device = vfio_dev.lock().await;
-                        // Update the guest PCI path for the VFIO device after coldplug,
-                        // which will be used for device mapping into from Guest to Container Environment.
-                        vfio_device.config.guest_pci_path = Some(pci_path.clone());
-                    }
-
-                    info!(
-                        sl!(),
-                        "Completed VFIOModern coldplug with returned guest pci path: {:?}",
-                        pci_path
-                    );
                 }
                 _ => info!(sl!(), "qemu cmdline: unsupported device: {:?}", device),
             }
@@ -256,7 +370,7 @@ impl QemuInner {
         //cmdline.add_serial_console("/dev/pts/23");
 
         // Add a console to the devices of the cmdline
-        let console_socket_path = Path::new(&self.get_jailer_root().await?).join("console.sock");
+        let console_socket_path = Path::new(&jailer_root).join("console.sock");
         cmdline.add_console(console_socket_path.to_str().unwrap());
 
         info!(sl!(), "qemu args: {}", cmdline.build().await?.join(" "));
@@ -297,13 +411,8 @@ impl QemuInner {
                     }
                 }
                 if let Some(user) = &user {
-                    let groups = user.groups.clone();
-                    let gid = Gid::from_raw(user.gid);
-                    let uid = Uid::from_raw(user.uid);
-
-                    let _ = set_groups(&groups);
-                    let _ = setgid(gid).context("setgid failed");
-                    let _ = setuid(uid).context("setuid failed");
+                    set_process_credentials(user)
+                        .map_err(|err| io::Error::other(format!("{err:#}")))?;
                 }
 
                 Ok(())
@@ -329,6 +438,35 @@ impl QemuInner {
             Ok(mut qmp) => {
                 if let Some(subchannel) = cmdline.take_ccw_subchannel() {
                     qmp.set_ccw_subchannel(subchannel);
+                }
+                // Setup virtio-mem device if enabled.  It requires a memory
+                // hotplug region (maxmem) on the QEMU command line; that region
+                // is not reserved for every configuration (e.g. on s390x the
+                // shared memory-backend used with a virtio-blk-ccw rootfs zeroes
+                // maxmem/slots, and static resource management sizes the VM
+                // upfront).  Skip the setup in that case -- like other static
+                // sizing arches (e.g. arm64) the guest simply runs with its
+                // boot memory -- instead of failing VM start with
+                // "the configuration is not prepared for memory devices".
+                if self.config.memory_info.enable_virtio_mem {
+                    if cmdline.has_memory_hotplug_region() {
+                        qmp.setup_virtio_mem(
+                            self.config.memory_info.default_memory,
+                            self.config.memory_info.default_maxmemory,
+                            &self.config.machine_info.machine_type,
+                            self.config.shared_fs.shared_fs.as_deref(),
+                        )
+                        .context("Failed to setup virtio-mem during VM initialization")?;
+                    } else {
+                        info!(
+                            sl!(),
+                            "virtio-mem enabled but no memory hotplug region (maxmem) was reserved; skipping virtio-mem setup"
+                        );
+                    }
+                }
+                let bridge_count = self.config.device_info.default_bridges;
+                if bridge_count > 0 {
+                    qmp.init_pci_bridges(bridge_count);
                 }
                 self.qmp = Some(qmp);
             }
@@ -562,7 +700,11 @@ impl QemuInner {
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
         info!(sl!(), "QemuInner::cleanup()");
-        let vm_path = [build_path(KATA_PATH).as_str(), self.id.as_str()].join("/");
+        let vm_path = [
+            prefix_with_rootless_dir(KATA_PATH).as_str(),
+            self.id.as_str(),
+        ]
+        .join("/");
         vm_cleanup(&self.config, vm_path.as_str())
     }
 
@@ -632,11 +774,16 @@ impl QemuInner {
         let flags = if self.hypervisor_config().security_info.confidential_guest
             || self.hypervisor_config().shared_fs.shared_fs.is_none()
         {
-            CapabilityBits::BlockDeviceSupport | CapabilityBits::BlockDeviceHotplugSupport
+            CapabilityBits::BlockDeviceSupport
+                | CapabilityBits::BlockDeviceHotplugSupport
+                | CapabilityBits::BlockDeviceDiscardSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         } else {
             CapabilityBits::BlockDeviceSupport
                 | CapabilityBits::BlockDeviceHotplugSupport
+                | CapabilityBits::BlockDeviceDiscardSupport
                 | CapabilityBits::FsSharingSupport
+                | CapabilityBits::NetworkDeviceHotplugSupport
         };
         caps.set(flags);
 
@@ -809,6 +956,80 @@ impl QemuInner {
     }
 }
 
+const BPF_JIT_ENABLE_PATH: &str = "/proc/sys/net/core/bpf_jit_enable";
+
+fn check_bpf_enabled(seccomp_sandbox: Option<&str>) {
+    check_bpf_enabled_with(
+        seccomp_sandbox,
+        || fs::read_to_string(BPF_JIT_ENABLE_PATH),
+        |message| warn!(sl!(), "{}", message),
+    );
+}
+
+fn check_bpf_enabled_with<ReadStatus, LogWarning>(
+    seccomp_sandbox: Option<&str>,
+    read_status: ReadStatus,
+    mut log_warning: LogWarning,
+) where
+    ReadStatus: FnOnce() -> io::Result<String>,
+    LogWarning: FnMut(String),
+{
+    if seccomp_sandbox.unwrap_or_default().is_empty() {
+        return;
+    }
+
+    let status = match read_status() {
+        Ok(status) => status,
+        Err(err) => {
+            log_warning(format!("failed to get bpf_jit_enable status: {err}"));
+            return;
+        }
+    };
+
+    let enabled = match status.trim().parse::<i32>() {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            log_warning(format!(
+                "failed to convert bpf_jit_enable status to integer: {err}"
+            ));
+            return;
+        }
+    };
+
+    if enabled == 0 {
+        log_warning(
+            "bpf_jit_enable is disabled. It's recommended to turn on bpf_jit_enable to reduce the performance impact of QEMU seccomp sandbox."
+                .to_string(),
+        );
+    }
+}
+
+fn set_process_credentials(user: &RootlessUser) -> Result<()> {
+    set_process_credentials_with(
+        user,
+        set_groups,
+        |gid| setgid(Gid::from_raw(gid)).map_err(anyhow::Error::from),
+        |uid| setuid(Uid::from_raw(uid)).map_err(anyhow::Error::from),
+    )
+}
+
+fn set_process_credentials_with<SetGroups, SetGid, SetUid>(
+    user: &RootlessUser,
+    set_groups_fn: SetGroups,
+    set_gid_fn: SetGid,
+    set_uid_fn: SetUid,
+) -> Result<()>
+where
+    SetGroups: Fn(&[u32]) -> Result<()>,
+    SetGid: Fn(u32) -> Result<()>,
+    SetUid: Fn(u32) -> Result<()>,
+{
+    set_groups_fn(&user.groups).context("setgroups failed")?;
+    set_gid_fn(user.gid).context("setgid failed")?;
+    set_uid_fn(user.uid).context("setuid failed")?;
+    Ok(())
+}
+
 async fn log_qemu_console(console: UnixStream) -> Result<()> {
     info!(sl!(), "starting reading qemu console");
 
@@ -849,6 +1070,7 @@ async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> 
 }
 
 use crate::device::DeviceType;
+use crate::vfio_device::VfioDeviceType;
 
 // device manager part of Hypervisor
 impl QemuInner {
@@ -867,10 +1089,50 @@ impl QemuInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         info!(sl!(), "QemuInner::remove_device() {} ", device);
-        Err(anyhow!(
-            "QemuInner::remove_device({}): Not yet implemented",
-            device
-        ))
+        self.hotunplug_device(&device).await?;
+
+        self.devices.retain(|d| match (d, &device) {
+            (DeviceType::BlockModern(a), DeviceType::BlockModern(b)) => {
+                !std::sync::Arc::ptr_eq(a, b)
+            }
+            _ => true,
+        });
+
+        Ok(())
+    }
+
+    async fn hotunplug_device(&mut self, device: &DeviceType) -> Result<()> {
+        let qmp = match self.qmp {
+            Some(ref mut qmp) => qmp,
+            None => return Err(anyhow!("QMP not initialized")),
+        };
+
+        match device {
+            DeviceType::BlockModern(ref block_device) => {
+                let (index, driver) = {
+                    let cfg = &block_device.lock().await.config;
+                    (
+                        cfg.index,
+                        self.config.blockdev_info.block_device_driver.clone(),
+                    )
+                };
+                qmp.hotunplug_block_device(&driver, index)
+                    .context("hotunplug block device")?;
+            }
+            DeviceType::Network(_)
+            | DeviceType::Vfio(_)
+            | DeviceType::VfioModern(_)
+            | DeviceType::VhostUserBlk(_)
+            | DeviceType::VhostUserNetwork(_)
+            | DeviceType::ShareFs(_)
+            | DeviceType::HybridVsock(_)
+            | DeviceType::Vsock(_)
+            | DeviceType::Protection(_)
+            | DeviceType::PortDevice(_) => {
+                return Err(anyhow!("hotunplug for {} is currently unsupported", device));
+            }
+        }
+        Ok(())
     }
 
     async fn hotplug_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -880,49 +1142,30 @@ impl QemuInner {
         };
 
         match device {
-            DeviceType::Network(ref network_device) => {
+            DeviceType::Network(mut network_device) => {
                 let (netdev, virtio_net_device) = get_network_device(
                     &self.config,
                     &network_device.config.host_dev_name,
                     network_device.config.guest_mac.clone().unwrap(),
                     &mut None,
+                    network_device.config.queue_num.max(1) as u32,
                 )?;
-                qmp.hotplug_network_device(&netdev, &virtio_net_device)?
-            }
-            DeviceType::Block(mut block_device) => {
-                let block_driver = &self.config.blockdev_info.block_device_driver;
-                let (pci_path, addr_str) = qmp
-                    .hotplug_block_device(
-                        block_driver,
-                        block_device.config.index,
-                        &block_device.config.path_on_host,
-                        &block_device.config.blkdev_aio.to_string(),
-                        Some(
-                            block_device
-                                .config
-                                .is_direct
-                                .unwrap_or(self.config.blockdev_info.block_device_cache_direct),
-                        ),
-                        block_device.config.is_readonly,
-                        block_device.config.no_drop,
-                        block_device.config.logical_sector_size,
-                        block_device.config.physical_sector_size,
-                        &block_device.config.format,
-                    )
-                    .context("hotplug block device")?;
+                qmp.hotplug_network_device(&netdev, &virtio_net_device)?;
 
-                if pci_path.is_some() {
-                    block_device.config.pci_path = pci_path;
-                }
-                if let Some(addr) = addr_str {
-                    if block_driver == VIRTIO_BLK_CCW {
-                        block_device.config.ccw_addr = Some(addr);
-                    } else {
-                        block_device.config.scsi_addr = Some(addr);
-                    }
+                // On s390x the NIC is plugged onto the virtual channel subsystem
+                // (virtio-net-ccw) and has no PCI address, so the PCI-path lookup
+                // below does not apply.  The agent matches the CCW interface via
+                // its uevent instead; forcing a PCI-path resolution here would
+                // fail and abort the whole NIC attach (breaking guest networking).
+                if !uses_native_ccw_bus() {
+                    let frontend_id = format!("frontend-{}", virtio_net_device.get_netdev_id());
+                    let pci_path = qmp
+                        .get_device_by_qdev_id(&frontend_id)
+                        .context("get network device pci path")?;
+                    network_device.config.pci_path = Some(pci_path);
                 }
 
-                return Ok(DeviceType::Block(block_device));
+                return Ok(DeviceType::Network(network_device));
             }
             DeviceType::Vfio(mut vfiodev) => {
                 // FIXME: the first one might not the true device we want to passthrough.
@@ -956,6 +1199,8 @@ impl QemuInner {
                     is_direct,
                     is_readonly,
                     no_drop,
+                    block_format,
+                    discard_unmap,
                     driver,
                     logical_sector_size,
                     physical_sector_size,
@@ -971,10 +1216,28 @@ impl QemuInner {
                         ),
                         cfg.is_readonly,
                         cfg.no_drop,
+                        cfg.format.clone(),
+                        cfg.discard_unmap,
                         self.config.blockdev_info.block_device_driver.clone(),
                         cfg.logical_sector_size,
                         cfg.physical_sector_size,
                     )
+                };
+
+                // Determine iothread for hotplugged virtio-blk-pci devices.
+                // Only attach iothread when:
+                // 1. enable_iothreads is true
+                // 2. indep_iothreads > 0
+                // 3. block driver is virtio-blk-pci
+                // 4. TODO: for more complex cases
+                let iothread = if self.config.enable_iothreads
+                    && self.config.indep_iothreads > 0
+                    && driver == VIRTIO_BLK_PCI
+                {
+                    // Use the first independent iothread (indep_iothread_0)
+                    Some("indep_iothread_0")
+                } else {
+                    None
                 };
 
                 // Second, execute the asynchronous hotplug without holding the lock.
@@ -987,9 +1250,11 @@ impl QemuInner {
                         is_direct,
                         is_readonly,
                         no_drop,
+                        discard_unmap,
                         logical_sector_size,
                         physical_sector_size,
-                        &BlockDeviceFormat::default(),
+                        &block_format,
+                        iothread,
                     )
                     .context("hotplug block device")?;
 
@@ -1009,40 +1274,53 @@ impl QemuInner {
                     }
                     info!(sl!(), "Completed BlockModern hotplug: {:?}", &cfg);
                 }
+                return Ok(DeviceType::BlockModern(block_device.clone()));
             }
             DeviceType::VfioModern(ref vfiodev) => {
                 // Snapshot VFIO parameters inside the lock.
-                let (hostdev_id, sysfs_path, address, driver_type, bus) = {
+                let (hostdev_id, device_type, sysfs_path, address, driver_type, bus) = {
                     let vfio_device = vfiodev.lock().await;
                     let hostdev_id = vfio_device.device_id.clone();
                     let device = &vfio_device.device;
+                    let device_type = device.device_type.clone();
 
-                    // FIXME: The first device in the group might not be the actual device intended for passthrough.
-                    // Multi-function support is tracked via issue #11292.
-                    let primary_device = device
-                        .clone()
-                        .iommu_group
-                        .ok_or_else(|| anyhow!("IOMMU group missing for VFIO device"))?
-                        .primary;
+                    let sysfs_path = device.primary.sysfs_path.display().to_string();
 
-                    info!(
-                        sl!(),
-                        "QMP hotplug VFIO primary_device address: {:?}", &primary_device.addr
-                    );
+                    // For AP devices there is no IOMMU group or BDF; use empty strings.
+                    let (address, driver_type, bus) = if device_type == VfioDeviceType::MediatedAp {
+                        (String::new(), "vfio-ap".to_string(), String::new())
+                    } else {
+                        // Legacy path: primary comes from the IOMMU group.
+                        // IOMMUFD path: iommu_group is None; use VfioDevice::primary
+                        // which is the single device returned by discover_vfio_device.
+                        // FIXME: multi-function group support tracked in #11292.
+                        let primary_device = device
+                            .iommu_group
+                            .as_ref()
+                            .map(|g| g.primary.clone())
+                            .unwrap_or_else(|| device.primary.clone());
 
-                    let sysfs_path = primary_device.sysfs_path.display().to_string();
-                    let driver_type = primary_device
-                        .driver
-                        .clone()
-                        .ok_or_else(|| anyhow!("Driver type missing for primary device"))?;
-                    let address = format!("{}", primary_device.addr);
+                        info!(
+                            sl!(),
+                            "QMP hotplug VFIO primary_device address: {:?}", &primary_device.addr
+                        );
+
+                        let driver_type = primary_device
+                            .driver
+                            .clone()
+                            .ok_or_else(|| anyhow!("Driver type missing for primary device"))?;
+                        let address = format!("{}", primary_device.addr);
+                        let bus = vfio_device.config.bus_port_id.0.clone();
+                        (address, driver_type, bus)
+                    };
 
                     (
                         hostdev_id,
+                        device_type,
                         sysfs_path,
                         address,
                         driver_type,
-                        vfio_device.config.bus_port_id.0.clone(),
+                        bus,
                     )
                 };
 
@@ -1055,12 +1333,13 @@ impl QemuInner {
                     &bus,
                 )?;
 
-                // Write the resulting Guest PCI Path back within the lock.
+                // Write the resulting Guest PCI Path back within the lock (PCI only).
                 {
                     let mut vfio_device = vfiodev.lock().await;
-                    if let Some(p) = guest_pci_path {
-                        // Very important to write back the guest pci path for VFIO devices.
-                        vfio_device.config.guest_pci_path = Some(p);
+                    if device_type != VfioDeviceType::MediatedAp {
+                        if let Some(p) = guest_pci_path {
+                            vfio_device.config.guest_pci_path = Some(p);
+                        }
                     }
                     info!(
                         sl!(),
@@ -1094,6 +1373,20 @@ impl QemuInner {
 
         Ok(())
     }
+
+    /// Resolve the in-guest PCIe path for a cold-plugged physical-endpoint VF
+    /// via QMP query-pci. Must be called after the VM has started and QMP is
+    /// initialised. This is the runtime-rs pair of the Go runtime's
+    /// `ResolveColdPlugVFIOGuestPciPaths` / `qomGetPciPath` call.
+    pub(crate) fn resolve_vfio_device_pci_path(&mut self, hostdev_id: &str) -> Result<PciPath> {
+        let qmp = self.qmp.as_mut().ok_or_else(|| {
+            anyhow!(
+                "QMP not initialised; cannot resolve PCI path for {}",
+                hostdev_id
+            )
+        })?;
+        qmp.get_device_by_qdev_id(hostdev_id)
+    }
 }
 
 #[async_trait]
@@ -1123,5 +1416,186 @@ impl Persist for QemuInner {
 
             exit_notify: Some(exit_notify),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+    use rstest::rstest;
+
+    #[tokio::test]
+    async fn test_network_device_hotplug_capability() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        assert!(qemu
+            .capabilities()
+            .await
+            .unwrap()
+            .is_network_device_hotplug_supported());
+    }
+
+    #[rstest]
+    #[case::seccomp_sandbox_unset(None, Err(io::ErrorKind::NotFound), false, None)]
+    #[case::seccomp_sandbox_empty(Some(""), Err(io::ErrorKind::NotFound), false, None)]
+    #[case::read_failure(
+        Some("on"),
+        Err(io::ErrorKind::NotFound),
+        true,
+        Some("failed to get bpf_jit_enable status")
+    )]
+    #[case::parse_failure(
+        Some("on"),
+        Ok("invalid"),
+        true,
+        Some("failed to convert bpf_jit_enable status to integer")
+    )]
+    #[case::disabled(Some("on"), Ok("0\n"), true, Some("bpf_jit_enable is disabled"))]
+    #[case::enabled(Some("on"), Ok("1\n"), true, None)]
+    fn test_bpf_jit_check_warnings(
+        #[case] seccomp_sandbox: Option<&str>,
+        #[case] read_result: Result<&str, io::ErrorKind>,
+        #[case] expect_read: bool,
+        #[case] expected_warning: Option<&str>,
+    ) {
+        let read_called = Cell::new(false);
+        let warnings = RefCell::new(Vec::new());
+        check_bpf_enabled_with(
+            seccomp_sandbox,
+            || {
+                read_called.set(true);
+                read_result
+                    .map(str::to_owned)
+                    .map_err(|kind| io::Error::new(kind, "injected"))
+            },
+            |warning| warnings.borrow_mut().push(warning),
+        );
+
+        assert_eq!(read_called.get(), expect_read);
+
+        let warnings = warnings.borrow();
+        match expected_warning {
+            Some(expected) => {
+                assert_eq!(warnings.len(), 1);
+                assert!(warnings[0].contains(expected));
+            }
+            None => assert!(warnings.is_empty()),
+        }
+    }
+
+    // The Set* prefix mirrors the setgroups/setgid/setuid syscalls these
+    // variants stand for, so keep it despite clippy::enum_variant_names.
+    #[derive(Debug, PartialEq)]
+    #[allow(clippy::enum_variant_names)]
+    enum CredentialOperation {
+        SetGroups(Vec<u32>),
+        SetGid(u32),
+        SetUid(u32),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    #[allow(clippy::enum_variant_names)]
+    enum CredentialStep {
+        SetGroups,
+        SetGid,
+        SetUid,
+    }
+
+    fn rootless_user() -> RootlessUser {
+        RootlessUser {
+            uid: 1001,
+            gid: 1002,
+            groups: vec![1003, 1004],
+            user_name: "kata-test".to_string(),
+        }
+    }
+
+    #[rstest]
+    #[case::with_supplementary_groups(vec![1003, 1004])]
+    #[case::without_supplementary_groups(Vec::new())]
+    fn test_set_process_credentials_order(#[case] groups: Vec<u32>) {
+        let operations = RefCell::new(Vec::new());
+        let mut user = rootless_user();
+        user.groups = groups.clone();
+
+        set_process_credentials_with(
+            &user,
+            |groups| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetGroups(groups.to_vec()));
+                Ok(())
+            },
+            |gid| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetGid(gid));
+                Ok(())
+            },
+            |uid| {
+                operations
+                    .borrow_mut()
+                    .push(CredentialOperation::SetUid(uid));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *operations.borrow(),
+            vec![
+                // Calling setgroups with an empty list clears any inherited
+                // supplementary groups and must not be skipped.
+                CredentialOperation::SetGroups(groups),
+                CredentialOperation::SetGid(1002),
+                CredentialOperation::SetUid(1001),
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::setgroups(CredentialStep::SetGroups, "setgroups failed", 1)]
+    #[case::setgid(CredentialStep::SetGid, "setgid failed", 2)]
+    #[case::setuid(CredentialStep::SetUid, "setuid failed", 3)]
+    fn test_set_process_credentials_stops_on_error(
+        #[case] failed_step: CredentialStep,
+        #[case] expected_error: &str,
+        #[case] expected_calls: usize,
+    ) {
+        let calls = Cell::new(0);
+        let result = set_process_credentials_with(
+            &rootless_user(),
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetGroups {
+                    Err(anyhow!("injected setgroups failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetGid {
+                    Err(anyhow!("injected setgid failure"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                if failed_step == CredentialStep::SetUid {
+                    Err(anyhow!("injected setuid failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        let error = result.expect_err("credential failure must abort setup");
+        assert!(format!("{error:#}").contains(expected_error));
+        assert_eq!(calls.get(), expected_calls);
     }
 }

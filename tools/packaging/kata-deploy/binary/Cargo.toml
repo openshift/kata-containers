@@ -14,6 +14,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 env_logger = "0.10"
+flate2 = "1"
+humantime = "2.1.0"
 k8s-openapi = { version = "0.26", default-features = false, features = [
     "v1_33",
 ] }
@@ -24,16 +26,20 @@ k8s-openapi = { version = "0.26", default-features = false, features = [
 # `ring` matches kube's own default crypto provider for rustls 0.23+ and
 # must stay enabled — without it, rustls panics at runtime with
 # "Could not automatically determine the process-level CryptoProvider".
+json-patch = "4"
 kube = { version = "2.0", default-features = false, features = [
     "client",
+    "jsonpatch",
     "rustls-tls",
     "ring",
 ] }
 libc.workspace = true
 log.workspace = true
 regex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
+tar = "0.4.46"
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
@@ -45,6 +51,10 @@ tokio = { workspace = true, features = [
 ] }
 toml_edit = "0.22"
 walkdir = "2"
+zstd = "0.13.3"
+# We speak D-Bus to systemd ourselves (see src/utils/dbus.rs) and only need the
+# wire format, not a D-Bus library.
+zvariant = "5"
 
 [dev-dependencies]
 rstest.workspace = true

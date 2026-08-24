@@ -6,6 +6,7 @@
 use protobuf::MessageField;
 
 use crate::cgroups::Manager as CgroupManager;
+use crate::cgroups_rs as cgroups;
 use crate::protocols::agent::{BlkioStats, CgroupStats, CpuStats, MemoryStats, PidsStats};
 use anyhow::Result;
 use cgroups::freezer::FreezerState;
@@ -51,7 +52,7 @@ impl CgroupManager for Manager {
         Ok(())
     }
 
-    fn destroy(&mut self) -> Result<()> {
+    fn destroy(&self) -> Result<()> {
         Ok(())
     }
 

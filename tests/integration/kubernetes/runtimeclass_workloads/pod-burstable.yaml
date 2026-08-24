@@ -9,12 +9,12 @@ metadata:
   name: burstable-test
 spec:
   runtimeClassName: kata
+  securityContext:
+    supplementalGroups: [10]
   containers:
   - name: qos-burstable
     image: quay.io/prometheus/busybox:latest
     command: ["/bin/sh", "-c", "tail -f /dev/null"]
     resources:
       limits:
-        memory: "200Mi"
-      requests:
-        memory: "100Mi"
+        memory: "800Mi"

@@ -1,58 +1,37 @@
-{{- if and .Values.customRuntimes.enabled .Values.customRuntimes.runtimes }}
+{{- $hasCustomRuntimes := and .Values.customRuntimes.enabled .Values.customRuntimes.runtimes -}}
+{{- if eq (include "kata-deploy.hasCustomConfigsConfigMap" . | trim) "true" }}
 ---
-# ConfigMap containing custom runtime configurations and drop-in files
+# ConfigMap containing custom runtime configuration and runtime drop-ins
 # This is mounted into the kata-deploy pod at /custom-configs/
-apiVersion: v1
-kind: ConfigMap
-metadata:
-{{- if .Values.env.multiInstallSuffix }}
-  name: {{ .Chart.Name }}-custom-configs-{{ .Values.env.multiInstallSuffix }}
-{{- else }}
-  name: {{ .Chart.Name }}-custom-configs
-{{- end }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "kata-deploy.labels" . | nindent 4 }}
-data:
-  # Format: handler:baseConfig:containerd_snapshotter:crio_pulltype
-  custom-runtimes.list: |
-{{- range $name, $runtime := .Values.customRuntimes.runtimes }}
-{{- $handler := "" }}
-{{- /* Extract handler from runtimeClass YAML */ -}}
-{{- if $runtime.runtimeClass }}
-{{- range (splitList "\n" $runtime.runtimeClass) }}
-{{- $line := trim . }}
-{{- if hasPrefix "handler:" $line }}
-{{- $handler = trim (trimPrefix "handler:" $line) }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- if $handler }}
-    {{ $handler }}:{{ $runtime.baseConfig }}:{{ dig "containerd" "snapshotter" "" $runtime }}:{{ dig "crio" "pullType" "" $runtime }}
-{{- end }}
-{{- end }}
-{{- /* Generate drop-in files for each runtime */ -}}
-{{- range $name, $runtime := .Values.customRuntimes.runtimes }}
-{{- $handler := "" }}
-{{- if $runtime.runtimeClass }}
-{{- range (splitList "\n" $runtime.runtimeClass) }}
-{{- $line := trim . }}
-{{- if hasPrefix "handler:" $line }}
-{{- $handler = trim (trimPrefix "handler:" $line) }}
-{{- end }}
-{{- end }}
-{{- end }}
-{{- if and $handler $runtime.dropIn }}
-  dropin-{{ $handler }}.toml: |
-{{ $runtime.dropIn | indent 4 }}
-{{- end }}
-{{- end }}
+{{ include "kata-deploy.customConfigsConfigMap" . }}
+{{- if $hasCustomRuntimes }}
 ---
 # RuntimeClasses for custom runtimes
+{{- $runtimeClassConfigs := fromYaml (include "kata-deploy.runtimeClassConfigs" .) | default dict }}
 {{- range $name, $runtime := .Values.customRuntimes.runtimes }}
 {{- if $runtime.runtimeClass }}
-{{ $runtime.runtimeClass }}
+{{- $runtimeClassObj := fromYaml $runtime.runtimeClass | default dict }}
+{{- $inheritBaseOverhead := true }}
+{{- if hasKey $runtime "inheritBaseOverhead" }}
+{{- $inheritBaseOverhead = $runtime.inheritBaseOverhead }}
+{{- end }}
+{{- if and $inheritBaseOverhead (hasKey $runtimeClassConfigs (default "" $runtime.baseConfig)) }}
+{{- $defaultOverhead := deepCopy (index $runtimeClassConfigs $runtime.baseConfig) }}
+{{- $runtimeOverhead := dig "overhead" "podFixed" (dict) $runtimeClassObj }}
+{{- $_ := set $runtimeClassObj "overhead" (dict "podFixed" (mergeOverwrite $defaultOverhead $runtimeOverhead)) }}
+{{- end }}
+{{- /* Custom RuntimeClasses need the same gate as the built-in ones, or they would
+       keep scheduling onto a node this install is being removed from, on the
+       strength of a label another install holds. */}}
+{{- with include "kata-deploy.instanceMarkerLabel" $ }}
+{{- $scheduling := dig "scheduling" (dict) $runtimeClassObj }}
+{{- $selector := dig "nodeSelector" (dict) $scheduling }}
+{{- $_ := set $selector . "true" }}
+{{- $_ := set $runtimeClassObj "scheduling" (merge (dict "nodeSelector" $selector) $scheduling) }}
+{{- end }}
+{{ toYaml $runtimeClassObj }}
 ---
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

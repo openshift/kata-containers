@@ -46,6 +46,13 @@ For a quick evaluation, you can check out [this how to](../how-to/how-to-set-pro
 
 ### Kata monitor
 
+Starting with Kata Containers 3.32.0, the `kata-monitor` binary is also published as a standalone, multi-arch container image alongside every release:
+
+- Released image: `quay.io/kata-containers/kata-monitor:<release-version>` (mirrored to `ghcr.io/kata-containers/kata-monitor`). The `latest` tag always points at the most recent release.
+- Testing image (tracking `main`): `quay.io/kata-containers/kata-monitor-ci:latest` (mirrored to `ghcr.io/kata-containers/kata-monitor-ci`).
+
+See the [how-to on running `kata-monitor` in a Kubernetes cluster](../how-to/how-to-set-prometheus-in-k8s.md) for a complete deployment example.
+
 The `kata-monitor` management agent should be started on each node where the Kata containers runtime is installed. `kata-monitor` will:
 
 > **Note**: a *node* running Kata containers will be either a single host system or a worker node belonging to a K8s cluster capable of running Kata pods.
@@ -58,7 +65,12 @@ Only one `kata-monitor` process runs in each node.
 
 `kata-monitor` uses a different communication channel than the one used by the container engine (`containerd`/`CRI-O`) to communicate with the Kata shim. The Kata shim exposes a dedicated socket address reserved to `kata-monitor`.
 
-The shim's metrics socket file is created under the virtcontainers sandboxes directory, i.e. `vc/sbs/${PODID}/shim-monitor.sock`.
+The shim's metrics socket file is created under the sandboxes directory for the active runtime:
+
+- Go runtime: `/run/vc/sbs/${PODID}/shim-monitor.sock`
+- runtime-rs: `/run/kata/${PODID}/shim-monitor.sock`
+
+`kata-monitor` watches **both** paths so it can collect metrics from either runtime (or both on the same node) without a runtime-type selection flag.
 
 > **Note**: If there is no Prometheus server configured, i.e., there are no scrape operations, `kata-monitor` will not collect any metrics.
 

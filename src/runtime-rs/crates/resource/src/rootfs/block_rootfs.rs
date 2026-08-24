@@ -5,7 +5,10 @@
 //
 
 use super::{Rootfs, ROOTFS};
-use crate::share_fs::{do_get_guest_path, do_get_host_path};
+use crate::{
+    block_device::agent_storage_source_from_block_config,
+    share_fs::{do_get_guest_path, do_get_host_path},
+};
 use agent::Storage;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -14,11 +17,9 @@ use hypervisor::{
         device_manager::{do_handle_device, get_block_device_info, DeviceManager},
         DeviceConfig, DeviceType,
     },
-    BlockConfig, BlockDeviceAio,
+    BlockConfigModern, BlockDeviceAio,
 };
-use kata_types::config::hypervisor::{
-    VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO, VIRTIO_BLK_PCI, VIRTIO_PMEM, VIRTIO_SCSI,
-};
+use kata_types::config::hypervisor::VIRTIO_PMEM;
 use kata_types::fs::VM_ROOTFS_FILESYSTEM_XFS;
 use kata_types::mount::Mount;
 use nix::sys::stat::{self, SFlag};
@@ -52,19 +53,26 @@ impl BlockRootfs {
 
         let blkdev_info = get_block_device_info(d).await;
         let block_driver = blkdev_info.block_device_driver.clone();
-        let block_device_config = &mut BlockConfig {
+        let block_device_config = &mut BlockConfigModern {
             major: stat::major(dev_id) as i64,
             minor: stat::minor(dev_id) as i64,
             driver_option: block_driver.clone(),
             path_on_host: rootfs.source.clone(),
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
+            num_queues: blkdev_info.num_queues,
+            queue_size: blkdev_info.queue_size,
+            logical_sector_size: blkdev_info.block_device_logical_sector_size,
+            physical_sector_size: blkdev_info.block_device_physical_sector_size,
             ..Default::default()
         };
 
         // create and insert block device into Kata VM
-        let device_info = do_handle_device(d, &DeviceConfig::BlockCfg(block_device_config.clone()))
-            .await
-            .context("do handle device failed.")?;
+        let device_info = do_handle_device(
+            d,
+            &DeviceConfig::BlockCfgModern(block_device_config.clone()),
+        )
+        .await
+        .context("do handle device failed.")?;
 
         let mut storage = Storage {
             fs_type: rootfs.fs_type.clone(),
@@ -84,38 +92,18 @@ impl BlockRootfs {
         }
 
         let mut device_id: String = "".to_owned();
-        if let DeviceType::Block(device) = device_info {
-            storage.driver = device.config.driver_option;
-            device_id = device.device_id;
-
-            match block_driver.as_str() {
-                VIRTIO_BLK_PCI => {
-                    storage.source = device
-                        .config
-                        .pci_path
-                        .ok_or("PCI path missing for pci block device")
-                        .map_err(|e| anyhow!(e))?
-                        .to_string();
-                }
-                VIRTIO_BLK_MMIO => {
-                    storage.source = device.config.virt_path;
-                }
-                VIRTIO_BLK_CCW => {
-                    storage.source = device
-                        .config
-                        .ccw_addr
-                        .ok_or_else(|| anyhow!("CCW address missing for ccw block device"))?;
-                }
-                VIRTIO_SCSI | VIRTIO_PMEM => {
-                    return Err(anyhow!(
-                        "Complete support for block driver {} has not been implemented yet",
-                        block_driver
-                    ));
-                }
-                _ => {
-                    return Err(anyhow!("Unknown block driver : {}", block_driver));
-                }
+        if let DeviceType::BlockModern(device_mod) = device_info {
+            let device = device_mod.lock().await.clone();
+            if block_driver == VIRTIO_PMEM {
+                return Err(anyhow!(
+                    "Complete support for block driver {} has not been implemented yet",
+                    block_driver
+                ));
             }
+
+            storage.driver = device.config.driver_option.clone();
+            storage.source = agent_storage_source_from_block_config(&device.config)?;
+            device_id = device.device_id;
         }
 
         Ok(Self {

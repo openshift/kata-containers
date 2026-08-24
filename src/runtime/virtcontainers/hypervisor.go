@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/pkg/errors"
 
@@ -463,6 +464,22 @@ type Param struct {
 	Value string
 }
 
+// GuestExtensionImage represents an additional block device image to attach to the VM
+// (e.g. CoCo extension, GPU extension).
+type GuestExtensionImage struct {
+	// Name is a short identifier for this extension (e.g. "coco", "gpu").
+	// Used as the virtio-blk serial so the guest can discover the device
+	// via /dev/disk/by-id/virtio-extension-<name> and match verity params
+	// from kernel cmdline kata.extension.<name>.verity_params=...
+	Name string
+
+	// Path is the host path to the extension image file.
+	Path string
+
+	// VerityParams contains dm-verity parameters for this extension image.
+	VerityParams string
+}
+
 // HypervisorConfig is the hypervisor configuration.
 // nolint: govet
 type HypervisorConfig struct {
@@ -484,6 +501,9 @@ type HypervisorConfig struct {
 	// InitrdPath is the guest initrd image host path.
 	// ImagePath and InitrdPath cannot be set at the same time.
 	InitrdPath string
+
+	// GuestExtensionImages lists additional block device images to attach to the VM.
+	GuestExtensionImages []GuestExtensionImage
 
 	// RootfsType is filesystem type of rootfs.
 	RootfsType string
@@ -540,9 +560,6 @@ type HypervisorConfig struct {
 	// VirtioFSCache cache mode for fs version cache
 	VirtioFSCache string
 
-	// File based memory backend root directory
-	FileBackedMemRootDir string
-
 	// VhostUserStorePath is the directory path where vhost-user devices
 	// related folders, sockets and device nodes should be.
 	VhostUserStorePath string
@@ -587,9 +604,6 @@ type HypervisorConfig struct {
 
 	// Enable annotations by name
 	EnableAnnotations []string
-
-	// FileBackedMemRootList is the list of valid root directories values for annotations
-	FileBackedMemRootList []string
 
 	// PFlash image paths
 	PFlash []string
@@ -802,6 +816,15 @@ type HypervisorConfig struct {
 
 	// GuestNUMANodes defines guest NUMA topology and mapping to host NUMA nodes and CPUs.
 	GuestNUMANodes []types.GuestNUMANode
+
+	// NUMAMapping is the raw user-provided NUMA mapping (TOML
+	// `numa_mapping` or the io.katacontainers.config.hypervisor.numa_mapping
+	// annotation). When empty, GuestNUMANodes was auto-derived from the
+	// host topology and may be right-sized at sandbox creation (e.g.
+	// collapsed to a single host node when the sandbox fits, or
+	// restricted to host nodes containing attached VFIO devices). When
+	// non-empty, the topology is honored verbatim.
+	NUMAMapping []string
 
 	// DisableNestingChecks is used to override customizations performed
 	// when running on top of another VMM.
@@ -1230,6 +1253,20 @@ func GetHypervisorPid(h Hypervisor) int {
 	return pids[0]
 }
 
+// IsHypervisorRunning reports whether the hypervisor process backing the
+// sandbox is still alive.  It is best-effort: a missing pidfile or a pid that
+// no longer maps to a live process is treated as "not running".
+func IsHypervisorRunning(h Hypervisor) bool {
+	pid := GetHypervisorPid(h)
+	if pid <= 0 {
+		return false
+	}
+	// Signal 0 performs error checking without sending a signal: nil means
+	// the process exists, EPERM means it exists but we may not signal it.
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
 // Kind of guest protection
 type guestProtection uint8
 
@@ -1307,6 +1344,11 @@ type Hypervisor interface {
 	AddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) error
 	HotplugAddDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
 	HotplugRemoveDevice(ctx context.Context, devInfo interface{}, devType DeviceType) (interface{}, error)
+	// ResolveColdPlugVFIOGuestPciPaths resolves the in-guest PCI path for each
+	// VFIODev with IsPCIe=true and an empty GuestPciPath, writing the result
+	// back onto the device. Hypervisors that do not require this (e.g. CLH,
+	// which already populates GuestPciPath during hot-plug) return nil.
+	ResolveColdPlugVFIOGuestPciPaths(ctx context.Context, vfioDevs []*config.VFIODev) error
 	ResizeMemory(ctx context.Context, memMB uint32, memoryBlockSizeMB uint32, probe bool) (uint32, MemoryDevice, error)
 	ResizeVCPUs(ctx context.Context, vcpus uint32) (uint32, uint32, error)
 	GetTotalMemoryMB(ctx context.Context) uint32
