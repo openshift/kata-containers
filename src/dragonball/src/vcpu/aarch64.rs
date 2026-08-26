@@ -17,11 +17,25 @@ use kvm_ioctls::{VcpuFd, VmFd};
 use vm_memory::{Address, GuestAddress, GuestAddressSpace};
 use vmm_sys_util::eventfd::EventFd;
 
+use serde_derive::{Deserialize, Serialize};
+
 use crate::address_space_manager::GuestAddressSpaceImpl;
 use crate::metric::VcpuMetrics;
 use crate::vcpu::vcpu_impl::{Result, Vcpu, VcpuError, VcpuStateEvent};
 use crate::vcpu::VcpuConfig;
 use crate::IoManagerCached;
+
+/// Snapshot state of an aarch64 vCPU.
+///
+/// Placeholder: aarch64 vCPU save/restore is not implemented yet. The struct
+/// exists so that architecture-independent snapshot code compiles on
+/// aarch64; fields (core registers, GIC state, MPIDR, ...) will be added
+/// when aarch64 support lands.
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct VcpuState {
+    /// vCPU id.
+    pub id: u8,
+}
 
 #[allow(unused)]
 impl Vcpu {
@@ -44,6 +58,7 @@ impl Vcpu {
     pub fn new_aarch64(
         id: u8,
         vcpu_fd: VcpuFd,
+        vm_fd: Arc<VmFd>,
         io_mgr: IoManagerCached,
         exit_evt: EventFd,
         vcpu_state_event: EventFd,
@@ -56,6 +71,7 @@ impl Vcpu {
 
         Ok(Vcpu {
             fd: vcpu_fd,
+            vm_fd,
             id,
             io_mgr,
             create_ts,

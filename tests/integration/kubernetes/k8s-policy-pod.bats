@@ -80,6 +80,7 @@ replace_prometheus_image() {
 	yq -i \
 		'.spec.containers[0].image = "quay.io/prometheus/busybox:latest"' \
 		"${correct_pod_yaml}"
+	set_pod_spec_security_context "${correct_pod_yaml}" ".spec" "" "" "10"
 }
 
 wait_for_pod_ready() {
@@ -121,8 +122,8 @@ create_and_wait_for_pod_ready() {
 @test "Successful pod with auto-generated policy and custom layers cache path" {
 	tmp_path=$(mktemp -d)
 
-	auto_generate_policy "${pod_config_dir}" "${testcase_pre_generate_pod_yaml}" "${testcase_pre_generate_configmap_yaml}" \
-		"--layers-cache-file-path=${tmp_path}/cache.json"
+	GENPOLICY_LAYERS_CACHE_FILE_PATH="${tmp_path}/cache.json" \
+		auto_generate_policy "${pod_config_dir}" "${testcase_pre_generate_pod_yaml}" "${testcase_pre_generate_configmap_yaml}"
 
 	[ -f "${tmp_path}/cache.json" ]
 	rm -r "${tmp_path}"

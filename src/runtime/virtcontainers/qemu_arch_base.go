@@ -61,8 +61,10 @@ type qemuArch interface {
 	// bridges sets the number bridges for the machine type
 	bridges(number uint32)
 
-	// cpuTopology returns the CPU topology for the given amount of vcpus
-	cpuTopology(vcpus, maxvcpus uint32) govmmQemu.SMP
+	// cpuTopology returns the CPU topology for the given amount of vcpus.
+	// numNUMANodes > 1 restructures the topology so vCPUs are grouped by socket per NUMA node.
+	// When confidentialGuest is true, CPU hotplug is disabled by setting MaxCPUs to 0.
+	cpuTopology(vcpus, maxvcpus uint32, numNUMANodes uint32, confidentialGuest bool) govmmQemu.SMP
 
 	// cpuModel returns the CPU model for the machine type
 	cpuModel() string
@@ -119,7 +121,7 @@ type qemuArch interface {
 	appendBalloonDevice(ctx context.Context, devices []govmmQemu.Device, BalloonDevice config.BalloonDev) ([]govmmQemu.Device, error)
 
 	// setEndpointDevicePath sets the appropriate PCI or CCW device path for an endpoint
-	setEndpointDevicePath(endpoint Endpoint, bridgeAddr int, devAddr string) error
+	setEndpointDevicePath(endpoint Endpoint, bridge types.Bridge, devAddr string) error
 
 	// addDeviceToBridge adds devices to the bus
 	addDeviceToBridge(ctx context.Context, ID string, t types.Type) (string, types.Bridge, error)
@@ -324,13 +326,40 @@ func (q *qemuArchBase) bridges(number uint32) {
 	}
 }
 
-func (q *qemuArchBase) cpuTopology(vcpus, maxvcpus uint32) govmmQemu.SMP {
-	smp := govmmQemu.SMP{
-		CPUs:    vcpus,
-		Sockets: maxvcpus,
-		Cores:   defaultCores,
-		Threads: defaultThreads,
-		MaxCPUs: maxvcpus,
+func (q *qemuArchBase) cpuTopology(vcpus, maxvcpus uint32, numNUMANodes uint32, confidentialGuest bool) govmmQemu.SMP {
+	var smp govmmQemu.SMP
+
+	if numNUMANodes > 1 {
+		coresPerSocket := (maxvcpus + numNUMANodes - 1) / numNUMANodes
+		if coresPerSocket == 0 {
+			coresPerSocket = 1
+		}
+		smpMaxCPUs := numNUMANodes * coresPerSocket * defaultThreads
+		smp = govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: numNUMANodes,
+			Cores:   coresPerSocket,
+			Threads: defaultThreads,
+			MaxCPUs: smpMaxCPUs,
+		}
+	} else {
+		smp = govmmQemu.SMP{
+			CPUs:    vcpus,
+			Sockets: maxvcpus,
+			Cores:   defaultCores,
+			Threads: defaultThreads,
+			MaxCPUs: maxvcpus,
+		}
+	}
+
+	// Disable CPU hotplug for confidential guests: zero MaxCPUs and Sockets so
+	// govmmQemu omits them, causing QEMU to set maxcpus=cpus. Cores is reset to
+	// defaultCores (1) so QEMU can infer a valid sockets value (cpus/cores/threads);
+	// a NUMA-derived coresPerSocket left here would violate the topology constraint.
+	if confidentialGuest {
+		smp.MaxCPUs = 0
+		smp.Sockets = 0
+		smp.Cores = defaultCores
 	}
 
 	return smp
@@ -663,6 +692,7 @@ func genericBlockDevice(drive config.BlockDrive, nestedRun bool) (govmmQemu.Bloc
 		DisableModern: nestedRun,
 		ShareRW:       drive.ShareRW,
 		ReadOnly:      drive.ReadOnly,
+		DiscardUnmap:  drive.DiscardUnmap,
 	}, nil
 }
 
@@ -749,21 +779,41 @@ func (q *qemuArchBase) appendBalloonDevice(_ context.Context, devices []govmmQem
 	return devices, nil
 }
 
-func (q *qemuArchBase) setEndpointDevicePath(endpoint Endpoint, bridgeAddr int, devAddr string) error {
-	bridgeSlot, err := types.PciSlotFromInt(bridgeAddr)
-	if err != nil {
-		return err
-	}
-	devSlot, err := types.PciSlotFromString(devAddr)
-	if err != nil {
-		return err
-	}
-	pciPath, err := types.PciPathFromSlots(bridgeSlot, devSlot)
+func (q *qemuArchBase) setEndpointDevicePath(endpoint Endpoint, bridge types.Bridge, devAddr string) error {
+	pciPath, err := bridgePciPath(bridge, devAddr)
 	if err != nil {
 		return err
 	}
 	endpoint.SetPciPath(pciPath)
 	return nil
+}
+
+// bridgePciPath returns the guest PCI path for a device hot-plugged onto a
+// given bridge at slot devAddr. For a top-level bridge (directly on
+// pcie.0/pci.0) the path has two components (bridge_slot/dev_slot). For a
+// bridge nested behind a parent device on the root bus (e.g. a pcie-pci-bridge
+// sitting on a pcie-root-port) the path has three components
+// (parent_slot/bridge_slot/dev_slot), which the kata-agent walks via sysfs.
+func bridgePciPath(bridge types.Bridge, devAddr string) (types.PciPath, error) {
+	devSlot, err := types.PciSlotFromString(devAddr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+
+	bridgeSlot, err := types.PciSlotFromInt(bridge.Addr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+
+	if !bridge.HasParent() {
+		return types.PciPathFromSlots(bridgeSlot, devSlot)
+	}
+
+	parentSlot, err := types.PciSlotFromInt(bridge.ParentAddr)
+	if err != nil {
+		return types.PciPath{}, err
+	}
+	return types.PciPathFromSlots(parentSlot, bridgeSlot, devSlot)
 }
 
 func (q *qemuArchBase) handleImagePath(config HypervisorConfig) error {

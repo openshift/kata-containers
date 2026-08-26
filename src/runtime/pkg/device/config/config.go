@@ -235,6 +235,17 @@ var (
 	// different types of PCI ports. We can deduces the Bus number from it
 	// and eliminate duplicates being assigned.
 	PCIeDevicesPerPort = map[PCIePort][]VFIODev{}
+
+	// NUMARootPorts maps host NUMA node IDs to root port IDs on pxb-pcie
+	// bridges.  When NUMA-aware PCIe topology is active (pxb-pcie),
+	// createPCIeTopology populates this so VFIODevice.Attach() can assign
+	// each device to the root port on its host NUMA node's pxb-pcie bus.
+	// Key: host NUMA node ID, Value: slice of root port IDs on that node's pxb.
+	NUMARootPorts = map[int][]string{}
+
+	// NUMARootPortDeviceCount tracks how many devices have been assigned
+	// to each host NUMA node's root ports (for round-robin assignment).
+	NUMARootPortDeviceCount = map[int]int{}
 )
 
 // DeviceInfo is an embedded type that contains device data common to all types of devices.
@@ -278,6 +289,9 @@ type DeviceInfo struct {
 
 	// If applicable, should this device be considered RO
 	ReadOnly bool
+
+	// DiscardUnmap enables discard/unmap support for this block device.
+	DiscardUnmap bool
 
 	// ColdPlug specifies whether the device must be cold plugged (true)
 	// or hot plugged (false).
@@ -326,6 +340,9 @@ type BlockDrive struct {
 
 	// ReadOnly sets the device file readonly
 	ReadOnly bool
+
+	// DiscardUnmap enables discard/unmap support for this block device.
+	DiscardUnmap bool
 
 	// Pmem enables persistent memory. Use File as backing file
 	// for a nvdimm device in the guest
@@ -417,6 +434,10 @@ type VFIODev struct {
 
 	// Type of VFIO device
 	Type VFIODeviceType
+
+	// NUMANode is the host NUMA node this device is attached to.
+	// -1 means no affinity or unknown.
+	NUMANode int
 
 	// IsPCIe specifies device is PCIe or PCI
 	IsPCIe bool

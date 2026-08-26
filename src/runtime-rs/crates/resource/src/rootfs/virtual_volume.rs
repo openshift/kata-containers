@@ -9,7 +9,6 @@ use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use kata_types::build_path;
 use kata_types::mount::ImagePullVolume;
 use oci_spec::runtime as oci;
 use serde_json;
@@ -27,7 +26,7 @@ use kata_types::{
 const KUBERNETES_CRI_IMAGE_NAME: &str = "io.kubernetes.cri.image-name";
 const KUBERNETES_CRIO_IMAGE_NAME: &str = "io.kubernetes.cri-o.ImageName";
 const KATA_VIRTUAL_VOLUME_TYPE_OVERLAY_FS: &str = "overlay";
-const DEFAULT_KATA_GUEST_ROOT_SHARED_FS: &str = "/run/kata-containers/";
+const KATA_GUEST_ROOT_SHARED_FS: &str = "/run/kata-containers/";
 
 const CRI_CONTAINER_TYPE_KEY_LIST: &[&str] = &[
     // cri containerd
@@ -36,17 +35,16 @@ const CRI_CONTAINER_TYPE_KEY_LIST: &[&str] = &[
     annotations::crio::CONTAINER_TYPE_LABEL_KEY,
 ];
 
-/// Get Kata guest root shared filesystem path.
-fn kata_guest_root_shared_fs() -> String {
-    build_path(DEFAULT_KATA_GUEST_ROOT_SHARED_FS)
-}
-
 /// Retrieves the image reference from OCI spec annotations.
 ///
 /// It checks known Kubernetes CRI and CRI-O annotation keys for the container type.
 /// If the container is a PodSandbox, it returns "pause".
 /// Otherwise, it attempts to find the image name using the appropriate Kubernetes
 /// annotation key.
+///
+/// If no container type annotation is found (SingleContainer case), it falls back to
+/// checking for image name annotations directly. This supports standalone container
+/// runtimes like nerdctl that may only provide the image name annotation.
 pub fn get_image_reference(spec_annotations: &HashMap<String, String>) -> Result<&str> {
     info!(
         sl!(),
@@ -72,6 +70,27 @@ pub fn get_image_reference(spec_annotations: &HashMap<String, String>) -> Result
                 };
             }
         }
+    }
+
+    // Fallback for SingleContainer case: if no container type annotation is found,
+    // try to get image name directly. This supports standalone container runtimes
+    // (e.g., nerdctl) that may only provide the image name annotation without the
+    // container type annotation.
+    if let Some(image_name) = spec_annotations.get(KUBERNETES_CRI_IMAGE_NAME) {
+        info!(
+            sl!(),
+            "Found image name without container type annotation (SingleContainer): {}", image_name
+        );
+        return Ok(image_name.as_str());
+    }
+
+    if let Some(image_name) = spec_annotations.get(KUBERNETES_CRIO_IMAGE_NAME) {
+        info!(
+            sl!(),
+            "Found CRI-O image name without container type annotation (SingleContainer): {}",
+            image_name
+        );
+        return Ok(image_name.as_str());
     }
 
     Err(anyhow!("no target image reference found"))
@@ -115,7 +134,7 @@ fn handle_virtual_volume_storage(
                 KATA_VIRTUAL_VOLUME_IMAGE_GUEST_PULL, image_pull_info
             )],
             fs_type: KATA_VIRTUAL_VOLUME_TYPE_OVERLAY_FS.to_string(),
-            mount_point: Path::new(kata_guest_root_shared_fs().as_str())
+            mount_point: Path::new(KATA_GUEST_ROOT_SHARED_FS)
                 .join(cid)
                 .join("rootfs")
                 .display()
@@ -163,7 +182,7 @@ impl VirtualVolume {
             }
         }
 
-        let guest_path = Path::new(kata_guest_root_shared_fs().as_str())
+        let guest_path = Path::new(KATA_GUEST_ROOT_SHARED_FS)
             .join(cid)
             .join("rootfs")
             .to_path_buf();
@@ -207,9 +226,8 @@ pub fn is_kata_virtual_volume(m: &kata_types::mount::Mount) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::rootfs::virtual_volume::kata_guest_root_shared_fs;
     use crate::rootfs::virtual_volume::{
-        KATA_VIRTUAL_VOLUME_PREFIX, KATA_VIRTUAL_VOLUME_TYPE_OVERLAY_FS,
+        KATA_GUEST_ROOT_SHARED_FS, KATA_VIRTUAL_VOLUME_PREFIX, KATA_VIRTUAL_VOLUME_TYPE_OVERLAY_FS,
     };
 
     use super::get_image_reference;
@@ -256,6 +274,28 @@ mod tests {
         let image_ref_result_pod_sandbox = get_image_reference(&annotations_pod_sandbox);
         assert!(image_ref_result_pod_sandbox.is_ok());
         assert_eq!(image_ref_result_pod_sandbox.unwrap(), "pause");
+        // Test SingleContainer fallback (no container type annotation)
+        let mut annotations_single = HashMap::new();
+        annotations_single.insert(
+            "io.kubernetes.cri.image-name".to_string(),
+            "example-image-single".to_string(),
+        );
+        let image_ref_result_single = get_image_reference(&annotations_single);
+        assert!(image_ref_result_single.is_ok());
+        assert_eq!(image_ref_result_single.unwrap(), "example-image-single");
+
+        // Test SingleContainer fallback with CRI-O annotation
+        let mut annotations_single_crio = HashMap::new();
+        annotations_single_crio.insert(
+            "io.kubernetes.cri-o.ImageName".to_string(),
+            "example-image-single-crio".to_string(),
+        );
+        let image_ref_result_single_crio = get_image_reference(&annotations_single_crio);
+        assert!(image_ref_result_single_crio.is_ok());
+        assert_eq!(
+            image_ref_result_single_crio.unwrap(),
+            "example-image-single-crio"
+        );
     }
 
     #[tokio::test]
@@ -284,7 +324,7 @@ mod tests {
         let virt_vol_obj = result.unwrap();
 
         // 1. Verify guest_path
-        let expected_guest_path = Path::new(kata_guest_root_shared_fs().as_str())
+        let expected_guest_path = Path::new(KATA_GUEST_ROOT_SHARED_FS)
             .join(cid)
             .join("rootfs");
         assert_eq!(virt_vol_obj.guest_path, expected_guest_path);
@@ -299,7 +339,7 @@ mod tests {
         assert_eq!(storage.driver, KATA_VIRTUAL_VOLUME_IMAGE_GUEST_PULL);
         assert_eq!(storage.fs_type, KATA_VIRTUAL_VOLUME_TYPE_OVERLAY_FS);
 
-        let expected_mount_point = Path::new(kata_guest_root_shared_fs().as_str())
+        let expected_mount_point = Path::new(KATA_GUEST_ROOT_SHARED_FS)
             .join(cid)
             .join("rootfs")
             .display()

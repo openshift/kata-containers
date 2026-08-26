@@ -114,11 +114,10 @@ machine_accelerators = "@MACHINEACCELERATORS@"
 
 # Qemu seccomp sandbox feature
 # comma-separated list of seccomp sandbox features to control the syscall access.
-# For example, `seccompsandbox= "on,obsolete=deny,spawn=deny,resourcecontrol=deny"`
-# Note: "elevateprivileges=deny" doesn't work with daemonize option, so it's removed from the seccomp sandbox
+# For example, `seccompsandbox = "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"`
 # Another note: enabling this feature may reduce performance, you may enable
 # /proc/sys/net/core/bpf_jit_enable to reduce the impact. see https://man7.org/linux/man-pages/man8/bpfc.8.html
-# Recommended value when enabling: "on,obsolete=deny,spawn=deny,resourcecontrol=deny"
+# Recommended value when enabling: "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
 seccompsandbox = "@DEFSECCOMPSANDBOXPARAM@"
 
 # CPU features
@@ -360,7 +359,12 @@ enable_iommu_platform = false
 # as is: map VM NUMA nodes to host 1:1 and bind vCPUs to related CPUs.
 # Note: To take proper advantage of NUMA, static_sandbox_resource_mgmt should
 # also be enabled for memory pre-allocation.
-enable_numa = false
+#
+# GPU workloads strongly benefit from NUMA awareness: when enabled, the runtime
+# validates that each cold-plugged VFIO device (GPU) resides on a host NUMA
+# node covered by the guest NUMA topology, ensuring memory locality. Consider
+# enabling this on multi-NUMA hosts with GPU passthrough.
+enable_numa = @DEFENABLENUMA_NV@
 
 # NUMA node mapping allows customizing how VM NUMA nodes map to host NUMA nodes.
 # Each entry defines a VM NUMA node and the host NUMA node(s) it maps to.
@@ -379,17 +383,6 @@ valid_vhost_user_store_paths = @DEFVALIDVHOSTUSERSTOREPATHS@
 # qemu will delay this many seconds and then attempt to reconnect.
 # Zero disables reconnecting, and the default is zero.
 vhost_user_reconnect_timeout_sec = 0
-
-# Enable file based guest memory support. The default is an empty string which
-# will disable this feature. In the case of virtio-fs, this is enabled
-# automatically and '/dev/shm' is used as the backing folder.
-# This option will be ignored if VM templating is enabled.
-file_mem_backend = ""
-
-# List of valid annotations values for the file_mem_backend annotation
-# The default if not set is empty (all annotations rejected.)
-# Your distribution recommends: @DEFVALIDFILEMEMBACKENDS@
-valid_file_mem_backends = @DEFVALIDFILEMEMBACKENDS@
 
 # -pflash can add image file to VM. The arguments of it should be in format
 # of ["/path/to/flash0.img", "/path/to/flash1.img"]
@@ -618,6 +611,29 @@ dial_timeout = @DEFAULTTIMEOUT_NV@
 # (agent default when unset: 6)
 launch_process_timeout = @DEFAULTLAUNCHPROCESSTIMEOUT_NV@
 
+# If enabled, the agent translates a container's VISIBLE_CDI_DEVICES
+# environment variable into CDI GPU device requests (nvidia.com/gpu), resolved
+# against the GPUs present in the VM via the CDI spec generated in the guest at
+# /var/run/cdi/. The format of VISIBLE_CDI_DEVICES is:
+#
+#   <cdi-kind>=<devices>[:<cdi-kind>=<devices>[...]]
+#
+# For example, you may set something like:
+#
+#   VISIBLE_CDI_DEVICES="nvidia.com/gpu=all:nvidia.com/ib=0,1"
+#
+# The devices can be referenced by explicit CDI index or through the "all"
+# keyword.
+#
+# This parameter is useful in the case where multiple containers in a pod need
+# access to the same GPU and do not want to request additional GPUs from the
+# outer runtime. This is especially useful with GPU observability where one
+# workload container performs the CDI request to the outer runtime, and the
+# sidecar observability containers would get access to the same resources by
+# setting VISIBLE_CDI_DEVICES="nvidia.com/gpu=all".
+# (default: false)
+visible_cdi_devices = false
+
 [runtime]
 # If enabled, the runtime will log additional debug messages to the
 # system log
@@ -680,8 +696,7 @@ jaeger_password = ""
 
 # If enabled, the runtime will not create a network namespace for shim and hypervisor processes.
 # This option may have some potential impacts to your host. It should only be used when you know what you're doing.
-# `disable_new_netns` conflicts with `internetworking_model=tcfilter` and `internetworking_model=macvtap`. It works only
-# with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
+# `disable_new_netns` only works with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
 # (default: false)
 disable_new_netns = false
@@ -743,6 +758,9 @@ disable_guest_empty_dir = @DEFDISABLEGUESTEMPTYDIR@
 #
 #   - block-encrypted
 #     Plugs a block device to be encrypted in the guest.
+#
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
 #
 emptydir_mode = "@DEFEMPTYDIRMODE_COCO@"
 

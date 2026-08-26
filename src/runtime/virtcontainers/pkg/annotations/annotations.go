@@ -20,8 +20,6 @@ const (
 
 	// ContainerTypeKey is the annotation key to fetch container type.
 	ContainerTypeKey = kataAnnotationsPrefix + "pkg.oci.container_type"
-
-	SandboxConfigPathKey = kataAnnotationsPrefix + "config_path"
 )
 
 // Annotations related to Hypervisor configuration
@@ -182,9 +180,6 @@ const (
 	// Enable Hypervisor Devices IOMMU_PLATFORM
 	IOMMUPlatform = kataAnnotHypervisorPrefix + "enable_iommu_platform"
 
-	// FileBackedMemRootDir is a sandbox annotation to soecify file based memory backend root directory
-	FileBackedMemRootDir = kataAnnotHypervisorPrefix + "file_mem_backend"
-
 	// NUMAMapping is a sandbox annotation that specifies mapping VM NUMA nodes to host NUMA nodes.
 	NUMAMapping = kataAnnotHypervisorPrefix + "numa_mapping"
 
@@ -341,6 +336,12 @@ const (
 	CdhApiTimeoutKernelParam        = "agent." + CdhApiTimeoutOption
 	LaunchProcessTimeoutOption      = "launch_process_timeout"
 	LaunchProcessTimeoutKernelParam = "agent." + LaunchProcessTimeoutOption
+
+	// VisibleCdiDevices, when enabled, lets the agent translate a
+	// container's VISIBLE_CDI_DEVICES environment variable into CDI GPU
+	// device requests inside the guest.
+	VisibleCdiDevicesOption      = "visible_cdi_devices"
+	VisibleCdiDevicesKernelParam = "agent." + VisibleCdiDevicesOption
 
 	// Policy is an annotation containing the contents of an agent policy file, base64 encoded.
 	Policy = kataAnnotAgentPrefix + "policy"

@@ -19,16 +19,7 @@ short_commit_length=10
 
 gh_cli="gh-cli"
 
-#for cross build
-CROSS_BUILD=${CROSS_BUILD-:}
-BUILDX=""
-PLATFORM=""
-TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
 ARCH=${ARCH:-$(uname -m)}
-[[ "${TARGET_ARCH}" == "aarch64" ]] && TARGET_ARCH=arm64
-TARGET_OS=${TARGET_OS:-linux}
-# shellcheck disable=SC2034
-[[ "${CROSS_BUILD}" == "true" ]] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
 
 install_yq() {
 	pushd "${repo_root_dir}" || return
@@ -58,6 +49,14 @@ info() {
 
 warn() {
 	echo >&2 "WARN: $*"
+}
+
+# ZSTD compression level (1-19) for kata tarball creation.
+# Override with KATA_TARBALL_ZSTD_LEVEL to tune size vs build time.
+KATA_TARBALL_ZSTD_LEVEL="${KATA_TARBALL_ZSTD_LEVEL:-10}"
+
+kata_tar_zstd() {
+	tar --use-compress-program="zstd -${KATA_TARBALL_ZSTD_LEVEL}" "$@"
 }
 
 get_repo_hash() {
@@ -187,7 +186,13 @@ calc_qemu_files_sha256sum() {
 
 get_qemu_image_name() {
 	qemu_script_dir="${repo_root_dir}/tools/packaging/static-build/qemu"
-	echo "${BUILDER_REGISTRY}:qemu-$(get_last_modification "${qemu_script_dir}")-$(uname -m)"
+	qemu_configure_script="${repo_root_dir}/tools/packaging/scripts/configure-hypervisor.sh"
+
+	qemu_hash=$(merge_two_hashes \
+		"$(get_last_modification "${qemu_script_dir}")" \
+		"$(get_last_modification "${qemu_configure_script}")")
+
+	echo "${BUILDER_REGISTRY}:qemu-${qemu_hash}-$(uname -m)"
 }
 
 get_shim_v2_image_name() {
@@ -203,6 +208,11 @@ get_ovmf_image_name() {
 get_busybox_image_name() {
 	busybox_script_dir="${repo_root_dir}/tools/packaging/static-build/busybox"
 	echo "${BUILDER_REGISTRY}:busybox-$(get_last_modification "${busybox_script_dir}")-$(uname -m)"
+}
+
+get_openvmm_image_name() {
+	openvmm_script_dir="${repo_root_dir}/tools/packaging/static-build/openvmm"
+	echo "${BUILDER_REGISTRY}:openvmm-$(get_last_modification "${openvmm_script_dir}")-$(uname -m)"
 }
 
 get_virtiofsd_image_name() {

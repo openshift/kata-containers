@@ -9,17 +9,20 @@ use std::{
     fs::{metadata, set_permissions, File, OpenOptions, Permissions},
     io,
     os::{
-        fd::{AsRawFd, RawFd},
+        fd::{BorrowedFd, RawFd},
         unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::Command,
 };
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use kata_types::{
-    build_path,
     config::{Hypervisor, KATA_PATH},
+    prefix_with_rootless_dir,
 };
 use lazy_static::lazy_static;
 use nix::{
@@ -36,7 +39,7 @@ use crate::device::Tap;
 
 use crate::{DEFAULT_HYBRID_VSOCK_NAME, JAILER_ROOT};
 
-pub fn remove_dir_all_if_exists(path: &str) -> Result<()> {
+pub fn remove_dir_all_if_exists(path: impl AsRef<Path>) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -67,7 +70,7 @@ pub fn get_child_threads(pid: u32) -> HashSet<u32> {
 // Return the path for a _hypothetical_ sandbox: the path does *not* exist
 // yet, and for this reason safe-path cannot be used.
 pub fn get_sandbox_path(sid: &str) -> String {
-    Path::new(build_path(KATA_PATH).as_str())
+    Path::new(prefix_with_rootless_dir(KATA_PATH).as_str())
         .join(sid)
         .to_string_lossy()
         .to_string()
@@ -90,13 +93,14 @@ pub fn get_jailer_root(sid: &str) -> String {
 // called on descriptors to be passed to a child (hypervisor) process as
 // O_CLOEXEC would obviously prevent that.
 pub fn clear_cloexec(rawfd: RawFd) -> Result<()> {
-    let cur_flags = fcntl::fcntl(rawfd, fcntl::FcntlArg::F_GETFD)?;
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(rawfd) };
+    let cur_flags = fcntl::fcntl(borrowed_fd, fcntl::FcntlArg::F_GETFD)?;
     let mut new_flags = fcntl::FdFlag::from_bits(cur_flags).ok_or(anyhow!(
         "couldn't construct FdFlag from flags value {:?}",
         cur_flags
     ))?;
     new_flags.remove(fcntl::FdFlag::FD_CLOEXEC);
-    if let Err(err) = fcntl::fcntl(rawfd, fcntl::FcntlArg::F_SETFD(new_flags)) {
+    if let Err(err) = fcntl::fcntl(borrowed_fd, fcntl::FcntlArg::F_SETFD(new_flags)) {
         info!(sl!(), "couldn't clear O_CLOEXEC on fd: {:?}", err);
         return Err(err.into());
     }
@@ -108,20 +112,19 @@ pub fn enter_netns(netns_path: &str) -> Result<()> {
     if !netns_path.is_empty() {
         let netns =
             File::open(netns_path).context(anyhow!("open netns path {:?} failed.", netns_path))?;
-        setns(netns.as_raw_fd(), CloneFlags::CLONE_NEWNET).context("set netns failed")?;
+        setns(&netns, CloneFlags::CLONE_NEWNET).context("set netns failed")?;
     }
 
     Ok(())
 }
 
 pub fn set_groups(groups: &[u32]) -> Result<()> {
-    if !groups.is_empty() {
-        let group = groups
-            .iter()
-            .map(|gid| Gid::from_raw(*gid))
-            .collect::<Vec<_>>();
-        setgroups(&group).context("set groups failed")?;
-    }
+    let group = groups
+        .iter()
+        .map(|gid| Gid::from_raw(*gid))
+        .collect::<Vec<_>>();
+    // An empty list intentionally clears inherited supplementary groups.
+    setgroups(&group).context("set groups failed")?;
 
     Ok(())
 }
@@ -171,9 +174,7 @@ fn create_fds(device: &str, num_fds: usize) -> Result<Vec<File>> {
             Err(e) => {
                 fds.clear();
                 return Err(anyhow!(
-                    "It failed with error {:?} when opened the {:?} device.",
-                    e,
-                    i
+                    "Failed to open {device} fd index {i}, with error {e}"
                 ));
             }
         };
@@ -251,6 +252,16 @@ fn first_valid_executable_path(paths: &[&str]) -> Result<String> {
         }
     }
     Err(anyhow!("No valid executable found in paths: {:?}", paths))
+}
+
+const VMM_USER_RUNTIME_BASE_DIR: &str = "/run/user";
+
+pub fn vmm_user_runtime_dir(uid: u32) -> PathBuf {
+    Path::new(VMM_USER_RUNTIME_BASE_DIR).join(uid.to_string())
+}
+
+pub fn remove_vmm_user_runtime_dir(uid: u32) -> Result<()> {
+    remove_dir_all_if_exists(vmm_user_runtime_dir(uid))
 }
 
 pub fn create_vmm_user() -> Result<String> {
@@ -334,20 +345,51 @@ pub struct SocketAddress {
 
 impl SocketAddress {
     pub fn new(port: u32) -> Self {
+        Self::new_with_socket_path(port, QGS_SOCKET_PATH)
+    }
+
+    fn new_with_socket_path(port: u32, socket_path: &str) -> Self {
         if port == 0 {
-            Self {
-                typ: "unix".to_string(),
-                cid: "".to_string(),
-                port: "".to_string(),
-                path: QGS_SOCKET_PATH.to_string(),
+            match std::fs::metadata(socket_path) {
+                Ok(_) => {
+                    return Self {
+                        typ: "unix".to_string(),
+                        cid: "".to_string(),
+                        port: "".to_string(),
+                        path: socket_path.to_string(),
+                    };
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Socket not present; fall back to vsock for backwards compatibility.
+                    warn!(
+                        sl!(),
+                        "QGS socket {} not found, falling back to vsock port 4050", socket_path
+                    );
+                }
+                Err(e) => {
+                    // Unexpected error (e.g. permission denied) — log it so misconfiguration
+                    // is not silently masked, then fall back to vsock.
+                    warn!(
+                        sl!(),
+                        "QGS socket {} inaccessible ({}), falling back to vsock port 4050",
+                        socket_path,
+                        e
+                    );
+                }
             }
-        } else {
-            Self {
+            return Self {
                 typ: "vsock".to_string(),
                 cid: format!("{}", 2),
-                port: port.to_string(),
+                port: "4050".to_string(),
                 path: "".to_string(),
-            }
+            };
+        }
+
+        Self {
+            typ: "vsock".to_string(),
+            cid: format!("{}", 2),
+            port: port.to_string(),
+            path: "".to_string(),
         }
     }
 }
@@ -423,6 +465,59 @@ pub fn uses_native_ccw_bus() -> bool {
     *NATIVE_CCW_BUS_CACHE
 }
 
+/// Scan the threads of the process rooted at `proc_path` (for example
+/// "/proc/1234") and return a map of vCPU index to host thread ID.
+///
+/// VMMs that run guest vCPUs on dedicated host threads name those threads
+/// "<prefix><index>" and expose the name via `/proc/<pid>/task/<tid>/comm`
+/// (Cloud Hypervisor uses the prefix "vcpu", OpenVMM uses "vp-"). Threads whose
+/// name does not start with `prefix` are ignored. The returned map may be empty;
+/// callers decide whether that is an error.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn get_vcpu_tids(proc_path: &str, prefix: &str) -> Result<HashMap<u32, u32>> {
+    let src = std::fs::canonicalize(proc_path)
+        .map_err(|e| anyhow!("Invalid proc path: {proc_path}: {e}"))?;
+
+    let tid_path = src.join("task");
+
+    let mut vcpus = HashMap::new();
+
+    for entry in std::fs::read_dir(&tid_path)? {
+        let entry = entry?;
+
+        let tid_str = match entry.file_name().into_string() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        let tid = tid_str
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("invalid tid."))?;
+
+        let comm_path = tid_path.join(&tid_str).join("comm");
+
+        if !comm_path.exists() {
+            return Err(anyhow!("comm path was not found."));
+        }
+
+        let p_name = std::fs::read_to_string(comm_path)?;
+
+        if !p_name.starts_with(prefix) {
+            continue;
+        }
+
+        let vcpu_id = p_name
+            .trim_start_matches(prefix)
+            .trim()
+            .parse::<u32>()
+            .map_err(|e| anyhow!(e).context("Invalid vcpu id."))?;
+
+        vcpus.insert(vcpu_id, tid);
+    }
+
+    Ok(vcpus)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -441,6 +536,8 @@ mod tests {
     use crate::utils::first_valid_executable_path;
 
     use super::create_fds;
+    use super::remove_dir_all_if_exists;
+    use super::vmm_user_runtime_dir;
     use super::SocketAddress;
 
     #[test]
@@ -453,6 +550,23 @@ mod tests {
     }
 
     #[test]
+    fn test_vmm_user_runtime_dir() {
+        assert_eq!(vmm_user_runtime_dir(1000), PathBuf::from("/run/user/1000"));
+    }
+
+    #[test]
+    fn test_remove_dir_all_if_exists_is_idempotent() {
+        let parent = TempDir::new().unwrap();
+        let runtime_dir = parent.path().join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        remove_dir_all_if_exists(&runtime_dir).unwrap();
+        assert!(!runtime_dir.exists());
+
+        remove_dir_all_if_exists(&runtime_dir).unwrap();
+    }
+
+    #[test]
     fn test_vsocket_address_new() {
         let socket = SocketAddress::new(8866);
         assert_eq!(socket.typ, "vsock");
@@ -462,9 +576,20 @@ mod tests {
 
     #[test]
     fn test_unix_address_new() {
-        let socket = SocketAddress::new(0);
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("qgs.socket");
+        std::fs::File::create(&sock).unwrap();
+
+        // Socket present: must return unix type
+        let socket = SocketAddress::new_with_socket_path(0, sock.to_str().unwrap());
         assert_eq!(socket.typ, "unix");
-        assert_eq!(socket.path, "/var/run/tdx-qgs/qgs.socket");
+        assert_eq!(socket.path, sock.to_str().unwrap());
+
+        // Socket absent: must fall back to vsock port 4050
+        let socket = SocketAddress::new_with_socket_path(0, "/nonexistent/qgs.socket");
+        assert_eq!(socket.typ, "vsock");
+        assert_eq!(socket.cid, "2");
+        assert_eq!(socket.port, "4050");
     }
 
     #[test]
@@ -476,9 +601,21 @@ mod tests {
 
     #[test]
     fn test_socket_address_serialize_deserialize() {
-        let socket = SocketAddress::new(0);
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("qgs.socket");
+        std::fs::File::create(&sock).unwrap();
+        let sock_str = sock.to_str().unwrap();
+
+        // Socket present: unix type
+        let socket = SocketAddress::new_with_socket_path(0, sock_str);
         let serialized = serde_json::to_string(&socket).unwrap();
-        let expected_json = r#"{"type":"unix","path":"/var/run/tdx-qgs/qgs.socket"}"#;
+        let expected_json = format!(r#"{{"type":"unix","path":"{sock_str}"}}"#);
+        assert_eq!(expected_json, serialized);
+
+        // Socket absent: vsock fallback
+        let socket = SocketAddress::new_with_socket_path(0, "/nonexistent/qgs.socket");
+        let serialized = serde_json::to_string(&socket).unwrap();
+        let expected_json = r#"{"type":"vsock","cid":"2","port":"4050"}"#;
         assert_eq!(expected_json, serialized);
     }
 

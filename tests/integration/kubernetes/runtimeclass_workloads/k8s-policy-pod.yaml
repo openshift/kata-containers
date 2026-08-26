@@ -88,3 +88,10 @@ spec:
               operator: In
               values:
               - not-a-real-hostname
+  resources:
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+    requests:
+      memory: "1Gi"
+      cpu: "500m"

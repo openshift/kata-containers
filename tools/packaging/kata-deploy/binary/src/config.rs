@@ -22,6 +22,34 @@ pub const K3S_RKE2_CONTAINERD_V2_TMPL: &str = "/etc/containerd/config.toml.tmpl"
 /// snapshotter field, and the base name for the data directory and socket path on the host.
 pub const NYDUS_FOR_KATA_TEE: &str = "nydus-for-kata-tee";
 
+/// Check if containerd config has an imports directive that would auto-load conf.d files.
+/// Returns true if the config file has "imports = [...]" directive that includes /etc/containerd/conf.d.
+fn config_has_containerd_confd_import(config_file: &str) -> bool {
+    use crate::utils::toml as toml_utils;
+
+    let has_conf_d_import = toml_utils::get_toml_array(Path::new(config_file), ".imports")
+        .map(|imports| {
+            imports
+                .iter()
+                .any(|path| path.contains("/etc/containerd/conf.d"))
+        })
+        .unwrap_or(false);
+
+    if has_conf_d_import {
+        info!(
+            "Found imports directive with /etc/containerd/conf.d in {}, will use conf.d auto-loading",
+            config_file
+        );
+    } else {
+        info!(
+            "No imports directive with /etc/containerd/conf.d in {}, will add it explicitly",
+            config_file
+        );
+    }
+
+    has_conf_d_import
+}
+
 /// Resolves whether to use the containerd 2.x split-CRI layout (true) or the v1 CRI gRPC layout (false) for K3s/RKE2.
 /// 1. Tries config.toml: if it has `version = 2` use legacy CRI table; if `version >= 3` (including 4+) use split CRI.
 /// 2. Else falls back to the node's containerRuntimeVersion (e.g. "containerd://2.1.5-k3s1").
@@ -133,6 +161,13 @@ pub struct CustomRuntime {
     pub containerd_snapshotter: Option<String>,
     /// CRI-O pull type (e.g., "guest-pull")
     pub crio_pull_type: Option<String>,
+    /// True for kata-deploy-synthesized debug variant runtimes (kata-<shim>-debug
+    /// and kata-<shim>-devkit). Guest debug settings are applied only on these
+    /// handlers.
+    pub debug_variant: bool,
+    /// True for the devkit runtime (kata-<shim>-devkit), which is a debug variant
+    /// with an extra drop-in wiring the extension image and debug console shell.
+    pub devkit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +185,14 @@ pub struct Config {
     pub multi_install_suffix: Option<String>,
     pub helm_post_delete_hook: bool,
     pub experimental_setup_snapshotter: Option<Vec<String>>,
+    /// EROFS snapshotter merge mode: "merged" (default) or "unmerged".
+    ///
+    /// In "unmerged" mode kata-deploy does not force containerd's erofs
+    /// snapshotter to merge layers (it leaves `max_unmerged_layers` at the
+    /// containerd default), so each image layer is exposed as its own
+    /// per-layer `layer.erofs`. This is the only layout the Go runtime can
+    /// consume; the merged (`fsmeta.erofs`) layout is runtime-rs only.
+    pub erofs_merge_mode: Option<String>,
     pub experimental_force_guest_pull_for_arch: Vec<String>,
     pub dest_dir: String,
     pub host_install_dir: String,
@@ -159,9 +202,46 @@ pub struct Config {
     pub containerd_conf_file: String,
     pub containerd_conf_file_backup: String,
     pub containerd_drop_in_conf_file: String,
+    pub containerd_user_drop_in_source_file: Option<String>,
     pub daemonset_name: String,
     pub custom_runtimes_enabled: bool,
     pub custom_runtimes: Vec<CustomRuntime>,
+    /// Install the devkit extension and a kata-<shim>-devkit custom runtime per
+    /// enabled shim. From the DEVKIT env var, honored only when debug is also on:
+    /// the devkit drop-in enables the agent debug console, which must never come
+    /// up without debug.
+    pub devkit_enabled: bool,
+    /// EROFS snapshotter rw-layer backing mode ("disk" or "memory").
+    pub erofs_snapshotter_mode: Option<String>,
+    /// Enable dm-verity integrity for EROFS lower layers.
+    /// Independent of rw-layer backing; works with both disk and memory modes.
+    pub erofs_dmverity: bool,
+    /// Startup taints to remove from the node once Kata is installed and the
+    /// node has been labeled `katacontainers.io/kata-runtime=true`. Each entry
+    /// is either a bare taint key (matches any effect) or `key:effect` (matches
+    /// only that effect). Empty means "remove nothing" and is the default, so
+    /// the behavior is opt-in and a no-op for users who don't configure it.
+    ///
+    /// This lets a node be provisioned with a startup taint that keeps Kata
+    /// workloads from being scheduled before the runtime binaries exist; kata-deploy
+    /// removes the taint as its final install step, closing the window in which a
+    /// pod could land on a not-yet-ready node.
+    pub startup_taints: Vec<String>,
+    /// This node's `status.nodeInfo.containerRuntimeVersion`, supplied by
+    /// whoever launched this process (`CONTAINER_RUNTIME_VERSION`).
+    ///
+    /// The job-mode dispatcher already holds every Node object it selected, so it
+    /// passes this down to the per-node Job. That is what lets those Jobs run
+    /// without a ServiceAccount token: they are the privileged, host-mutating part
+    /// of the install, and the less they can reach the better. Absent (the
+    /// DaemonSet), the value is read from the Node.
+    pub container_runtime_version: Option<String>,
+    /// The Kubernetes flavour the chart was configured for (`K8S_DISTRIBUTION`),
+    /// which is what chose the host directory mounted at /etc/containerd.
+    ///
+    /// Absent when the operator pinned that directory themselves, or when this
+    /// process was not started by the chart.
+    pub k8s_distribution: Option<String>,
 }
 
 impl Config {
@@ -185,12 +265,13 @@ impl Config {
         // Parse shims - only use arch-specific variable
         // Use architecture-specific default shims list (only shims supported for this arch)
         let default_shims = get_default_shims_for_arch(&arch);
-        let shims_for_arch = get_arch_var("SHIMS", default_shims, &arch)
+        let shims_for_arch: Vec<String> = get_arch_var("SHIMS", default_shims, &arch)
             .split_whitespace()
             .map(|s| s.to_string())
             .collect();
 
-        let default_shim_for_arch = get_arch_var("DEFAULT_SHIM", "qemu", &arch);
+        let default_shim_for_arch =
+            get_arch_var("DEFAULT_SHIM", get_default_shim_for_arch(&arch), &arch);
 
         // Only use arch-specific variable for allowed hypervisor annotations
         let allowed_hypervisor_annotations_for_arch =
@@ -237,7 +318,9 @@ impl Config {
             dest_dir
         };
 
-        let host_install_dir = format!("/host{dest_dir}");
+        // Install dir is mounted into the container at the same absolute path as
+        // on the host (see kata-deploy.installDir in the Helm chart).
+        let host_install_dir = dest_dir.clone();
 
         let crio_drop_in_conf_dir = "/etc/crio/crio.conf.d/".to_string();
         let crio_drop_in_conf_file = if let Some(ref suffix) = multi_install_suffix {
@@ -265,6 +348,10 @@ impl Config {
         let containerd_conf_file_backup = format!("{containerd_conf_file}.bak");
         let containerd_drop_in_conf_file =
             format!("{dest_dir}/containerd/config.d/kata-deploy.toml");
+        let containerd_user_drop_in_source_file = env::var("CONTAINERD_USER_DROP_IN_SOURCE_FILE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let helm_post_delete_hook =
             env::var("HELM_POST_DELETE_HOOK").unwrap_or_else(|_| "false".to_string()) == "true";
@@ -273,6 +360,11 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect());
+
+        let erofs_merge_mode = env::var("EROFS_MERGE_MODE")
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
 
         // Only use arch-specific variable for experimental force guest pull
         let experimental_force_guest_pull_for_arch =
@@ -283,13 +375,77 @@ impl Config {
                 .collect();
 
         // Parse custom runtimes from ConfigMap
-        let custom_runtimes_enabled =
+        let custom_runtimes_from_configmap =
             env::var("CUSTOM_RUNTIMES_ENABLED").unwrap_or_else(|_| "false".to_string()) == "true";
-        let custom_runtimes = if custom_runtimes_enabled {
+        let mut custom_runtimes = if custom_runtimes_from_configmap {
             parse_custom_runtimes()?
         } else {
             Vec::new()
         };
+
+        if debug {
+            synthesize_variant_runtimes(
+                Variant::Debug,
+                &shims_for_arch,
+                multi_install_suffix.as_deref(),
+                snapshotter_handler_mapping_for_arch.as_deref(),
+                pull_type_mapping_for_arch.as_deref(),
+                &mut custom_runtimes,
+            );
+        }
+
+        // Gate devkit on debug: the devkit drop-in turns on the agent debug
+        // console, so honoring DEVKIT without DEBUG would silently enable it,
+        // breaking the "only effective with debug" contract.
+        let devkit_requested = env::var("DEVKIT").unwrap_or_else(|_| "false".to_string()) == "true";
+        if devkit_requested && !debug {
+            log::warn!("DEVKIT=true ignored: it requires DEBUG=true to take effect");
+        }
+        let devkit_enabled = devkit_requested && debug;
+        if devkit_enabled {
+            synthesize_variant_runtimes(
+                Variant::Devkit,
+                &shims_for_arch,
+                multi_install_suffix.as_deref(),
+                snapshotter_handler_mapping_for_arch.as_deref(),
+                pull_type_mapping_for_arch.as_deref(),
+                &mut custom_runtimes,
+            );
+        }
+
+        // Enable the custom-runtime code paths if either source produced entries.
+        let custom_runtimes_enabled = !custom_runtimes.is_empty();
+
+        let erofs_snapshotter_mode = env::var("EROFS_SNAPSHOTTER_MODE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let erofs_dmverity = env::var("EROFS_DMVERITY")
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("dmverity");
+
+        // Startup taints to remove after install+label. Comma- or whitespace-separated
+        // list of `key` or `key:effect` entries. Empty/unset means "remove nothing".
+        let startup_taints = env::var("STARTUP_TAINTS")
+            .unwrap_or_default()
+            .split([',', ' ', '\t', '\n'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Empty is treated as absent, so a template that renders the env var
+        // unconditionally still means "look it up".
+        let container_runtime_version = env::var("CONTAINER_RUNTIME_VERSION")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let k8s_distribution = env::var("K8S_DISTRIBUTION")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let config = Config {
             node_name,
@@ -305,6 +461,7 @@ impl Config {
             multi_install_suffix,
             helm_post_delete_hook,
             experimental_setup_snapshotter,
+            erofs_merge_mode,
             experimental_force_guest_pull_for_arch,
             dest_dir,
             host_install_dir,
@@ -314,15 +471,33 @@ impl Config {
             containerd_conf_file,
             containerd_conf_file_backup,
             containerd_drop_in_conf_file,
+            containerd_user_drop_in_source_file,
             daemonset_name,
             custom_runtimes_enabled,
             custom_runtimes,
+            devkit_enabled,
+            erofs_snapshotter_mode,
+            erofs_dmverity,
+            startup_taints,
+            container_runtime_version,
+            k8s_distribution,
         };
 
         // Validate the configuration
         config.validate()?;
 
         Ok(config)
+    }
+
+    /// The CRI runtime handlers this install writes for its shims.
+    ///
+    /// Custom runtimes and variants are left out: they are configured
+    /// conditionally, so their absence from a runtime would say nothing.
+    pub fn shim_handlers(&self) -> Vec<String> {
+        self.shims_for_arch
+            .iter()
+            .map(|shim| shim_handler(shim, self.multi_install_suffix.as_deref()))
+            .collect()
     }
 
     /// Validate configuration parameters
@@ -474,6 +649,17 @@ impl Config {
             _ => {}
         }
 
+        // Validate EROFS_MERGE_MODE
+        // Only "merged" (default) and "unmerged" are accepted.
+        if let Some(mode) = self.erofs_merge_mode.as_ref() {
+            if mode != "merged" && mode != "unmerged" {
+                return Err(anyhow::anyhow!(
+                    "EROFS_MERGE_MODE must be either 'merged' or 'unmerged', got '{}'",
+                    mode
+                ));
+            }
+        }
+
         // Validate EXPERIMENTAL_FORCE_GUEST_PULL_FOR_ARCH
         // This is a list of shim names
         for shim in &self.experimental_force_guest_pull_for_arch {
@@ -484,6 +670,19 @@ impl Config {
                     shim,
                     self.shims_for_arch.join(", ")
                 ));
+            }
+        }
+
+        // Validate EROFS_SNAPSHOTTER_MODE.
+        if let Some(mode) = self.erofs_snapshotter_mode.as_ref() {
+            match mode.as_str() {
+                "disk" | "memory" => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported EROFS_SNAPSHOTTER_MODE: '{}'. Supported values: disk, memory",
+                        mode
+                    ));
+                }
             }
         }
 
@@ -517,15 +716,26 @@ impl Config {
             "* EXPERIMENTAL_SETUP_SNAPSHOTTER: {:?}",
             self.experimental_setup_snapshotter
         );
+        info!("* EROFS_MERGE_MODE: {:?}", self.erofs_merge_mode);
+        info!(
+            "* EROFS_SNAPSHOTTER_MODE: {:?}",
+            self.erofs_snapshotter_mode
+        );
+        info!("* EROFS_DMVERITY: {}", self.erofs_dmverity);
         info!(
             "* EXPERIMENTAL_FORCE_GUEST_PULL: {}",
             self.experimental_force_guest_pull_for_arch.join(",")
         );
         info!("* CONTAINERD_CONF_FILE: {}", self.containerd_conf_file);
         info!(
+            "* CONTAINERD_USER_DROP_IN_SOURCE_FILE: {:?}",
+            self.containerd_user_drop_in_source_file
+        );
+        info!(
             "* CUSTOM_RUNTIMES_ENABLED: {}",
             self.custom_runtimes_enabled
         );
+        info!("* STARTUP_TAINTS: {}", self.startup_taints.join(" "));
         if !self.custom_runtimes.is_empty() {
             info!("* CUSTOM_RUNTIMES:");
             for runtime in &self.custom_runtimes {
@@ -539,15 +749,41 @@ impl Config {
                 );
             }
         }
+
+        log::debug!("Resolved kata-deploy configuration:\n{:#?}", self);
+    }
+
+    /// This node's container runtime version, e.g. `containerd://2.1.5-k3s1`.
+    ///
+    /// Every caller goes through here so there is a single place where the value
+    /// can come from the environment (job mode, where the dispatcher passes it in
+    /// and the pod holds no credentials) instead of from the Node object.
+    pub async fn resolve_container_runtime_version(&self) -> Result<String> {
+        match self.container_runtime_version.as_deref() {
+            Some(version) => Ok(version.to_string()),
+            None => k8s::get_container_runtime_version(self).await.context(
+                "could not read this node's container runtime version from the apiserver. In job \
+                 mode the dispatcher passes it in CONTAINER_RUNTIME_VERSION precisely because \
+                 these pods hold no credentials, so reaching this means it did not",
+            ),
+        }
     }
 
     /// Get containerd configuration file paths based on runtime type and containerd version
     pub async fn get_containerd_paths(&self, runtime: &str) -> Result<ContainerdPaths> {
         use crate::runtime::manager;
 
-        // Check if drop-in files can be used based on containerd version
-        let use_drop_in =
-            manager::is_containerd_capable_of_using_drop_in_files(self, runtime).await?;
+        // Get containerd version once for drop-in and conf.d capability checks.
+        // Not required for k0s (drop-ins are always supported there).
+        let container_runtime_version = if matches!(runtime, "k0s-worker" | "k0s-controller") {
+            None
+        } else {
+            Some(self.resolve_container_runtime_version().await?)
+        };
+        let use_drop_in = manager::is_containerd_capable_of_drop_in(
+            runtime,
+            container_runtime_version.as_deref(),
+        );
 
         let paths = match runtime {
             "k0s-worker" | "k0s-controller" => ContainerdPaths {
@@ -572,7 +808,6 @@ impl Config {
                 // versioned drop-in dir (config.toml.d or config-v3.toml.d). If the import is
                 // missing we bail; the cluster must configure the template with the import
                 // (e.g. in tests or via a custom k3s/RKE2 setup). Refs: docs.k3s.io/advanced#configuring-containerd
-                let container_runtime_version = k8s::get_container_runtime_version(self).await.ok();
                 let use_v3 = k3s_rke2_resolve_use_v3(
                     k3s_rke2_rendered_config_path(),
                     container_runtime_version.as_deref(),
@@ -614,14 +849,41 @@ impl Config {
                     plugin_id: Some(k3s_rke2_containerd_plugin_id(use_v3).to_string()),
                 }
             }
-            _ => ContainerdPaths {
-                config_file: self.containerd_conf_file.clone(),
-                backup_file: self.containerd_conf_file_backup.clone(),
-                imports_file: Some(self.containerd_conf_file.clone()),
-                drop_in_file: self.containerd_drop_in_conf_file.clone(),
-                use_drop_in,
-                plugin_id: None,
-            },
+            _ => {
+                // For containerd >= 2.2.0, use /etc/containerd/conf.d/ which is auto-imported
+                // by containerd, avoiding the need to modify the main config entirely.
+                // Check if the config actually has imports before skipping adding it explicitly.
+                let supports_conf_d = container_runtime_version
+                    .as_deref()
+                    .map(|v| {
+                        manager::containerd_version_is_2_2_or_newer(v)
+                            && config_has_containerd_confd_import(&self.containerd_conf_file)
+                    })
+                    .unwrap_or(false);
+
+                let (imports_file, drop_in_file) = if supports_conf_d {
+                    let drop_in = if let Some(ref suffix) = self.multi_install_suffix {
+                        format!("/etc/containerd/conf.d/kata-deploy-{suffix}.toml")
+                    } else {
+                        "/etc/containerd/conf.d/kata-deploy.toml".to_string()
+                    };
+                    (None, drop_in)
+                } else {
+                    (
+                        Some(self.containerd_conf_file.clone()),
+                        self.containerd_drop_in_conf_file.clone(),
+                    )
+                };
+
+                ContainerdPaths {
+                    config_file: self.containerd_conf_file.clone(),
+                    backup_file: self.containerd_conf_file_backup.clone(),
+                    imports_file,
+                    drop_in_file,
+                    use_drop_in,
+                    plugin_id: None,
+                }
+            }
         };
 
         Ok(paths)
@@ -719,6 +981,8 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
             drop_in_file,
             containerd_snapshotter,
             crio_pull_type,
+            debug_variant: false,
+            devkit: false,
         });
     }
 
@@ -730,15 +994,144 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
     Ok(custom_runtimes)
 }
 
+/// Look up `shim`'s value in a comma-separated "shim1:value1,shim2:value2"
+/// mapping (SNAPSHOTTER_HANDLER_MAPPING, PULL_TYPE_MAPPING). None if absent or
+/// empty.
+fn lookup_mapping_value(mapping: &str, shim: &str) -> Option<String> {
+    mapping.split(',').find_map(|entry| {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() == 2 && parts[0].trim() == shim {
+            let value = parts[1].trim();
+            (!value.is_empty()).then(|| value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// A RuntimeClass kata-deploy synthesizes for a shim, in addition to the plain
+/// one. Both carry guest debug configuration, which is what keeps it off the
+/// plain RuntimeClass and its kernel cmdline stable for measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// kata-<shim>-debug: guest debug configuration.
+    Debug,
+    /// kata-<shim>-devkit: the same, plus the devkit extension image and the
+    /// debug console shell it carries.
+    Devkit,
+}
+
+impl Variant {
+    /// Suffix distinguishing the variant's handler from the plain one.
+    fn suffix(&self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Devkit => "devkit",
+        }
+    }
+}
+
+/// The handler name, and hence the RuntimeClass name, of a shim.
+///
+/// In one place because it is both written into the CRI configuration and read
+/// back out of a running CRI to confirm that configuration was loaded.
+pub fn shim_handler(shim: &str, multi_install_suffix: Option<&str>) -> String {
+    match multi_install_suffix {
+        Some(install_suffix) if !install_suffix.is_empty() => {
+            format!("kata-{shim}-{install_suffix}")
+        }
+        _ => format!("kata-{shim}"),
+    }
+}
+
+/// The handler name, and hence the RuntimeClass name, of a shim's variant.
+///
+/// In one place because the cleanup of stale variants has to look for exactly
+/// the names the synthesis below produced, multi-install suffix and all.
+pub fn variant_handler(shim: &str, multi_install_suffix: Option<&str>, variant: Variant) -> String {
+    let suffix = variant.suffix();
+    match multi_install_suffix {
+        Some(install_suffix) if !install_suffix.is_empty() => {
+            format!("kata-{shim}-{install_suffix}-{suffix}")
+        }
+        _ => format!("kata-{shim}-{suffix}"),
+    }
+}
+
+/// Append a variant custom runtime per enabled shim, modelling them as custom
+/// runtimes so they reuse the whole install/register/cleanup machinery: all
+/// that distinguishes them is which drop-ins install.rs writes.
+///
+/// The handler is derived from the standard runtime name (kata-<shim>, or
+/// kata-<shim>-<suffix> under a multi-install) so concurrent kata-deploy
+/// instances on the same node do not fight over one variant handler.
+fn synthesize_variant_runtimes(
+    variant: Variant,
+    shims_for_arch: &[String],
+    multi_install_suffix: Option<&str>,
+    snapshotter_handler_mapping_for_arch: Option<&str>,
+    pull_type_mapping_for_arch: Option<&str>,
+    custom_runtimes: &mut Vec<CustomRuntime>,
+) {
+    let suffix = variant.suffix();
+
+    for shim in shims_for_arch {
+        let handler = variant_handler(shim, multi_install_suffix, variant);
+        if custom_runtimes.iter().any(|r| r.handler == handler) {
+            continue;
+        }
+
+        // Inherit the base shim's image-pulling config: the variant RuntimeClass
+        // shares the base config (same shared_fs), so it must pull the same way.
+        // Otherwise containerd/CRI-O default to overlayfs/node-pull, which breaks
+        // shims running shared_fs = none (e.g. nvidia runtime-rs) and makes every
+        // pod on the variant terminate.
+        let containerd_snapshotter = snapshotter_handler_mapping_for_arch
+            .and_then(|mapping| lookup_mapping_value(mapping, shim));
+        let crio_pull_type =
+            pull_type_mapping_for_arch.and_then(|mapping| lookup_mapping_value(mapping, shim));
+
+        log::info!(
+            "Synthesizing {} variant runtime: handler={}, base_config={}",
+            suffix,
+            handler,
+            shim
+        );
+
+        custom_runtimes.push(CustomRuntime {
+            handler,
+            base_config: shim.clone(),
+            drop_in_file: None,
+            containerd_snapshotter,
+            crio_pull_type,
+            debug_variant: true,
+            devkit: variant == Variant::Devkit,
+        });
+    }
+}
+
 /// Get default shims list for a specific architecture
 /// Returns only shims that are supported for that architecture
 fn get_default_shims_for_arch(arch: &str) -> &'static str {
     match arch {
-        "x86_64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-gpu qemu-nvidia-gpu-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-snp-runtime-rs qemu-nvidia-gpu-tdx qemu-nvidia-gpu-tdx-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs",
-        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-gpu qemu-cca",
+        "x86_64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu qemu-nvidia-gpu-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-snp-runtime-rs qemu-nvidia-gpu-tdx qemu-nvidia-gpu-tdx-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs",
+        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu",
         "s390x" => "qemu qemu-runtime-rs qemu-se qemu-se-runtime-rs qemu-coco-dev qemu-coco-dev-runtime-rs",
-        "ppc64le" => "qemu",
+        "ppc64le" => "qemu qemu-runtime-rs",
         _ => "qemu", // Fallback to qemu for unknown architectures
+    }
+}
+
+/// Get the default shim for a specific architecture.
+///
+/// Since the Kata Containers 4.0 release, the Rust runtime (runtime-rs,
+/// "qemu-runtime-rs") is the default wherever a runtime-rs build exists.
+/// This only acts as a fallback: the Helm chart normally provides DEFAULT_SHIM
+/// explicitly via values.yaml (`defaultShim`).
+fn get_default_shim_for_arch(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" | "aarch64" | "s390x" | "ppc64le" => "qemu-runtime-rs",
+        _ => "qemu", // Fallback to the Go runtime for unknown architectures
     }
 }
 
@@ -818,6 +1211,9 @@ mod tests {
             "EXPERIMENTAL_FORCE_GUEST_PULL_S390X",
             "EXPERIMENTAL_FORCE_GUEST_PULL_PPC64LE",
             "CONTAINERD_CONFIG_FILE_NAME",
+            "STARTUP_TAINTS",
+            "CUSTOM_RUNTIMES_ENABLED",
+            "DEVKIT",
         ];
         for var in &vars {
             std::env::remove_var(var);
@@ -882,6 +1278,16 @@ mod tests {
         let arch = get_arch().unwrap();
         assert!(!arch.is_empty());
         cleanup_env_vars();
+    }
+
+    #[rstest]
+    #[case("x86_64", "qemu-runtime-rs")]
+    #[case("aarch64", "qemu-runtime-rs")]
+    #[case("s390x", "qemu-runtime-rs")]
+    #[case("ppc64le", "qemu-runtime-rs")]
+    #[case("riscv64", "qemu")]
+    fn test_get_default_shim_for_arch(#[case] arch: &str, #[case] expected: &str) {
+        assert_eq!(get_default_shim_for_arch(arch), expected);
     }
 
     #[serial]
@@ -954,6 +1360,155 @@ mod tests {
         );
 
         cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_devkit_disabled_by_default() {
+        setup_minimal_env();
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.devkit_enabled);
+        assert!(config.custom_runtimes.iter().all(|r| !r.devkit));
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_devkit_requires_debug() {
+        setup_minimal_env();
+        // DEBUG defaults to false in setup_minimal_env.
+        std::env::set_var("DEVKIT", "true");
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.devkit_enabled);
+        assert!(config.custom_runtimes.iter().all(|r| !r.devkit));
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_devkit_synthesizes_per_shim_runtime() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        std::env::set_var("DEVKIT", "true");
+
+        let config = Config::from_env().unwrap();
+
+        assert!(config.devkit_enabled);
+        assert!(config.custom_runtimes_enabled);
+
+        // setup_minimal_env configures a single "qemu" shim for this arch.
+        let devkit: Vec<_> = config.custom_runtimes.iter().filter(|r| r.devkit).collect();
+        assert_eq!(devkit.len(), 1);
+        assert_eq!(devkit[0].handler, "kata-qemu-devkit");
+        assert_eq!(devkit[0].base_config, "qemu");
+        assert!(devkit[0].drop_in_file.is_none());
+        // With no snapshotter/pull-type mapping, the devkit runtime inherits
+        // nothing and containerd/CRI-O use their defaults for the base shim.
+        assert!(devkit[0].containerd_snapshotter.is_none());
+        assert!(devkit[0].crio_pull_type.is_none());
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_devkit_inherits_base_shim_snapshotter_and_pull_type() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        std::env::set_var("DEVKIT", "true");
+        // The base "qemu" shim is mapped to the erofs snapshotter / guest-pull;
+        // its devkit variant must inherit both so pods on the devkit
+        // RuntimeClass pull images the same way as the base shim (crucial for
+        // shims running with shared_fs = none).
+        set_arch_var("SNAPSHOTTER_HANDLER_MAPPING", "qemu:erofs");
+        set_arch_var("PULL_TYPE_MAPPING", "qemu:guest-pull");
+
+        let config = Config::from_env().unwrap();
+
+        let devkit: Vec<_> = config.custom_runtimes.iter().filter(|r| r.devkit).collect();
+        assert_eq!(devkit.len(), 1);
+        assert_eq!(devkit[0].handler, "kata-qemu-devkit");
+        assert_eq!(devkit[0].containerd_snapshotter.as_deref(), Some("erofs"));
+        assert_eq!(devkit[0].crio_pull_type.as_deref(), Some("guest-pull"));
+
+        cleanup_env_vars();
+    }
+
+    /// Guest debug lives on the variant RuntimeClasses rather than the plain
+    /// one, so the devkit RuntimeClass has to be a debug variant as well:
+    /// otherwise the class whose whole purpose is debugging would boot a guest
+    /// with no agent debug console to reach.
+    #[serial]
+    #[test]
+    fn test_devkit_runtime_is_also_a_debug_variant() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        std::env::set_var("DEVKIT", "true");
+
+        let config = Config::from_env().unwrap();
+
+        let devkit = config
+            .custom_runtimes
+            .iter()
+            .find(|r| r.devkit)
+            .expect("expected synthesized devkit runtime");
+        assert!(devkit.debug_variant);
+
+        // And the plain debug variant is still there, on its own handler.
+        let handlers: Vec<_> = config
+            .custom_runtimes
+            .iter()
+            .map(|r| r.handler.as_str())
+            .collect();
+        assert_eq!(handlers, vec!["kata-qemu-debug", "kata-qemu-devkit"]);
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_devkit_handler_includes_multi_install_suffix() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        std::env::set_var("DEVKIT", "true");
+        std::env::set_var("MULTI_INSTALL_SUFFIX", "dev");
+
+        let config = Config::from_env().unwrap();
+
+        let devkit = config
+            .custom_runtimes
+            .iter()
+            .find(|r| r.devkit)
+            .expect("expected synthesized devkit runtime");
+        // Same reason as the debug variant: two kata-deploy instances on one
+        // node must not share a handler.
+        assert_eq!(devkit.handler, "kata-qemu-dev-devkit");
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    fn test_lookup_mapping_value() {
+        let mapping = "qemu:erofs, fc:nydus,clh:";
+        assert_eq!(
+            lookup_mapping_value(mapping, "qemu").as_deref(),
+            Some("erofs")
+        );
+        // Entries may carry surrounding whitespace.
+        assert_eq!(
+            lookup_mapping_value(mapping, "fc").as_deref(),
+            Some("nydus")
+        );
+        // Empty value is treated as absent.
+        assert!(lookup_mapping_value(mapping, "clh").is_none());
+        // Unknown shim.
+        assert!(lookup_mapping_value(mapping, "stratovirt").is_none());
+        // Nothing mapped at all.
+        assert!(lookup_mapping_value("", "qemu").is_none());
     }
 
     #[serial]
@@ -1432,5 +1987,98 @@ mod tests {
 
             cleanup_env_vars();
         }
+    }
+
+    #[serial]
+    #[test]
+    fn test_debug_variant_not_synthesized_when_debug_disabled() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "false");
+
+        let config = Config::from_env().unwrap();
+
+        assert!(!config.custom_runtimes_enabled);
+        assert!(config.custom_runtimes.is_empty());
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_debug_variant_synthesizes_per_shim_runtime() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+
+        let config = Config::from_env().unwrap();
+
+        assert!(config.custom_runtimes_enabled);
+
+        let debug_variants: Vec<_> = config
+            .custom_runtimes
+            .iter()
+            .filter(|r| r.debug_variant)
+            .collect();
+        assert_eq!(debug_variants.len(), 1);
+        assert_eq!(debug_variants[0].handler, "kata-qemu-debug");
+        assert_eq!(debug_variants[0].base_config, "qemu");
+        assert!(debug_variants[0].drop_in_file.is_none());
+        assert!(debug_variants[0].containerd_snapshotter.is_none());
+        assert!(debug_variants[0].crio_pull_type.is_none());
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    fn shim_handlers_name_what_the_cri_config_declares() {
+        assert_eq!(shim_handler("qemu", None), "kata-qemu");
+        assert_eq!(shim_handler("qemu", Some("")), "kata-qemu");
+        assert_eq!(shim_handler("qemu", Some("dev")), "kata-qemu-dev");
+    }
+
+    #[serial]
+    #[test]
+    fn test_debug_variant_handler_includes_multi_install_suffix() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        std::env::set_var("MULTI_INSTALL_SUFFIX", "dev");
+
+        let config = Config::from_env().unwrap();
+
+        let debug_variant = config
+            .custom_runtimes
+            .iter()
+            .find(|r| r.debug_variant)
+            .expect("expected synthesized debug variant runtime");
+        // Mirrors the standard handler (kata-<shim>-<suffix>) so two kata-deploy
+        // instances on one node do not share a debug handler.
+        assert_eq!(debug_variant.handler, "kata-qemu-dev-debug");
+        assert_eq!(debug_variant.base_config, "qemu");
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_debug_variant_inherits_base_shim_snapshotter_and_pull_type() {
+        setup_minimal_env();
+        std::env::set_var("DEBUG", "true");
+        set_arch_var("SNAPSHOTTER_HANDLER_MAPPING", "qemu:nydus");
+        set_arch_var("PULL_TYPE_MAPPING", "qemu:guest-pull");
+
+        let config = Config::from_env().unwrap();
+
+        let debug_variant = config
+            .custom_runtimes
+            .iter()
+            .find(|r| r.debug_variant)
+            .expect("expected synthesized debug variant runtime");
+        assert_eq!(debug_variant.handler, "kata-qemu-debug");
+        assert_eq!(
+            debug_variant.containerd_snapshotter.as_deref(),
+            Some("nydus")
+        );
+        assert_eq!(debug_variant.crio_pull_type.as_deref(), Some("guest-pull"));
+
+        cleanup_env_vars();
     }
 }

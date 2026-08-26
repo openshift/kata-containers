@@ -3,8 +3,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config;
 use crate::config::{Config, ContainerdPaths, CustomRuntime, NYDUS_FOR_KATA_TEE};
-use crate::k8s;
 use crate::utils;
 use crate::utils::toml as toml_utils;
 use anyhow::{Context, Result};
@@ -132,15 +132,102 @@ pub(crate) fn pluginid_for_snapshotter_annotations(
 
 fn get_containerd_output_path(paths: &ContainerdPaths) -> PathBuf {
     if paths.use_drop_in {
-        if paths.drop_in_file.starts_with("/etc/containerd/") {
-            Path::new(&paths.drop_in_file).to_path_buf()
-        } else {
-            let drop_in_path = paths.drop_in_file.trim_start_matches('/');
-            Path::new("/host").join(drop_in_path)
-        }
+        Path::new(&paths.drop_in_file).to_path_buf()
     } else {
         Path::new(&paths.config_file).to_path_buf()
     }
+}
+
+/// Every containerd configuration file [`configure_containerd`] can write, the
+/// effective kata output file first.
+///
+/// All of them, because an unchanged kata drop-in says nothing about the user
+/// drop-in next to it, or about the `imports` entry in the main config that
+/// makes containerd read either of them in the first place.
+pub(crate) async fn kata_cri_config_files(config: &Config, runtime: &str) -> Option<Vec<PathBuf>> {
+    let paths = config.get_containerd_paths(runtime).await.ok()?;
+
+    let mut files = vec![get_containerd_output_path(&paths)];
+    if let Ok((user_drop_in, _)) = get_user_containerd_drop_in_output_path(&paths) {
+        files.push(user_drop_in);
+    }
+    if let Some(imports_file) = &paths.imports_file {
+        files.push(PathBuf::from(imports_file));
+    }
+
+    // Without drop-in support the output file is the main config, which is also
+    // where imports would go.
+    files.dedup();
+
+    Some(files)
+}
+
+fn get_user_containerd_drop_in_output_path(paths: &ContainerdPaths) -> Result<(PathBuf, String)> {
+    if !paths.use_drop_in {
+        anyhow::bail!(
+            "Containerd user drop-in requires drop-in support, but runtime config is in non-drop-in mode"
+        );
+    }
+
+    let base_drop_in = Path::new(&paths.drop_in_file).to_path_buf();
+    let base_import_path = paths.drop_in_file.clone();
+
+    let parent = base_drop_in.parent().ok_or_else(|| {
+        anyhow::anyhow!("Failed to resolve parent directory for {:?}", base_drop_in)
+    })?;
+    let user_file_name = "zz-kata-deploy-user.toml";
+    let host_path = parent.join(user_file_name);
+
+    let import_parent = Path::new(&base_import_path)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to resolve import parent for {base_import_path}"))?;
+    let import_path = import_parent
+        .join(user_file_name)
+        .to_string_lossy()
+        .to_string();
+
+    Ok((host_path, import_path))
+}
+
+fn configure_user_containerd_drop_in(config: &Config, paths: &ContainerdPaths) -> Result<()> {
+    let Some(source_file) = config.containerd_user_drop_in_source_file.as_ref() else {
+        return Ok(());
+    };
+
+    let source_path = Path::new(source_file);
+    if !source_path.exists() {
+        anyhow::bail!(
+            "Configured CONTAINERD_USER_DROP_IN_SOURCE_FILE does not exist: {}",
+            source_file
+        );
+    }
+
+    let (user_drop_in_path, user_drop_in_import_path) =
+        get_user_containerd_drop_in_output_path(paths)?;
+    if let Some(parent) = user_drop_in_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create user containerd drop-in directory: {parent:?}")
+        })?;
+    }
+
+    fs::copy(source_path, &user_drop_in_path).with_context(|| {
+        format!(
+            "Failed to copy user containerd drop-in from {:?} to {:?}",
+            source_path, user_drop_in_path
+        )
+    })?;
+
+    if let Some(imports_file) = &paths.imports_file {
+        toml_utils::append_to_toml_array(
+            Path::new(imports_file),
+            ".imports",
+            &format!("\"{}\"", user_drop_in_import_path),
+        )?;
+    }
+
+    utils::debug_log_file_contents("Containerd user drop-in", &user_drop_in_path);
+
+    Ok(())
 }
 
 fn write_containerd_runtime_config(
@@ -223,11 +310,7 @@ pub async fn configure_containerd_runtime(
 ) -> Result<()> {
     log::info!("configure_containerd_runtime: Starting for shim={}", shim);
 
-    let adjusted_shim = match config.multi_install_suffix.as_ref() {
-        Some(suffix) if !suffix.is_empty() => format!("{shim}-{suffix}"),
-        _ => shim.to_string(),
-    };
-    let runtime_name = format!("kata-{adjusted_shim}");
+    let runtime_name = config::shim_handler(shim, config.multi_install_suffix.as_deref());
     let configuration = format!("configuration-{shim}");
 
     let paths = config.get_containerd_paths(runtime).await?;
@@ -374,17 +457,24 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
 
     if !paths.use_drop_in {
         // For non-drop-in, backup the correct config file for each runtime
-        if Path::new(&paths.config_file).exists() && !Path::new(&paths.backup_file).exists() {
-            fs::copy(&paths.config_file, &paths.backup_file)?;
+        if Path::new(&paths.config_file).exists() {
+            // Only what was found here before kata-deploy is worth preserving. A
+            // configuration an earlier run of this install created is not, and
+            // backing it up would make uninstall restore Kata's own handlers.
+            if matches!(
+                whole_file_disposition(&paths.config_file, &paths.backup_file),
+                WholeFileConfig::Keep
+            ) {
+                fs::copy(&paths.config_file, &paths.backup_file)?;
+            }
+        } else {
+            // Nothing to back up, so uninstall has no way to tell this file apart
+            // from one an administrator wrote unless we say we made it.
+            fs::write(created_marker_file(&paths.config_file), "")?;
         }
     } else {
         // Create the drop-in file directory and file
-        // Only add /host prefix if path is not in /etc/containerd (which is mounted from host)
-        let drop_in_file = if paths.drop_in_file.starts_with("/etc/containerd/") {
-            paths.drop_in_file.clone()
-        } else {
-            format!("/host{}", paths.drop_in_file)
-        };
+        let drop_in_file = paths.drop_in_file.clone();
         log::info!("Creating drop-in file at: {}", drop_in_file);
 
         if let Some(parent) = Path::new(&drop_in_file).parent() {
@@ -414,6 +504,9 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
             log::info!("Successfully added drop-in to imports array");
         } else {
             log::info!("Runtime auto-loads drop-in files, skipping imports");
+            // Migrating to conf.d: drop any stale import a pre-conf.d
+            // kata-deploy left in the main config so it can't dangle later.
+            remove_legacy_drop_in_import(config)?;
         }
     }
 
@@ -445,7 +538,75 @@ pub async fn configure_containerd(config: &Config, runtime: &str) -> Result<()> 
         }
     }
 
+    configure_user_containerd_drop_in(config, &paths)?;
+
+    utils::debug_log_file_contents(
+        "Containerd main config/template",
+        Path::new(&paths.config_file),
+    );
+    if is_k3s_or_rke2(runtime) {
+        utils::debug_log_file_contents(
+            "Containerd rendered config",
+            Path::new(crate::config::k3s_rke2_rendered_config_path()),
+        );
+    }
+    if paths.use_drop_in {
+        let drop_in_file = get_containerd_output_path(&paths);
+        utils::debug_log_file_contents("Containerd kata-deploy drop-in", &drop_in_file);
+    }
+
     log::info!("Successfully configured all containerd runtimes");
+    Ok(())
+}
+
+/// Defensively remove a legacy kata-deploy entry from the main containerd
+/// config's `imports` array.
+///
+/// kata-deploy versions predating the conf.d migration registered their drop-in
+/// by appending `{dest_dir}/containerd/config.d/kata-deploy.toml` to the
+/// `imports` array of the main containerd config. Since the conf.d migration
+/// (containerd >= 2.2.0) we write to the auto-imported `/etc/containerd/conf.d/`
+/// directory instead and no longer touch the `imports` array. When a node is
+/// upgraded from a pre-conf.d kata-deploy to a conf.d-aware one, that stale
+/// import survives: the new code never adds it (so never removes it either).
+///
+/// On uninstall we delete the artifacts directory (`dest_dir`) — including the
+/// file the stale import still points at — and then restart containerd. The
+/// restart fails because containerd imports a path that no longer exists,
+/// wedging the node (pods stuck Terminating, new pods unable to start).
+///
+/// Scrubbing the stale import keeps the main config self-consistent across the
+/// version boundary. It is a no-op on fresh conf.d installs (nothing to remove)
+/// and on runtimes that still manage `imports` themselves (handled separately).
+fn remove_legacy_drop_in_import(config: &Config) -> Result<()> {
+    remove_legacy_drop_in_import_from(
+        Path::new(&config.containerd_conf_file),
+        &config.containerd_drop_in_conf_file,
+    )
+}
+
+/// Pure core of [`remove_legacy_drop_in_import`], separated out so it can be
+/// unit tested without constructing a full [`Config`].
+fn remove_legacy_drop_in_import_from(main_config: &Path, legacy_import: &str) -> Result<()> {
+    if !main_config.exists() {
+        return Ok(());
+    }
+
+    // get_toml_array returns an empty Vec when the file has no `imports` array,
+    // so this never errors (or accidentally removes anything) on a config we
+    // never touched.
+    let imports = toml_utils::get_toml_array(main_config, ".imports").unwrap_or_default();
+    if !imports.iter().any(|entry| entry == legacy_import) {
+        return Ok(());
+    }
+
+    log::info!(
+        "Removing stale legacy kata-deploy import '{}' from {}",
+        legacy_import,
+        main_config.display()
+    );
+    toml_utils::remove_from_toml_array(main_config, ".imports", &format!("\"{legacy_import}\""))?;
+
     Ok(())
 }
 
@@ -454,6 +615,21 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
     let paths = config.get_containerd_paths(runtime).await?;
 
     if paths.use_drop_in {
+        if config.containerd_user_drop_in_source_file.is_some() {
+            let (user_drop_in_path, user_drop_in_import_path) =
+                get_user_containerd_drop_in_output_path(&paths)?;
+            if let Some(imports_file) = &paths.imports_file {
+                toml_utils::remove_from_toml_array(
+                    Path::new(imports_file),
+                    ".imports",
+                    &format!("\"{}\"", user_drop_in_import_path),
+                )?;
+            }
+            if user_drop_in_path.exists() {
+                fs::remove_file(&user_drop_in_path)?;
+            }
+        }
+
         // Remove drop-in from imports array (if we added it; K3s/RKE2 have imports_file = None)
         if let Some(imports_file) = &paths.imports_file {
             toml_utils::remove_from_toml_array(
@@ -463,26 +639,68 @@ pub async fn cleanup_containerd(config: &Config, runtime: &str) -> Result<()> {
             )?;
         }
         // Remove the drop-in file
-        let drop_in_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
-            Path::new(&paths.drop_in_file).to_path_buf()
-        } else {
-            Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
-        };
+        let drop_in_path = Path::new(&paths.drop_in_file).to_path_buf();
         if drop_in_path.exists() {
             fs::remove_file(&drop_in_path)?;
         }
+
+        // When `imports_file` is None (e.g. conf.d auto-import on containerd
+        // >= 2.2.0) we don't manage the imports array, so a stale entry left by
+        // a pre-conf.d kata-deploy would otherwise dangle once the artifacts
+        // are removed and containerd is restarted. Scrub it defensively.
+        if paths.imports_file.is_none() {
+            remove_legacy_drop_in_import(config)?;
+        }
+
         return Ok(());
     }
 
-    // For non-drop-in, restore from backup
-    if Path::new(&paths.backup_file).exists() {
-        fs::remove_file(&paths.config_file)?;
-        fs::rename(&paths.backup_file, &paths.config_file)?;
-    } else {
-        fs::remove_file(&paths.config_file).ok();
+    match whole_file_disposition(&paths.config_file, &paths.backup_file) {
+        WholeFileConfig::Restore => {
+            fs::remove_file(&paths.config_file)?;
+            fs::rename(&paths.backup_file, &paths.config_file)?;
+        }
+        WholeFileConfig::Delete => {
+            fs::remove_file(&paths.config_file).ok();
+            fs::remove_file(created_marker_file(&paths.config_file)).ok();
+        }
+        WholeFileConfig::Keep => log::warn!(
+            "Leaving {} in place: it has no kata-deploy backup and no record of having been \
+             created by kata-deploy, so its contents are not ours to remove",
+            paths.config_file
+        ),
     }
 
     Ok(())
+}
+
+/// What uninstall is entitled to do with a whole-file containerd configuration.
+pub enum WholeFileConfig {
+    /// An install replaced a configuration that was already there.
+    Restore,
+    /// An install created the configuration, so removing it restores the host.
+    Delete,
+    /// No evidence that any install wrote this file: leave it to its owner.
+    Keep,
+}
+
+/// A missing backup only means "we created this" if creating it was recorded. On
+/// anything weaker - a path this install also uses appearing in the file, say -
+/// deleting takes an administrator's whole containerd configuration with it.
+pub fn whole_file_disposition(config_file: &str, backup_file: &str) -> WholeFileConfig {
+    if Path::new(backup_file).exists() {
+        WholeFileConfig::Restore
+    } else if Path::new(&created_marker_file(config_file)).exists() {
+        WholeFileConfig::Delete
+    } else {
+        WholeFileConfig::Keep
+    }
+}
+
+/// Path of the record that an install created `config_file` from nothing, kept
+/// next to the configuration so it outlives the pod that wrote it.
+fn created_marker_file(config_file: &str) -> String {
+    format!("{config_file}.kata-deploy-created")
 }
 
 /// Setup containerd config files based on runtime type.
@@ -494,11 +712,7 @@ pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Re
             // K3s/RKE2: rendered config must already import the drop-in dir (checked in get_containerd_paths).
             // Create the drop-in dir and empty file only.
             let paths = config.get_containerd_paths(runtime).await?;
-            let drop_in_path = if paths.drop_in_file.starts_with("/etc/containerd/") {
-                Path::new(&paths.drop_in_file).to_path_buf()
-            } else {
-                Path::new("/host").join(paths.drop_in_file.trim_start_matches('/'))
-            };
+            let drop_in_path = Path::new(&paths.drop_in_file).to_path_buf();
             if let Some(parent) = drop_in_path.parent() {
                 fs::create_dir_all(parent).with_context(|| {
                     format!("Failed to create K3s/RKE2 drop-in dir: {parent:?}")
@@ -511,7 +725,7 @@ pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Re
             }
         }
         "k0s-worker" | "k0s-controller" => {
-            // k0s uses /etc/containerd/containerd.d/ for drop-ins (no /host prefix needed)
+            // k0s uses /etc/containerd/containerd.d/ for drop-ins.
             // Path is fixed for k0s, so we can hardcode it here
             let drop_in_file_path = "/etc/containerd/containerd.d/kata-deploy.toml";
             if let Some(parent) = Path::new(drop_in_file_path).parent() {
@@ -519,14 +733,15 @@ pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Re
             }
             fs::File::create(drop_in_file_path)?;
         }
-        "containerd" => {
-            if !Path::new(&config.containerd_conf_file).exists() {
-                if let Some(parent) = Path::new(&config.containerd_conf_file).parent() {
-                    if parent.exists() {
-                        // Write output to file
-                        let output = utils::host_exec(&["containerd", "config", "default"])?;
-                        fs::write(&config.containerd_conf_file, output)?;
-                    }
+        "containerd" if !Path::new(&config.containerd_conf_file).exists() => {
+            if let Some(parent) = Path::new(&config.containerd_conf_file).parent() {
+                if parent.exists() {
+                    let runtime_version = config.resolve_container_runtime_version().await?;
+                    let schema = schema_version_for_containerd_release(&runtime_version)?;
+                    fs::write(
+                        &config.containerd_conf_file,
+                        format!("version = {schema}\n"),
+                    )?;
                 }
             }
         }
@@ -534,6 +749,31 @@ pub async fn setup_containerd_config_files(runtime: &str, config: &Config) -> Re
     }
 
     Ok(())
+}
+
+/// The configuration schema a containerd release reads: 3 since containerd 2.0,
+/// 2 before it.
+///
+/// A node can run containerd without a configuration file at all, but
+/// kata-deploy needs one to hang its runtime handlers and imports off. It
+/// writes just the schema version, which leaves containerd on its own built-in
+/// defaults rather than freezing the defaults of whichever containerd happens
+/// to be installed the day kata is deployed.
+fn schema_version_for_containerd_release(container_runtime_version: &str) -> Result<u32> {
+    let version = container_runtime_version
+        .strip_prefix("containerd://")
+        .unwrap_or(container_runtime_version);
+
+    let major: u32 = version
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .with_context(|| {
+            format!("Failed to parse containerd version: {container_runtime_version}")
+        })?;
+
+    Ok(if major >= 2 { 3 } else { 2 })
 }
 
 /// Check if containerd version supports snapshotter configuration
@@ -558,7 +798,7 @@ fn check_containerd_snapshotter_version_support(
 }
 
 pub async fn containerd_snapshotter_version_check(config: &Config) -> Result<()> {
-    let container_runtime_version = k8s::get_container_runtime_version(config).await?;
+    let container_runtime_version = config.resolve_container_runtime_version().await?;
 
     let has_snapshotter_mapping = config
         .snapshotter_handler_mapping_for_arch
@@ -603,7 +843,7 @@ fn check_containerd_erofs_version_support(container_runtime_version: &str) -> Re
 }
 
 pub async fn containerd_erofs_snapshotter_version_check(config: &Config) -> Result<()> {
-    let container_runtime_version = k8s::get_container_runtime_version(config).await?;
+    let container_runtime_version = config.resolve_container_runtime_version().await?;
 
     check_containerd_erofs_version_support(&container_runtime_version)
 }
@@ -688,6 +928,36 @@ mod tests {
         }
     }
 
+    /// Uninstall may only delete a whole-file configuration it can prove an install
+    /// wrote. A file with neither a backup nor a creation record belongs to whoever
+    /// put it there.
+    #[test]
+    fn whole_file_configuration_is_only_removed_on_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("containerd.toml");
+        let backup = dir.path().join("containerd.toml.bak");
+        let config_path = config.to_str().unwrap();
+        let backup_path = backup.to_str().unwrap();
+        std::fs::write(&config, "version = 2\n").unwrap();
+
+        assert!(matches!(
+            whole_file_disposition(config_path, backup_path),
+            WholeFileConfig::Keep
+        ));
+
+        std::fs::write(created_marker_file(config_path), "").unwrap();
+        assert!(matches!(
+            whole_file_disposition(config_path, backup_path),
+            WholeFileConfig::Delete
+        ));
+
+        std::fs::write(&backup, "version = 2\n").unwrap();
+        assert!(matches!(
+            whole_file_disposition(config_path, backup_path),
+            WholeFileConfig::Restore
+        ));
+    }
+
     #[test]
     fn test_containerd_debug_level_toml_path_by_schema_version() {
         assert_eq!(containerd_debug_level_toml_path(Some(4)), ".debug.level");
@@ -703,6 +973,23 @@ mod tests {
             get_containerd_pluginid(f.path().to_str().unwrap(), "containerd").unwrap(),
             CONTAINERD_V3_RUNTIME_PLUGIN_ID
         );
+    }
+
+    #[rstest]
+    #[case("containerd://2.2.0", 3)]
+    #[case("containerd://2.0.0-rc.1", 3)]
+    #[case("containerd://1.7.29", 2)]
+    #[case("1.6.28", 2)]
+    fn test_schema_version_for_containerd_release(#[case] version: &str, #[case] expected: u32) {
+        assert_eq!(
+            schema_version_for_containerd_release(version).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_schema_version_for_containerd_release_rejects_garbage() {
+        assert!(schema_version_for_containerd_release("containerd://unknown").is_err());
     }
 
     #[test]
@@ -909,5 +1196,49 @@ mod tests {
             version,
             expected_error
         );
+    }
+
+    const LEGACY_IMPORT: &str = "/opt/kata/containerd/config.d/kata-deploy.toml";
+
+    #[rstest]
+    // Node upgraded from a pre-conf.d kata-deploy: the stale legacy import is
+    // scrubbed while unrelated imports are preserved.
+    #[case(
+        Some(concat!(
+            "version = 2\n\nimports = [\"/etc/containerd/conf.d/*.toml\", ",
+            "\"/opt/kata/containerd/config.d/kata-deploy.toml\"]\n"
+        )),
+        vec!["/etc/containerd/conf.d/*.toml"]
+    )]
+    // Config we never touched (no imports array): no-op, must not error.
+    #[case(Some("version = 2\n\n[plugins]\n"), vec![])]
+    // imports present but without our legacy entry: left untouched.
+    #[case(
+        Some("imports = [\"/etc/containerd/conf.d/*.toml\"]\n"),
+        vec!["/etc/containerd/conf.d/*.toml"]
+    )]
+    // No main config on disk (e.g. crio-only nodes): no-op, must not be created.
+    #[case(None, vec![])]
+    fn test_remove_legacy_drop_in_import(
+        #[case] initial_content: Option<&str>,
+        #[case] expected_imports: Vec<&str>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        if let Some(content) = initial_content {
+            std::fs::write(&path, content).unwrap();
+        }
+
+        remove_legacy_drop_in_import_from(&path, LEGACY_IMPORT).unwrap();
+
+        match initial_content {
+            Some(_) => {
+                let imports = toml_utils::get_toml_array(&path, ".imports").unwrap();
+                let expected: Vec<String> =
+                    expected_imports.iter().map(|s| s.to_string()).collect();
+                assert_eq!(imports, expected);
+            }
+            None => assert!(!path.exists(), "missing config must not be created"),
+        }
     }
 }

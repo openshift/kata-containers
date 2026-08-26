@@ -28,14 +28,12 @@ jobs:
       # all the tests due to a single flaky instance.
       fail-fast: false
       matrix:
-        containerd_version: ['active']
+        containerd_version: ['latest']
         vmm: ['dragonball', 'clh-runtime-rs', 'qemu-runtime-rs']
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-sandboxapi-amd64-${{ toJSON(matrix) }}
       cancel-in-progress: true
-    # TODO: enable me when https://github.com/containerd/containerd/issues/11640 is fixed
-    if: false
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       CONTAINERD_VERSION: ${{ matrix.containerd_version }}
       GOPATH: ${{ github.workspace }}
@@ -60,16 +58,11 @@ jobs:
         env:
           INSTALL_IN_GOPATH: false
 
-      - name: Read properties from versions.yaml
-        run: |
-          go_version="$(yq '.languages.golang.version' versions.yaml)"
-          [ -n "$go_version" ]
-          echo "GO_VERSION=${go_version}" >> "$GITHUB_ENV"
-
-      - name: Setup Golang version ${{ env.GO_VERSION }}
+      # TODO: revert to versions.yaml Go once Kata bumps to a Go version compatible with containerd 2.3
+      - name: Setup Golang 1.26.3 (required by containerd 2.3)
         uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: "1.26.3"
 
       - name: Install dependencies
         run: bash tests/integration/cri-containerd/gha-run.sh install-dependencies
@@ -79,7 +72,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          name: ${{ (matrix.vmm == 'dragonball' || endsWith(matrix.vmm, '-runtime-rs')) && format('kata-static-tarball-amd64{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-amd64{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata
@@ -94,7 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        containerd_version: ['lts', 'active']
+        containerd_version: ['minimum', 'latest']
         vmm: ['clh', 'clh-runtime-rs', 'dragonball', 'qemu', 'qemu-runtime-rs']
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-run-containerd-stability-amd64-${{ toJSON(matrix) }}
@@ -125,11 +118,20 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          name: ${{ (matrix.vmm == 'dragonball' || endsWith(matrix.vmm, '-runtime-rs')) && format('kata-static-tarball-amd64{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-amd64{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
+
+      - name: get-kata-tools-tarball
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-tools-static-tarball-amd64${{ inputs.tarball-suffix }}
+          path: kata-tools-artifacts
 
       - name: Install kata
         run: bash tests/stability/gha-run.sh install-kata kata-artifacts
+
+      - name: Install kata-tools
+        run: bash tests/stability/gha-run.sh install-kata-tools kata-tools-artifacts
 
       - name: Run containerd-stability tests
         timeout-minutes: 15
@@ -143,8 +145,8 @@ jobs:
       # all the tests due to a single flaky instance.
       fail-fast: false
       matrix:
-        containerd_version: ['lts', 'active']
-        vmm: ['clh', 'qemu', 'dragonball', 'qemu-runtime-rs']
+        containerd_version: ['minimum', 'latest']
+        vmm: ['clh', 'qemu', 'dragonball', 'qemu-runtime-rs', 'clh-runtime-rs']
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-run-nydus-amd64-${{ toJSON(matrix) }}
       cancel-in-progress: true
@@ -174,7 +176,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          name: ${{ (matrix.vmm == 'dragonball' || endsWith(matrix.vmm, '-runtime-rs')) && format('kata-static-tarball-amd64{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-amd64{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: get-kata-tools-tarball
@@ -204,6 +206,10 @@ jobs:
         vmm:
           - qemu
           - qemu-runtime-rs
+          - qemu-nvidia-cpu
+          - qemu-nvidia-cpu-runtime-rs
+          - qemu-nvidia-gpu
+          - qemu-nvidia-gpu-runtime-rs
     runs-on: ubuntu-22.04
     env:
       KATA_HYPERVISOR: ${{ matrix.vmm }}
@@ -228,7 +234,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          name: ${{ (matrix.vmm == 'dragonball' || endsWith(matrix.vmm, '-runtime-rs')) && format('kata-static-tarball-amd64{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-amd64{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata
@@ -252,10 +258,14 @@ jobs:
           - qemu
           - clh-runtime-rs
           - qemu-runtime-rs
+          - qemu-nvidia-cpu
+          - qemu-nvidia-cpu-runtime-rs
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-nerdctl-amd64-${{ toJSON(matrix) }}
       cancel-in-progress: true
-    runs-on: ubuntu-22.04
+    # 24.04 is what the erofs snapshotter legs need: the erofs-utils backport
+    # they install comes from Ubuntu 25.10 and does not install on 22.04.
+    runs-on: ubuntu-24.04
     env:
       KATA_HYPERVISOR: ${{ matrix.vmm }}
     steps:
@@ -280,7 +290,7 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
+          name: ${{ (matrix.vmm == 'dragonball' || endsWith(matrix.vmm, '-runtime-rs')) && format('kata-static-tarball-amd64{0}', inputs.tarball-suffix) || format('kata-go-static-tarball-amd64{0}', inputs.tarball-suffix) }}
           path: kata-artifacts
 
       - name: Install kata
@@ -330,8 +340,18 @@ jobs:
       - name: get-kata-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
+          # No VMM matrix: the pod VM tests boot the default runtime-rs
+          # package.
           name: kata-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-artifacts
+
+      - name: get-kata-agent-tarball
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          # The host agent binary lives in the per-component agent artifact:
+          # the merged tarballs only ship the agent inside the guest images.
+          name: kata-artifacts-amd64-agent${{ inputs.tarball-suffix }}
+          path: kata-agent-artifacts
 
       - name: get-kata-tools-tarball
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -339,9 +359,10 @@ jobs:
           name: kata-tools-static-tarball-amd64${{ inputs.tarball-suffix }}
           path: kata-tools-artifacts
 
-      - name: Install kata & kata-tools
+      - name: Install kata, kata-agent & kata-tools
         run: |
           bash tests/functional/kata-agent-apis/gha-run.sh install-kata kata-artifacts
+          bash tests/functional/kata-agent-apis/gha-run.sh install-kata-agent kata-agent-artifacts
           bash tests/functional/kata-agent-apis/gha-run.sh install-kata-tools kata-tools-artifacts
 
       - name: Run kata agent api tests with agent-ctl

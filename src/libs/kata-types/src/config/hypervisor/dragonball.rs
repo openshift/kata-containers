@@ -79,6 +79,9 @@ impl ConfigPlugin for DragonballConfig {
             if db.memory_info.memory_slots == 0 {
                 db.memory_info.memory_slots = default::DEFAULT_DRAGONBALL_MEMORY_SLOTS;
             }
+            if db.factory.template_path.is_empty() {
+                db.factory.template_path = default::DEFAULT_TEMPLATE_PATH.to_string();
+            }
         }
         Ok(())
     }
@@ -157,8 +160,7 @@ impl ConfigPlugin for DragonballConfig {
                     "dragonball hypervisor does not support vIOMMU",
                 ));
             }
-            if db.device_info.hotplug_vfio_on_root_bus
-                || db.device_info.default_bridges > 0
+            if db.device_info.default_bridges > 0
                 || db.device_info.pcie_root_port > 0
                 || db.device_info.pcie_switch_port > 0
             {
@@ -200,5 +202,32 @@ impl ConfigPlugin for DragonballConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::hypervisor::Hypervisor;
+
+    #[test]
+    fn test_adjust_config_sets_factory_template_path() {
+        let mut config = TomlConfig::default();
+        config.hypervisor.insert(
+            HYPERVISOR_NAME_DRAGONBALL.to_string(),
+            Hypervisor::default(),
+        );
+
+        DragonballConfig::new().adjust_config(&mut config).unwrap();
+
+        assert_eq!(
+            config
+                .hypervisor
+                .get(HYPERVISOR_NAME_DRAGONBALL)
+                .unwrap()
+                .factory
+                .template_path,
+            default::DEFAULT_TEMPLATE_PATH
+        );
     }
 }

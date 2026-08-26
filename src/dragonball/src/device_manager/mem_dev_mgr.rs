@@ -21,6 +21,8 @@ use vm_memory::{
 };
 
 use crate::address_space_manager::GuestAddressSpaceImpl;
+#[cfg(target_arch = "x86_64")]
+use crate::api::v1::ConfidentialVmType;
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, DeviceConfigInfos};
 use crate::device_manager::DbsMmioV2Device;
 use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
@@ -293,6 +295,11 @@ impl MemDeviceMgr {
             }
         };
 
+        #[cfg(not(target_arch = "x86_64"))]
+        let f_access_platform = false;
+        #[cfg(target_arch = "x86_64")]
+        let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
+
         virtio::mem::Mem::new(
             config.mem_id.clone(),
             capacity_mib,
@@ -302,6 +309,7 @@ impl MemDeviceMgr {
             epoll_mgr.clone(),
             factory,
             boot_mem_size,
+            f_access_platform,
         )
         .map_err(DeviceMgrError::Virtio)
     }
@@ -392,7 +400,7 @@ impl MemoryRegionFactory {
     fn configure_anon_mem(&self, mmap_reg: &MmapRegion) -> Result<(), VirtioError> {
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_DONTFORK,
             )
@@ -440,7 +448,7 @@ impl MemoryRegionFactory {
         // Safe because we just create the MmapRegion
         unsafe {
             mman::madvise(
-                mmap_reg.as_ptr() as *mut libc::c_void,
+                std::ptr::NonNull::new_unchecked(mmap_reg.as_ptr() as *mut libc::c_void),
                 mmap_reg.size(),
                 mman::MmapAdvise::MADV_HUGEPAGE,
             )

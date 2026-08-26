@@ -1,7 +1,7 @@
 module github.com/kata-containers/kata-containers/src/runtime
 
 // Keep in sync with version in versions.yaml
-go 1.25.10
+go 1.25.13
 
 // WARNING: Do NOT use `replace` directives as those break dependabot:
 // https://github.com/kata-containers/kata-containers/issues/11020
@@ -14,7 +14,7 @@ require (
 	github.com/container-orchestrated-devices/container-device-interface v0.6.0
 	github.com/containerd/cgroups v1.1.0
 	github.com/containerd/console v1.0.5
-	github.com/containerd/containerd v1.7.29
+	github.com/containerd/containerd v1.7.33
 	github.com/containerd/containerd/api v1.9.0
 	github.com/containerd/cri-containerd v1.19.0
 	github.com/containerd/fifo v1.1.0
@@ -37,9 +37,10 @@ require (
 	github.com/mdlayher/vsock v1.2.1
 	github.com/moby/sys/mountinfo v0.7.2
 	github.com/moby/sys/userns v0.1.0
-	github.com/opencontainers/runc v1.2.8
+	github.com/opencontainers/cgroups v0.0.4
+	github.com/opencontainers/runc v1.3.6
 	github.com/opencontainers/runtime-spec v1.2.1
-	github.com/opencontainers/selinux v1.13.0
+	github.com/opencontainers/selinux v1.13.1
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.22.0
@@ -56,10 +57,10 @@ require (
 	go.opentelemetry.io/otel/exporters/jaeger v1.0.0
 	go.opentelemetry.io/otel/sdk v1.43.0
 	go.opentelemetry.io/otel/trace v1.43.0
-	golang.org/x/oauth2 v0.34.0
-	golang.org/x/sys v0.43.0
-	google.golang.org/grpc v1.79.3
-	google.golang.org/protobuf v1.36.10
+	golang.org/x/oauth2 v0.36.0
+	golang.org/x/sys v0.46.0
+	google.golang.org/grpc v1.82.1
+	google.golang.org/protobuf v1.36.11
 	k8s.io/apimachinery v0.33.0
 	k8s.io/cri-api v0.33.0
 	k8s.io/kubelet v0.33.0
@@ -75,7 +76,7 @@ require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cilium/ebpf v0.16.0 // indirect
+	github.com/cilium/ebpf v0.17.3 // indirect
 	github.com/containerd/cgroups/v3 v3.0.5 // indirect
 	github.com/containerd/continuity v0.4.4 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
@@ -124,18 +125,17 @@ require (
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/syndtr/gocapability v0.0.0-20200815063812-42c35b437635 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	go.mongodb.org/mongo-driver v1.14.0 // indirect
+	go.mongodb.org/mongo-driver v1.17.7 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.59.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
-	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
-	golang.org/x/mod v0.34.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/mod v0.40.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
+	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 	google.golang.org/genproto v0.0.0-20250303144028-a0af3efb3deb // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect

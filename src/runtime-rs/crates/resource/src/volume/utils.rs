@@ -6,25 +6,80 @@
 
 use std::{
     fs,
+    fs::OpenOptions,
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd},
     path::{Path, PathBuf},
 };
 
 use crate::{
+    block_device::agent_storage_source_from_block_config,
     share_fs::{do_get_guest_path, do_get_host_path},
     volume::share_fs_volume::generate_mount_path,
 };
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{get_mount_options, get_mount_path};
-use kata_types::device::{
-    DRIVER_BLK_CCW_TYPE as KATA_CCW_DEV_TYPE, DRIVER_BLK_PCI_TYPE as KATA_BLK_DEV_TYPE,
-    DRIVER_SCSI_TYPE as KATA_SCSI_DEV_TYPE,
-};
 use oci_spec::runtime as oci;
 
 use hypervisor::device::DeviceType;
 
 pub const DEFAULT_VOLUME_FS_TYPE: &str = "ext4";
 pub const KATA_MOUNT_BIND_TYPE: &str = "bind";
+pub const KATA_MOUNT_RBIND_TYPE: &str = "rbind";
+
+/// Build the OCI mount options for the container-side bind mount of a direct
+/// block volume.
+pub(crate) fn build_bind_mount_options(
+    volume_options: &[String],
+    oci_options: &Option<Vec<String>>,
+) -> Vec<String> {
+    let mut opts = oci_options.clone().unwrap_or_default();
+    opts.extend(volume_options.iter().cloned());
+
+    if !opts
+        .iter()
+        .any(|o| matches!(o.as_str(), KATA_MOUNT_BIND_TYPE | KATA_MOUNT_RBIND_TYPE))
+    {
+        opts.push(KATA_MOUNT_BIND_TYPE.to_string());
+    }
+    opts
+}
+
+/// Filter OCI bind-mount flags ("bind", "rbind") from volume options that
+/// will be passed to the agent's `Storage.options`.
+pub(crate) fn filter_block_storage_options(options: &[String]) -> Vec<String> {
+    options
+        .iter()
+        .filter(|o| !matches!(o.as_str(), KATA_MOUNT_BIND_TYPE | KATA_MOUNT_RBIND_TYPE))
+        .cloned()
+        .collect()
+}
+
+// BLKROGET (_IO(0x12, 94)) returns the block device's read-only flag into an
+// int. It is encoded as an `_IO` ioctl but actually transfers data, so it is a
+// "bad" ioctl; request_code_none! produces the correct, arch-aware value.
+nix::ioctl_read_bad!(blkroget, nix::request_code_none!(0x12, 94), libc::c_int);
+
+/// Query the host block device's read-only flag (BLKROGET). This reflects the
+/// device's actual writability, which is the ground truth for whether the guest
+/// should see it read-only: when the host backing is read-only, writes from the
+/// guest fail at the host anyway, so the device must be exposed read-only. The
+/// read-only intent for such devices is frequently not carried in the OCI spec
+/// (no "ro" mount option), so the device flag is the only reliable source.
+pub(crate) fn is_block_device_readonly<P: AsRef<Path>>(path: P) -> Result<bool> {
+    let path = path.as_ref();
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {} for readonly probe", path.display()))?;
+
+    let mut ro: libc::c_int = 0;
+    // Safe: file owns a valid fd for the duration of the call and `ro` is a
+    // valid, properly aligned pointer to an initialized int.
+    unsafe { blkroget(file.as_raw_fd(), &mut ro).context("ioctl BLKROGET")? };
+
+    Ok(ro != 0)
+}
 
 pub fn get_file_name<P: AsRef<Path>>(src: P) -> Result<String> {
     let file_name = src
@@ -45,14 +100,15 @@ pub fn get_file_name<P: AsRef<Path>>(src: P) -> Result<String> {
 
 pub(crate) async fn generate_shared_path(
     dest: PathBuf,
-    read_only: bool,
     device_id: &str,
     sid: &str,
 ) -> Result<String> {
     let file_name = get_file_name(&dest).context("failed to get file name.")?;
     let mount_name = generate_mount_path(device_id, file_name.as_str());
     let guest_path = do_get_guest_path(&mount_name, device_id, true, false);
-    let host_path = do_get_host_path(&mount_name, sid, device_id, true, read_only);
+    // Note: directories should always be created under the rw/ path. The ro/ directory is a
+    // read-only bind mount of rw/, so creating directories directly under ro/ would fail with a read-only FS.
+    let host_path = do_get_host_path(&mount_name, sid, device_id, true, false);
 
     if get_mount_path(&Some(dest)).starts_with("/dev") {
         fs::File::create(&host_path).context(format!("failed to create file {:?}", &host_path))?;
@@ -64,58 +120,24 @@ pub(crate) async fn generate_shared_path(
     Ok(guest_path)
 }
 
-/// Extract storage source information from block device configuration.
-/// This helper function handles the common logic for determining the storage source
-/// based on the driver type (BLK/SCSI/CCW).
-fn extract_storage_source(
-    driver_option: &str,
-    pci_path: Option<&hypervisor::device::pci_path::PciPath>,
-    scsi_addr: Option<&str>,
-    ccw_addr: Option<&str>,
-    virt_path: &str,
-) -> Result<String> {
-    let source = match driver_option {
-        KATA_BLK_DEV_TYPE => {
-            if let Some(pci_path) = pci_path {
-                pci_path.to_string()
-            } else {
-                return Err(anyhow!("block driver is blk but no pci path exists"));
-            }
-        }
-        KATA_SCSI_DEV_TYPE => {
-            if let Some(scsi_addr) = scsi_addr {
-                scsi_addr.to_string()
-            } else {
-                return Err(anyhow!("block driver is scsi but no scsi address exists"));
-            }
-        }
-        KATA_CCW_DEV_TYPE => {
-            if let Some(ccw_addr) = ccw_addr {
-                ccw_addr.to_string()
-            } else {
-                return Err(anyhow!("block driver is ccw but no ccw address exists"));
-            }
-        }
-        _ => virt_path.to_string(),
-    };
-
-    Ok(source)
-}
-
 pub async fn handle_block_volume(
     device_info: DeviceType,
     m: &oci::Mount,
     read_only: bool,
     sid: &str,
     fstype: &str,
+    volume_options: Option<&[String]>,
 ) -> Result<(agent::Storage, oci::Mount, String)> {
-    // storage
+    let oci_opts = get_mount_options(m.options());
+    let mut storage_options: Vec<String> =
+        filter_block_storage_options(volume_options.unwrap_or(&oci_opts));
+
+    if read_only && !storage_options.iter().any(|o| o == "ro") {
+        storage_options.push("ro".to_string());
+    }
+
     let mut storage = agent::Storage {
-        options: if read_only {
-            vec!["ro".to_string()]
-        } else {
-            Vec::new()
-        },
+        options: storage_options,
         ..Default::default()
     };
 
@@ -128,30 +150,12 @@ pub async fn handle_block_volume(
     if let DeviceType::BlockModern(device_mod) = device_info.clone() {
         let device = &device_mod.lock().await;
         storage.driver = device.config.driver_option.clone();
-        storage.source = extract_storage_source(
-            &device.config.driver_option,
-            device.config.pci_path.as_ref(),
-            device.config.scsi_addr.as_deref(),
-            device.config.ccw_addr.as_deref(),
-            &device.config.virt_path,
-        )?;
+        storage.source = agent_storage_source_from_block_config(&device.config)?;
         device_id = device.device_id.clone();
     }
 
-    if let DeviceType::Block(device) = device_info {
-        storage.driver = device.config.driver_option.clone();
-        storage.source = extract_storage_source(
-            &device.config.driver_option,
-            device.config.pci_path.as_ref(),
-            device.config.scsi_addr.as_deref(),
-            device.config.ccw_addr.as_deref(),
-            &device.config.virt_path,
-        )?;
-        device_id = device.device_id;
-    }
-
     // generate host guest shared path
-    let guest_path = generate_shared_path(m.destination().clone(), read_only, &device_id, sid)
+    let guest_path = generate_shared_path(m.destination().clone(), &device_id, sid)
         .await
         .context("generate host-guest shared path failed")?;
     storage.mount_point = guest_path.clone();
@@ -170,11 +174,113 @@ pub async fn handle_block_volume(
         storage.fs_type = fstype.to_owned();
     }
 
+    // The Storage object already mounts the block device at `guest_path`
+    // inside the guest. The OCI Mount then bind-mounts from `guest_path` to
+    // the container's destination, so its type must be "bind" rather than a
+    // filesystem type like "ext4".
     let mut mount = oci::Mount::default();
     mount.set_destination(m.destination().clone());
-    mount.set_typ(Some(storage.fs_type.clone()));
+    mount.set_typ(Some(KATA_MOUNT_BIND_TYPE.to_string()));
     mount.set_source(Some(PathBuf::from(&guest_path)));
-    mount.set_options(m.options().clone());
+    mount.set_options(Some(build_bind_mount_options(
+        volume_options.unwrap_or(&[]),
+        m.options(),
+    )));
+
+    debug!(
+        sl!(),
+        "handle block volume with device_id: {}, storage: {:?}, mount: {:?}",
+        device_id,
+        storage,
+        mount
+    );
 
     Ok((storage, mount, device_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GENERATE_SHARED_PATH_TEST_ENV: &str = "KATA_TEST_GENERATE_SHARED_PATH";
+
+    #[test]
+    fn test_build_bind_mount_options_merges_volume_options() {
+        let volume_options = vec!["ro".to_string(), "nosuid".to_string()];
+        let oci_options = Some(vec!["rbind".to_string(), "noexec".to_string()]);
+
+        let opts = build_bind_mount_options(&volume_options, &oci_options);
+
+        assert_eq!(
+            opts,
+            vec![
+                "rbind".to_string(),
+                "noexec".to_string(),
+                "ro".to_string(),
+                "nosuid".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_bind_mount_options_with_oci_options() {
+        let oci_options = Some(vec!["noexec".to_string(), "nodev".to_string()]);
+
+        let opts = build_bind_mount_options(&[], &oci_options);
+
+        // OCI options are used verbatim, then "bind" is appended because none of
+        // them is a bind/rbind flag.
+        assert_eq!(
+            opts,
+            vec![
+                "noexec".to_string(),
+                "nodev".to_string(),
+                KATA_MOUNT_BIND_TYPE.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_shared_path_read_only() {
+        if std::env::var_os(GENERATE_SHARED_PATH_TEST_ENV).is_some() {
+            kata_types::rootless::set_rootless(true);
+
+            let sid = "test-sandbox";
+            let device_id = "test-device";
+            let host_rw_path = crate::share_fs::get_host_rw_shared_path(sid);
+            let host_shared_path = host_rw_path.parent().unwrap();
+            let host_ro_path = host_shared_path.join("ro");
+            fs::create_dir_all(host_shared_path).unwrap();
+
+            // A file makes a write through ro fail even when running as root.
+            fs::write(&host_ro_path, b"must not be modified").unwrap();
+
+            let guest_path =
+                generate_shared_path(PathBuf::from("/mnt/test-volume"), device_id, sid)
+                    .await
+                    .unwrap();
+            let mount_name = Path::new(&guest_path).file_name().unwrap();
+
+            assert!(host_rw_path.join("passthrough").join(mount_name).is_dir());
+            assert!(host_ro_path.is_file());
+            return;
+        }
+
+        // Rootless state is process-global, so isolate it from parallel tests.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("test_generate_shared_path_read_only")
+            .arg("--test-threads=1")
+            .env(GENERATE_SHARED_PATH_TEST_ENV, "1")
+            .env("XDG_RUNTIME_DIR", temp_dir.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "isolated shared-path test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

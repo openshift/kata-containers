@@ -31,9 +31,9 @@ jobs:
     needs: release
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/release-amd64.yaml
     with:
       target-arch: amd64
@@ -45,9 +45,9 @@ jobs:
     needs: release
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/release-arm64.yaml
     with:
       target-arch: arm64
@@ -59,26 +59,35 @@ jobs:
     needs: release
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/release-s390x.yaml
     with:
       target-arch: s390x
     secrets:
-      CI_HKD_PATH: ${{ secrets.CI_HKD_PATH }}
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
   build-and-push-assets-ppc64le:
     needs: release
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/release-ppc64le.yaml
     with:
       target-arch: ppc64le
+    secrets:
+      QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
+
+  publish-kata-monitor-image:
+    name: publish-kata-monitor-image
+    needs: [build-and-push-assets-amd64, build-and-push-assets-arm64, build-and-push-assets-s390x, build-and-push-assets-ppc64le]
+    permissions:
+      contents: read
+      packages: write # needed to push build artifacts to ghcr.io
+    uses: ./.github/workflows/release-kata-images.yaml
     secrets:
       QUAY_DEPLOYER_PASSWORD: ${{ secrets.QUAY_DEPLOYER_PASSWORD }}
 
@@ -137,6 +146,11 @@ jobs:
           tarball=$(pwd)/kata-static.tar.zst
           echo "KATA_STATIC_TARBALL=${tarball}" >> "$GITHUB_ENV"
 
+      - name: Set KATA_GO_STATIC_TARBALL env var
+        run: |
+          tarball=$(pwd)/kata-go-static.tar.zst
+          echo "KATA_GO_STATIC_TARBALL=${tarball}" >> "$GITHUB_ENV"
+
       - name: Download amd64 artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -145,6 +159,18 @@ jobs:
       - name: Upload amd64 static tarball to GitHub
         run: |
           ./tools/packaging/release/release.sh upload-kata-static-tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURE: amd64
+
+      - name: Download amd64 Go runtime artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-go-static-tarball-amd64
+
+      - name: Upload amd64 Go runtime tarball to GitHub
+        run: |
+          ./tools/packaging/release/release.sh upload-kata-go-static-tarball
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHITECTURE: amd64
@@ -161,6 +187,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARCHITECTURE: arm64
 
+      - name: Download arm64 Go runtime artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-go-static-tarball-arm64
+
+      - name: Upload arm64 Go runtime tarball to GitHub
+        run: |
+          ./tools/packaging/release/release.sh upload-kata-go-static-tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURE: arm64
+
       - name: Download s390x artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -173,6 +211,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ARCHITECTURE: s390x
 
+      - name: Download s390x Go runtime artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-go-static-tarball-s390x
+
+      - name: Upload s390x Go runtime tarball to GitHub
+        run: |
+          ./tools/packaging/release/release.sh upload-kata-go-static-tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURE: s390x
+
       - name: Download ppc64le artifacts
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
@@ -181,6 +231,18 @@ jobs:
       - name: Upload ppc64le static tarball to GitHub
         run: |
           ./tools/packaging/release/release.sh upload-kata-static-tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHITECTURE: ppc64le
+
+      - name: Download ppc64le Go runtime artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: kata-go-static-tarball-ppc64le
+
+      - name: Upload ppc64le Go runtime tarball to GitHub
+        run: |
+          ./tools/packaging/release/release.sh upload-kata-go-static-tarball
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHITECTURE: ppc64le
@@ -296,7 +358,7 @@ jobs:
 
   publish-release:
     name: publish-release
-    needs: [ build-and-push-assets-amd64, build-and-push-assets-arm64, build-and-push-assets-s390x, build-and-push-assets-ppc64le, publish-multi-arch-images, upload-multi-arch-static-tarball, upload-versions-yaml, upload-cargo-vendored-tarball, upload-libseccomp-tarball ]
+    needs: [ build-and-push-assets-amd64, build-and-push-assets-arm64, build-and-push-assets-s390x, build-and-push-assets-ppc64le, publish-multi-arch-images, publish-kata-monitor-image, upload-multi-arch-static-tarball, upload-versions-yaml, upload-cargo-vendored-tarball, upload-libseccomp-tarball ]
     runs-on: ubuntu-22.04
     permissions:
       contents: write # needed for the `gh release` commands

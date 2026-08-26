@@ -150,9 +150,16 @@ enable_tracing = false
 
 debug_console_enabled = false
 
-# Agent connection dialing timeout value in milliseconds
-# (default: 30000)
-dial_timeout_ms = 30000
+# Sleep between agent connection retries, in milliseconds.
+# Note: unlike the Go runtime's dial_timeout (which is the overall budget),
+# this is just the inter-retry delay.
+# (default: 10)
+dial_timeout_ms = 100
+
+# Overall time budget for establishing the agent connection, in milliseconds.
+# Retry count = reconnect_timeout_ms / dial_timeout_ms.
+# (default: 3000, but 30s is appropriate for remote VMs)
+reconnect_timeout_ms = 30000
 
 # Create Container Request Timeout
 # This timeout value is used to set the maximum duration for the agent to process a CreateContainerRequest.
@@ -189,7 +196,17 @@ enable_debug = false
 #     Uses tc filter rules to redirect traffic from the network interface
 #     provided by plugin to a tap interface connected to the VM.
 #
-# Note: The remote hypervisor, uses it's own network, so "none" is required
+#   - l3forwarding
+#     Uses L3 routing and proxy ARP to forward traffic between the network
+#     interface provided by the plugin and a tap interface connected to the
+#     VM.
+#     Useful for Istio Ambient-style service mesh integration with node
+#     proxies. Supports a single network interface per network namespace.
+#     Experimental feature, IPv4 only.
+#
+# Note: The remote hypervisor uses CAA for networking via a VXLAN tunnel —
+# the runtime must not set up its own network devices. "none" is required;
+# adjust_config() enforces this.
 internetworking_model = "none"
 
 name = "virt_container"
@@ -222,11 +239,11 @@ jaeger_password = ""
 
 # If enabled, the runtime will not create a network namespace for shim and hypervisor processes.
 # This option may have some potential impacts to your host. It should only be used when you know what you're doing.
-# `disable_new_netns` conflicts with `internetworking_model=tcfilter` and `internetworking_model=macvtap`. It works only
-# with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
+# `disable_new_netns` only works with `internetworking_model=none`. The tap device will be in the host network namespace and can connect to a bridge
 # (like OVS) directly.
 # (default: false)
-# Note: The remote hypervisor has a different networking model, which requires true
+# Note: Must be false for the remote hypervisor — CAA needs the netns path
+# for VXLAN tunnel setup. adjust_config() enforces this.
 disable_new_netns = false
 
 # if enabled, the runtime will add all the kata processes inside one dedicated cgroup.
@@ -268,18 +285,40 @@ static_sandbox_resource_mgmt = true
 #
 vfio_mode = "@DEFVFIOMODE@"
 
-# If enabled, the runtime will not create Kubernetes emptyDir mounts on the guest filesystem. Instead, emptyDir mounts will
-# be created on the host and shared via virtio-fs. This is potentially slower, but allows sharing of files from host to guest.
-# Note: remote hypervisor has no sharing of emptydir mounts from host to guest
-disable_guest_empty_dir = false
+# Specifies how Kubernetes emptyDir volumes are handled.
+# Options:
+#
+#   - shared-fs (default)
+#     Shares the emptyDir folder with the guest using the method given
+#     by the `shared_fs` setting.
+#
+#   - block-encrypted
+#     Plugs a block device to be encrypted in the guest.
+#
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
+#
+emptydir_mode = "@DEFEMPTYDIRMODE@"
 
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
 # Supported experimental features:
+# for example:
+#       experimental = ["force_guest_pull"]
+# which enables force_guest_pull mode in CoCo scenarios.
 # (default: [])
 experimental = @DEFAULTEXPFEATURES@
 
 # If enabled, user can run pprof tools with shim v2 process through kata-monitor.
 # (default: false)
 enable_pprof = false
+
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"

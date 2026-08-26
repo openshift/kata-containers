@@ -11,6 +11,10 @@ set -o pipefail
 kubernetes_dir="${kubernetes_dir:-$(dirname "$(readlink -f "$0")")}"
 # shellcheck source=/dev/null
 source "${kubernetes_dir}/../../common.bash"
+# shellcheck source=/dev/null
+source "${kubernetes_dir}/tests_common.sh"
+# shellcheck source=/dev/null
+source "${kubernetes_dir}/k8s_bats_runner.sh"
 
 cleanup() {
 	# Clean up all node debugger pods whose name starts with `custom-node-debugger` if pods exist
@@ -25,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 TARGET_ARCH="${TARGET_ARCH:-x86_64}"
-KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 K8S_TEST_DEBUG="${K8S_TEST_DEBUG:-false}"
 K8S_TEST_HOST_TYPE="${K8S_TEST_HOST_TYPE:-small}"
 # Setting to "yes" enables fail fast, stopping execution at the first failed test.
@@ -73,10 +77,13 @@ else
 		"k8s-credentials-secrets.bats" \
 		"k8s-cron-job.bats" \
 		"k8s-custom-dns.bats" \
+		"k8s-devkit-debug-console.bats" \
 		"k8s-empty-dirs.bats" \
 		"k8s-env.bats" \
+		"k8s-erofs-dmverity.bats" \
 		"k8s-exec.bats" \
 		"k8s-file-volume.bats" \
+		"k8s-graceful-termination.bats" \
 		"k8s-hostname.bats" \
 		"k8s-hostpath-volume.bats" \
 		"k8s-inotify.bats" \
@@ -93,18 +100,24 @@ else
 		"k8s-optional-empty-configmap.bats" \
 		"k8s-optional-empty-secret.bats" \
 		"k8s-pid-ns.bats" \
+		"k8s-plain-ephemeral-data-storage.bats" \
 		"k8s-pod-quota.bats" \
 		"k8s-port-forward.bats" \
 		"k8s-privileged.bats" \
 		"k8s-projected-volume.bats" \
+		"k8s-qemu-rootless-sandbox.bats" \
 		"k8s-replication.bats" \
 		"k8s-sandbox-cgroup.bats" \
+		"k8s-sandbox-cgroup-placement.bats" \
 		"k8s-seccomp.bats" \
 		"k8s-sysctls.bats" \
 		"k8s-security-context.bats" \
 		"k8s-shared-volume.bats" \
+		"k8s-uds-shared-volume.bats" \
 		"k8s-volume.bats" \
+		"k8s-vm-templating.bats" \
 		"k8s-nginx-connectivity.bats" \
+		"k8s-l3forwarding-connectivity.bats" \
 	)
 
 	K8S_TEST_NORMAL_HOST_UNION=( \
@@ -150,6 +163,7 @@ fi
 
 ensure_yq
 
-# Use common bats test runner with proper reporting
+# Use common bats test runner with proper reporting, plain RuntimeClass by
+# default, and triage-only -debug re-runs for failed cases.
 export BATS_TEST_FAIL_FAST="${K8S_TEST_FAIL_FAST}"
-run_bats_tests "${kubernetes_dir}" K8S_TEST_UNION
+run_kubernetes_bats_tests "${kubernetes_dir}" K8S_TEST_UNION

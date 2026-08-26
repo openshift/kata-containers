@@ -29,14 +29,14 @@ readonly versions_yaml="${repo_root_dir}/versions.yaml"
 
 readonly busybox_builder="${static_build_dir}/busybox/build.sh"
 readonly agent_builder="${static_build_dir}/agent/build.sh"
-readonly coco_guest_components_builder="${static_build_dir}/coco-guest-components/build.sh"
 readonly clh_builder="${static_build_dir}/cloud-hypervisor/build-static-clh.sh"
+readonly openvmm_builder="${static_build_dir}/openvmm/build.sh"
 readonly firecracker_builder="${static_build_dir}/firecracker/build-static-firecracker.sh"
 readonly kernel_builder="${static_build_dir}/kernel/build.sh"
 readonly ovmf_builder="${static_build_dir}/ovmf/build.sh"
 readonly pause_image_builder="${static_build_dir}/pause-image/build.sh"
 readonly qemu_builder="${static_build_dir}/qemu/build-static-qemu.sh"
-readonly qemu_experimental_builder="${static_build_dir}/qemu/build-static-qemu-experimental.sh"
+readonly qemu_flavour_builder="${static_build_dir}/qemu/build-static-qemu-flavour.sh"
 readonly stratovirt_builder="${static_build_dir}/stratovirt/build-static-stratovirt.sh"
 readonly shimv2_builder="${static_build_dir}/shim-v2/build.sh"
 readonly virtiofsd_builder="${static_build_dir}/virtiofsd/build.sh"
@@ -74,6 +74,20 @@ destdir="${workdir}/kata-static"
 
 default_binary_permissions='0744'
 
+# Rootfs image variants that carry a dm-verity root hash (measured rootfs).
+# Their hashes are collected at build time and consumed by the Rust runtime,
+# so this list is walked in a few places - keep it in one spot to avoid drift.
+readonly MEASURED_ROOTFS_VARIANTS=(
+	base
+	confidential
+	coco-extension
+	devkit-extension
+	nvidia-gpu
+	nvidia-gpu-confidential
+	nvidia
+	nvidia-gpu-extension
+)
+
 die() {
 	msg="$*"
 	echo "ERROR: ${msg}" >&2
@@ -86,6 +100,11 @@ info() {
 
 error() {
 	echo "ERROR: $*"
+}
+
+# Sanitize a string so it is valid as a Docker / OCI image tag component.
+sanitize_tag_component() {
+	echo "$1" | tr -dc '[:print:]' | tr -c 'a-zA-Z0-9_.\-' _
 }
 
 usage() {
@@ -110,15 +129,15 @@ options:
 	agent
 	agent-ctl
 	boot-image-se
+	boot-image-se-runtime-rs
 	coco-guest-components
 	cloud-hypervisor
-	cloud-hypervisor-glibc
+	openvmm
 	firecracker
 	genpolicy
 	kata-ctl
 	kata-manager
 	kernel
-	kernel-cca-confidential
 	kernel-debug
 	kernel-dragonball-experimental
 	kernel-experimental
@@ -128,18 +147,19 @@ options:
 	ovmf
 	ovmf-sev
 	ovmf-tdx
-	ovmf-cca
 	qemu
-	qemu-cca-experimental
+	qemu-no-shared-fs
 	qemu-snp-experimental
 	qemu-tdx-experimental
 	stratovirt
 	rootfs-image
 	rootfs-image-confidential
+	rootfs-image-coco-extension
 	rootfs-image-mariner
 	rootfs-initrd
 	rootfs-initrd-confidential
-	shim-v2
+	shim-v2-go
+	shim-v2-rust
 	trace-forwarder
 	virtiofsd
 EOF
@@ -182,12 +202,17 @@ get_kernel_modules_dir() {
 }
 
 cleanup_and_fail_shim_v2_specifics() {
-	for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
-		local root_hash_file="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build/shim-v2-root_hash_${variant}.txt"
+	local component="${1:-}"
+	local component_tarball_path="${2:-}"
+	local extra_tarballs="${3:-}"
+	local tarball_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
+
+	for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+		local root_hash_file="${tarball_dir}/${component}-root_hash_${variant}.txt"
 		[[ -f "${root_hash_file}" ]] && rm -f "${root_hash_file}"
 	done
 
-	return "$(cleanup_and_fail "${1:-}" "${2:-}")"
+	cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}"
 }
 
 cleanup_and_fail() {
@@ -212,8 +237,15 @@ install_cached_shim_v2_tarball_get_root_hash() {
 	local tarball_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
 	local root_hash_basedir="./opt/kata/share/kata-containers/"
 
-	for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
-		local image_conf_tarball="kata-static-rootfs-image-${variant}.tar.zst"
+	for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+		# The measured base image ships as kata-static-rootfs-image.tar.zst
+		# (no variant suffix), but carries its root hash under the "base" label.
+		local image_conf_tarball
+		if [[ "${variant}" == "base" ]]; then
+			image_conf_tarball="kata-static-rootfs-image.tar.zst"
+		else
+			image_conf_tarball="kata-static-rootfs-image-${variant}.tar.zst"
+		fi
 		local tarball_path="${tarball_dir}/${image_conf_tarball}"
 		local root_hash_path="${root_hash_basedir}root_hash_${variant}.txt"
 
@@ -229,14 +261,21 @@ install_cached_shim_v2_tarball_get_root_hash() {
 }
 
 install_cached_shim_v2_tarball_compare_root_hashes() {
+	local component="${1:-}"
 	local found_any=""
 	local tarball_dir="${repo_root_dir}/tools/packaging/kata-deploy/local-build/build"
 
-	for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
-		# Skip if one or the other does not exist.
-		[[ ! -f "${tarball_dir}/root_hash_${variant}.txt" ]] && continue
+	for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+		local image_root_hash="${tarball_dir}/root_hash_${variant}.txt"
+		local cached_root_hash="${component}-root_hash_${variant}.txt"
 
-		diff "${tarball_dir}/root_hash_${variant}.txt" "shim-v2-root_hash_${variant}.txt" || return 1
+		# Skip if the current image tarball did not ship a root hash for this variant.
+		[[ ! -f "${image_root_hash}" ]] && continue
+
+		if [[ ! -f "${cached_root_hash}" ]] || ! cmp -s "${image_root_hash}" "${cached_root_hash}"; then
+			info "Measured rootfs hash mismatch for ${component} variant ${variant}; rebuilding shim"
+			return 1
+		fi
 		found_any="yes"
 	done
 	[[ -z "${found_any}" ]] && return 0
@@ -259,11 +298,12 @@ install_cached_tarball_component() {
 	# "tarball1_name:tarball1_path tarball2_name:tarball2_path ... tarballN_name:tarballN_path"
 	local extra_tarballs="${6:-}"
 
-	if [[ "${component}" = "shim-v2" ]]; then
+	if [[ "${MEASURED_ROOTFS}" = "yes" ]] && \
+		{ [[ "${component}" = "shim-v2-go" ]] || [[ "${component}" = "shim-v2-rust" ]]; }; then
 		install_cached_shim_v2_tarball_get_root_hash
 	fi
 
-	oras pull "${ARTEFACT_REGISTRY}/${ARTEFACT_REPOSITORY}/cached-artefacts/${build_target}:latest-${TARGET_BRANCH}-$(uname -m)" || return 1
+	oras pull "${ARTEFACT_REGISTRY}/${ARTEFACT_REPOSITORY}/cached-artefacts/${build_target}:latest-$(sanitize_tag_component "${TARGET_BRANCH}")-$(uname -m)" || return 1
 
 	cached_version="$(cat "${component}"-version)"
 	cached_image_version="$(cat "${component}"-builder-image-version)"
@@ -271,12 +311,19 @@ install_cached_tarball_component() {
 	rm -f "${component}"-version
 	rm -f "${component}"-builder-image-version
 
-	[[ "${cached_image_version}" != "${current_image_version}" ]] && return "$(cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}")"
-	[[ "${cached_version}" != "${current_version}" ]] && return "$(cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}")"
-	sha256sum -c "${component}-sha256sum" || return "$(cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}")"
+	if [[ "${cached_image_version}" != "${current_image_version}" ]]; then
+		cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}"
+		return 1
+	fi
+	if [[ "${cached_version}" != "${current_version}" ]]; then
+		cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}"
+		return 1
+	fi
+	sha256sum -c "${component}-sha256sum" || { cleanup_and_fail "${component_tarball_path}" "${extra_tarballs}"; return 1; }
 
-	if [[ "${component}" = "shim-v2" ]]; then
-		install_cached_shim_v2_tarball_compare_root_hashes || return "$(cleanup_and_fail_shim_v2_specifics "${component_tarball_path}" "${extra_tarballs}")"
+	if [[ "${MEASURED_ROOTFS}" = "yes" ]] && \
+		{ [[ "${component}" = "shim-v2-go" ]] || [[ "${component}" = "shim-v2-rust" ]]; }; then
+		install_cached_shim_v2_tarball_compare_root_hashes "${component}" || { cleanup_and_fail_shim_v2_specifics "${component}" "${component_tarball_path}" "${extra_tarballs}"; return 1; }
 	fi
 
 	info "Using cached tarball of ${component}"
@@ -309,15 +356,160 @@ get_coco_guest_components_tarball_path() {
 }
 
 get_latest_coco_guest_components_artefact_and_builder_image_version() {
-	local coco_guest_components_version
-	coco_guest_components_version=$(get_from_kata_deps ".externals.coco-guest-components.version")
-	local coco_guest_components_toolchain
-	coco_guest_components_toolchain=$(get_from_kata_deps ".externals.coco-guest-components.toolchain")
-	local latest_coco_guest_components_artefact="${coco_guest_components_version}-${coco_guest_components_toolchain}"
-	local latest_coco_guest_components_builder_image
-	latest_coco_guest_components_builder_image="$(get_coco_guest_components_image_name)"
+	echo "$(get_from_kata_deps ".externals.coco-guest-components.version")-$(get_coco_extension_oci_arch)"
+}
 
-	echo "${latest_coco_guest_components_artefact}-${latest_coco_guest_components_builder_image}"
+get_coco_extension_oci_arch() {
+	arch_to_golang "$(uname -m)"
+}
+
+# Multi-arch scratch OCI container image from guest-components' "Publish OCI
+# container image" step (coco-extension-image.yml). This is the assembled guest
+# components rootfs as a container, not the EROFS disk image (extension_image).
+get_coco_guest_components_container_image_ref() {
+	local version image
+	version="$(get_from_kata_deps ".externals.coco-guest-components.version")"
+	image="$(get_from_kata_deps ".externals.coco-guest-components.container_image")"
+	[[ -n "${version}" ]] || die "Failed to get coco-guest-components version from versions.yaml"
+	[[ -n "${image}" ]] || die "Failed to get coco-guest-components container_image from versions.yaml"
+
+	echo "${image}:${version}"
+}
+
+# The extension disk image is published as a multi-arch OCI index tagged with the
+# guest-components commit; the per-arch selection happens at pull time.
+get_coco_extension_disk_image_ref() {
+	local version image
+	version="$(get_from_kata_deps ".externals.coco-guest-components.version")"
+	image="$(get_from_kata_deps ".externals.coco-guest-components.extension_image")"
+	[[ -n "${version}" ]] || die "Failed to get coco-guest-components version from versions.yaml"
+	[[ -n "${image}" ]] || die "Failed to get coco-guest-components extension_image from versions.yaml"
+
+	echo "${image}:${version}"
+}
+
+# GitHub "owner/repo" that owns the provenance attestation, derived from the
+# guest-components URL so it never drifts from the pinned source.
+get_coco_extension_provenance_repo() {
+	local url
+	url="$(get_from_kata_deps ".externals.coco-guest-components.url")"
+	url="${url%/}"
+	echo "${url#https://github.com/}"
+}
+
+get_latest_coco_extension_artefact_version() {
+	echo "$(get_from_kata_deps ".externals.coco-guest-components.version")-$(get_coco_extension_oci_arch)"
+}
+
+ensure_oras_installed() {
+	if command -v oras &>/dev/null; then
+		return 0
+	fi
+
+	local install_oras_script="${repo_root_dir}/tools/packaging/kata-deploy/local-build/dockerbuild/install_oras.sh"
+	[[ -f "${install_oras_script}" ]] || die "oras is required to pull the CoCo extension image"
+	"${install_oras_script}"
+}
+
+ensure_gh_installed() {
+	if command -v gh &>/dev/null; then
+		return 0
+	fi
+
+	local install_gh_script="${repo_root_dir}/tools/packaging/kata-deploy/local-build/dockerbuild/install_gh.sh"
+	[[ -f "${install_gh_script}" ]] || return 1
+	"${install_gh_script}" || return 1
+	command -v gh &>/dev/null
+}
+
+# Verify the guest-components provenance attestation bound to a per-arch OCI
+# manifest digest (container or disk image).
+#
+# Verification policy:
+#   VERIFY_COCO_EXTENSION_PROVENANCE=no  — always skip
+#   VERIFY_COCO_EXTENSION_PROVENANCE=yes — always verify (CI); fail if gh/token missing
+#   unset (default)                      — verify when GH_TOKEN/GITHUB_TOKEN is set,
+#                                          otherwise skip with a warning (local builds)
+verify_guest_components_oci_provenance() {
+	local image="$1"
+	local digest="$2"
+	local token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+
+	if [[ "${VERIFY_COCO_EXTENSION_PROVENANCE:-}" == "no" ]]; then
+		warn "guest-components provenance verification disabled (VERIFY_COCO_EXTENSION_PROVENANCE=no)"
+		return 0
+	fi
+
+	# The GitHub CLI has no s390x build; provenance cannot be verified there even
+	# when CI sets VERIFY_COCO_EXTENSION_PROVENANCE=yes.
+	if [[ "$(uname -m)" == "s390x" ]]; then
+		warn "skipping guest-components provenance verification on s390x for ${image}@${digest}"
+		return 0
+	fi
+
+	if [[ -z "${token}" ]]; then
+		if [[ "${VERIFY_COCO_EXTENSION_PROVENANCE:-}" == "yes" ]]; then
+			die "VERIFY_COCO_EXTENSION_PROVENANCE=yes requires GH_TOKEN or GITHUB_TOKEN"
+		fi
+		warn "No GH_TOKEN/GITHUB_TOKEN set; skipping guest-components provenance verification for ${image}@${digest}"
+		return 0
+	fi
+
+	if ! ensure_gh_installed; then
+		die "gh CLI is required to verify guest-components provenance (set VERIFY_COCO_EXTENSION_PROVENANCE=no to bypass)"
+	fi
+
+	local repo
+	repo="$(get_coco_extension_provenance_repo)"
+	info "Verifying provenance of ${image}@${digest} against ${repo}"
+	export GH_TOKEN="${token}"
+	# --bundle-from-oci reads the attestation guest-components pushed alongside the
+	# image (actions/attest push-to-registry) instead of the GitHub API.
+	gh attestation verify "oci://${image}@${digest}" \
+		--repo "${repo}" \
+		--bundle-from-oci \
+		|| die "Provenance verification failed for ${image}@${digest}"
+}
+
+# Pull the published scratch OCI container image (coco-extension), verify its
+# provenance, and export the rootfs into destdir for monolithic confidential images.
+install_coco_guest_components_from_oci() {
+	ensure_oras_installed
+
+	local image_ref image go_arch digest cid
+	image_ref="$(get_coco_guest_components_container_image_ref)"
+	image="${image_ref%%:*}"
+	go_arch="$(get_coco_extension_oci_arch)"
+
+	digest="$(oras resolve --platform "linux/${go_arch}" "${image_ref}")" \
+		|| die "Failed to resolve ${image_ref} for linux/${go_arch}; bump .externals.coco-guest-components.version in versions.yaml once guest-components has published the image"
+
+	verify_guest_components_oci_provenance "${image}" "${digest}"
+
+	info "Pull and extract CoCo guest components from ${image}@${digest} (linux/${go_arch})"
+
+	docker pull "${image}@${digest}"
+	# coco-extension is FROM scratch with no CMD/ENTRYPOINT; docker create needs
+	# an executable that exists in the image rootfs (we never run the container).
+	cid="$(docker create "${image}@${digest}" /usr/local/bin/attestation-agent --help)"
+	# docker export dumps the container filesystem, which carries scaffolding the
+	# image itself does not have: .dockerenv, the /etc/{hostname,hosts,resolv.conf,
+	# mtab} bind-mount placeholders and the /proc, /sys and /dev mountpoints. The
+	# rootfs builder extracts this tarball over the guest rootfs, so those would
+	# overwrite its DNS and host configuration with empty files.
+	#
+	# docker export names members without a leading "./", and --anchored keeps the
+	# patterns from matching the same names deeper in the tree.
+	docker export "${cid}" | tar -xf - -C "${destdir}" --anchored \
+		--exclude=.dockerenv \
+		--exclude=etc/hostname \
+		--exclude=etc/hosts \
+		--exclude=etc/resolv.conf \
+		--exclude=etc/mtab \
+		--exclude=dev \
+		--exclude=proc \
+		--exclude=sys
+	docker rm -f "${cid}" >/dev/null
 }
 
 get_pause_image_tarball_path() {
@@ -390,6 +582,20 @@ get_latest_nvidia_nvat_version() {
 	get_from_kata_deps ".externals.nvidia.nvat.version"
 }
 
+# The CUDA and tools APT repositories feed setup_apt_repositories() in the
+# rootfs chroot; overriding them in versions.yaml (e.g. to point at an
+# internal release-candidate mirror) must invalidate the cached rootfs.
+get_latest_nvidia_repo_version() {
+	local arch
+	arch="$(uname -m)"
+
+	echo "$(get_from_kata_deps ".externals.nvidia.cuda.repo.${arch}.url")" \
+		"$(get_from_kata_deps ".externals.nvidia.cuda.repo.${arch}.pkg")" \
+		"$(get_from_kata_deps ".externals.nvidia.tools.repo.${arch}.url")" \
+		"$(get_from_kata_deps ".externals.nvidia.tools.repo.${arch}.pkg")" \
+		| sha256sum | cut -c1-9
+}
+
 #Install guest image
 install_image() {
 	local variant="${1:-}"
@@ -409,21 +615,30 @@ install_image() {
 	osbuilder_last_commit="$(get_last_modification "${repo_root_dir}/tools/osbuilder")"
 	local guest_image_last_commit
 	guest_image_last_commit="$(get_last_modification "${repo_root_dir}/tools/packaging/guest-image")"
-	local libs_last_commit
-	libs_last_commit="$(get_last_modification "${repo_root_dir}/src/libs")"
-	local gperf_version
-	gperf_version="$(get_from_kata_deps ".externals.gperf.version")"
-	local libseccomp_version
-	libseccomp_version="$(get_from_kata_deps ".externals.libseccomp.version")"
-	local rust_version
-	rust_version="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
-	local agent_last_commit
-	agent_last_commit=$(merge_two_hashes \
-		"$(get_last_modification "${repo_root_dir}/src/agent")" \
-		"$(get_last_modification "${repo_root_dir}/tools/packaging/static-build/agent")")
 
+	# The gpu extension ships neither kata-agent nor NVRC, so its cache key
+	# must not track agent/toolchain inputs that only affect agent-bearing images.
+	if [[ "${variant}" == "nvidia-gpu-extension" ]]; then
+		latest_artefact="$(get_kata_version)-${os_name}-${os_version}-${osbuilder_last_commit}-${guest_image_last_commit}-${image_type}"
+		latest_artefact+="-$(get_latest_kernel_nvidia_artefact_and_builder_image_version)"
+		latest_artefact+="-$(get_latest_nvidia_driver_version)"
+		latest_artefact+="-$(get_latest_nvidia_ctk_version)"
+	else
+		local libs_last_commit
+		libs_last_commit="$(get_last_modification "${repo_root_dir}/src/libs")"
+		local gperf_version
+		gperf_version="$(get_from_kata_deps ".externals.gperf.version")"
+		local libseccomp_version
+		libseccomp_version="$(get_from_kata_deps ".externals.libseccomp.version")"
+		local rust_version
+		rust_version="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
+		local agent_last_commit
+		agent_last_commit=$(merge_two_hashes \
+			"$(get_last_modification "${repo_root_dir}/src/agent")" \
+			"$(get_last_modification "${repo_root_dir}/tools/packaging/static-build/agent")")
 
-	latest_artefact="$(get_kata_version)-${os_name}-${os_version}-${osbuilder_last_commit}-${guest_image_last_commit}-${agent_last_commit}-${libs_last_commit}-${gperf_version}-${libseccomp_version}-${rust_version}-${image_type}"
+		latest_artefact="$(get_kata_version)-${os_name}-${os_version}-${osbuilder_last_commit}-${guest_image_last_commit}-${agent_last_commit}-${libs_last_commit}-${gperf_version}-${libseccomp_version}-${rust_version}-${image_type}"
+	fi
 	if [[ "${variant}" == *confidential ]]; then
 		# For the confidential image we depend on the kernel built in order to ensure that
 		# measured boot is used
@@ -433,21 +648,47 @@ install_image() {
 			latest_artefact+="-$(get_latest_nvidia_ctk_version)"
 			latest_artefact+="-$(get_latest_nvidia_nvrc_version)"
 			latest_artefact+="-$(get_latest_nvidia_nvat_version)"
+			latest_artefact+="-$(get_latest_nvidia_repo_version)"
 		else
 			latest_artefact+="-$(get_latest_kernel_artefact_and_builder_image_version)"
 		fi
 
+		# Both the standard and NVIDIA confidential images bake the CoCo
+		# guest components (including the pause bundle) into the rootfs.
 		latest_artefact+="-$(get_latest_coco_guest_components_artefact_and_builder_image_version)"
-		latest_artefact+="-$(get_latest_pause_image_artefact_and_builder_image_version)"
 	fi
 
 	if [[ "${variant}" == "nvidia-gpu" ]]; then
-		# If we bump the kernel we need to rebuild the image
+		# Monolith: Kata NVIDIA modules + pinned driver/CTK userspace + NVRC init.
 		latest_artefact+="-$(get_latest_kernel_nvidia_artefact_and_builder_image_version)"
 		latest_artefact+="-$(get_latest_nvidia_driver_version)"
 		latest_artefact+="-$(get_latest_nvidia_ctk_version)"
 		latest_artefact+="-$(get_latest_nvidia_nvrc_version)"
+		latest_artefact+="-$(get_latest_nvidia_repo_version)"
 	fi
+
+	if [[ "${variant}" == "nvidia" ]]; then
+		# The nvidia base image strips all driver userspace and resets the
+		# kernel modules to in-tree only, so it is driver-agnostic: it depends
+		# on the NVIDIA kernel build and NVRC (its init), but not on the driver
+		# or container-toolkit versions.  That lets a single base image back
+		# multiple driver-specific gpu extensions.
+		latest_artefact+="-$(get_latest_kernel_nvidia_artefact_and_builder_image_version)"
+		latest_artefact+="-$(get_latest_nvidia_nvrc_version)"
+	fi
+
+	# The base guest image (empty variant) is built as a measured rootfs so
+	# that confidential configurations can dm-verity-protect it; non-confidential
+	# configurations simply boot its data partition unverified.  Reflect the
+	# measured build (and the kernel it is tied to, since measured boot depends
+	# on it) in the cache key, and emit the root hash under a dedicated "base"
+	# label so it never collides with the legacy confidential image hash.
+	local root_hash_variant="${variant}"
+	if [[ -z "${variant}" && "${MEASURED_ROOTFS:-no}" == "yes" ]]; then
+		root_hash_variant="base"
+		latest_artefact+="-measured-$(get_latest_kernel_artefact_and_builder_image_version)"
+	fi
+	export ROOT_HASH_VARIANT="${root_hash_variant}"
 
 	latest_builder_image=""
 
@@ -462,16 +703,22 @@ install_image() {
 	info "Create image"
 
 	if [[ -n "${variant}" ]]; then
+		# Both the standard confidential image and the NVIDIA confidential
+		# image bake the CoCo guest components (including the pause bundle)
+		# into the rootfs, so each stays a usable standalone monolithic CoCo image.
+		# The runtime-rs split path instead ships these in the separately published
+		# CoCo extension image (rootfs-image-coco-extension).
 		if [[ "${variant}" == *confidential ]]; then
 			COCO_GUEST_COMPONENTS_TARBALL="$(get_coco_guest_components_tarball_path)"
 			export COCO_GUEST_COMPONENTS_TARBALL
-			PAUSE_IMAGE_TARBALL="$(get_pause_image_tarball_path)"
-			export PAUSE_IMAGE_TARBALL
 		fi
 	fi
 
-	AGENT_TARBALL=$(get_agent_tarball_path)
-	export AGENT_TARBALL
+	# The gpu extension is GPU userspace only; do not require an agent tarball.
+	if [[ "${variant}" != "nvidia-gpu-extension" ]]; then
+		AGENT_TARBALL=$(get_agent_tarball_path)
+		export AGENT_TARBALL
+	fi
 	export AGENT_POLICY
 
 	if [[ -n "${GUEST_HOOKS_TARBALL_NAME}" ]]; then
@@ -498,7 +745,32 @@ install_image() {
 	"${rootfs_builder}" --osname="${os_name}" --osversion="${os_version}" --imagetype=image --prefix="${prefix}" --destdir="${destdir}" --image_initrd_suffix="${variant}"
 }
 
+#Install the base guest image
+#
+# The base image (kata-containers.img) is shared by both non-confidential and
+# confidential configurations.  It is built once as a measured rootfs (dm-verity
+# hash partition + root hash emitted under the "base" label).  Confidential
+# configurations enforce that hash via the kernel command line, while
+# non-confidential configurations ignore it and boot the data partition
+# directly.  Measured rootfs is not used on s390x (Secure Execution measures the
+# guest through a different mechanism), so the base stays unmeasured there.
+install_image_base() {
+	if [[ "${ARCH}" == "s390x" ]]; then
+		export MEASURED_ROOTFS="no"
+	else
+		export MEASURED_ROOTFS="yes"
+	fi
+	install_image
+}
+
 #Install guest image for confidential guests
+#
+# During the transition to composable (base + extension) images this monolithic
+# confidential image still bakes in the CoCo guest components and is the image
+# used by the Go runtime. The runtime-rs shims instead use the base image plus
+# the separately built CoCo extension image (rootfs-image-coco-extension),
+# attached as an extra block device. Once the split path is validated for the
+# Go runtime too, the components can stop being baked in here.
 install_image_confidential() {
 	export CONFIDENTIAL_GUEST="yes"
 	if [[ "${ARCH}" == "s390x" ]]; then
@@ -507,6 +779,168 @@ install_image_confidential() {
 		export MEASURED_ROOTFS="yes"
 	fi
 	install_image "confidential"
+}
+
+#Install CoCo extension image (erofs+verity, contains CoCo guest components + pause)
+#
+# The disk image is built and published by guest-components
+# (ghcr.io/confidential-containers/guest-components/coco-extension-disk) as a
+# multi-arch OCI index. Kata resolves the per-arch manifest digest, verifies its
+# provenance attestation, and pulls exactly that digest into kata-static.
+install_image_coco_extension() {
+	local component="rootfs-image-coco-extension"
+
+	latest_artefact="$(get_kata_version)-coco-extension-$(get_latest_coco_extension_artefact_version)"
+	latest_builder_image=""
+
+	install_cached_tarball_component \
+		"${component}" \
+		"${latest_artefact}" \
+		"${latest_builder_image}" \
+		"${final_tarball_name}" \
+		"${final_tarball_path}" \
+		&& return 0
+
+	ensure_oras_installed
+
+	local disk_image_ref image go_arch
+	disk_image_ref="$(get_coco_extension_disk_image_ref)"
+	image="${disk_image_ref%%:*}"
+	go_arch="$(get_coco_extension_oci_arch)"
+
+	# Resolve the per-arch manifest digest out of the multi-arch index. This is the
+	# subject guest-components' provenance attestation is bound to, so we verify it
+	# and then pull that exact digest (avoiding a resolve/pull TOCTOU window).
+	local digest
+	digest="$(oras resolve --platform "linux/${go_arch}" "${disk_image_ref}")" \
+		|| die "Failed to resolve ${disk_image_ref} for linux/${go_arch}; bump .externals.coco-guest-components.version in versions.yaml once guest-components has published the image"
+
+	verify_guest_components_oci_provenance "${image}" "${digest}"
+
+	info "Pull CoCo extension disk image from ${image}@${digest} (linux/${go_arch})"
+
+	local pull_dir
+	pull_dir="$(mktemp -d)"
+	pushd "${pull_dir}" >/dev/null
+	if ! oras pull "${image}@${digest}" --no-tty; then
+		popd >/dev/null
+		rm -rf "${pull_dir}"
+		die "Failed to pull CoCo extension image ${image}@${digest}"
+	fi
+
+	[[ -f kata-containers-coco-extension.img ]] || die "CoCo extension pull did not contain kata-containers-coco-extension.img"
+
+	local install_dir="${destdir}/${prefix}/share/kata-containers/"
+	mkdir -p "${install_dir}"
+	install -D --mode 0644 kata-containers-coco-extension.img \
+		"${install_dir}/kata-containers-coco-extension.img"
+
+	if [[ -f root_hash_coco-extension.txt ]]; then
+		install -D --mode 0644 root_hash_coco-extension.txt \
+			"${install_dir}/root_hash_coco-extension.txt"
+		info "Root hash file: ${install_dir}/root_hash_coco-extension.txt"
+	elif [[ "${ARCH}" != "s390x" ]]; then
+		die "Expected root_hash_coco-extension.txt in ${disk_image_ref}"
+	fi
+
+	popd >/dev/null
+	rm -rf "${pull_dir}"
+}
+
+# Install the generic devkit debug extension image (erofs+verity): a
+# self-contained minimal Ubuntu rootfs with debug tools prebaked. It ships no
+# kata-agent, kernel or driver userspace, so it is built as an agent-less
+# ROOTFS_ONLY rootfs through the osbuilder "devkit" distro (mmdebstrap, like the
+# base guest rootfs) and handed to image_builder.sh, never through rootfs.sh's
+# agent path.
+install_image_devkit_extension() {
+	local component="rootfs-image-devkit-extension"
+
+	# Reuse the guest image's Ubuntu release (e.g. "noble") so the devkit matches
+	# the base userspace ABI (glibc) the guest ships.
+	local os_name os_version
+	os_name="$(get_from_kata_deps ".assets.image.architecture.${ARCH}.name")"
+	os_version="$(get_from_kata_deps ".assets.image.architecture.${ARCH}.version")"
+	[[ "${os_name}" == "ubuntu" ]] || die "devkit extension expects an ubuntu base, got '${os_name}' for ${ARCH}"
+	[[ -n "${os_version}" ]] || die "assets.image.architecture.${ARCH}.version must be set in versions.yaml"
+
+	# Self-contained (Ubuntu release + guest scripts + the CUDA repository baked
+	# into devkit-add-nvidia-repos), so key the cache on the Ubuntu version, the
+	# devkit source directory and that repository pin.
+	local devkit_last_commit
+	devkit_last_commit="$(git -C "${repo_root_dir}" log -1 --abbrev=9 --pretty=format:"%h" \
+		-- tools/osbuilder/rootfs-builder/devkit 2>/dev/null || echo "unknown")"
+	local cuda_repo_pin
+	cuda_repo_pin="$(printf '%s %s' \
+		"$(get_from_kata_deps ".externals.nvidia.cuda.repo.${ARCH}.url")" \
+		"$(get_from_kata_deps ".externals.nvidia.cuda.repo.${ARCH}.pkg")" \
+		| sha256sum | cut -c1-9)"
+	latest_artefact="$(get_kata_version)-devkit-extension-${os_version}-${devkit_last_commit}-${cuda_repo_pin}"
+	latest_builder_image=""
+
+	install_cached_tarball_component \
+		"${component}" \
+		"${latest_artefact}" \
+		"${latest_builder_image}" \
+		"${final_tarball_name}" \
+		"${final_tarball_path}" \
+		&& return 0
+
+	info "Create devkit extension image"
+
+	# Temp dir under the repo root so the path is valid both in the outer build
+	# container and the nested osbuilder/image-builder (Docker-in-Docker uses
+	# host paths).
+	local extension_rootfs
+	extension_rootfs="$(mktemp -d "${repo_root_dir}/.devkit-extension-rootfs.XXXX")"
+
+	# Build the agent-less debug rootfs through the osbuilder "devkit" distro
+	# (mmdebstrap inside the builder container), mirroring how the base guest
+	# rootfs is built. ROOTFS_ONLY stops rootfs.sh before the agent/systemd setup.
+	info "Building devkit ubuntu rootfs (${os_name}:${os_version}) with mmdebstrap"
+	local rootfs_sh="${repo_root_dir}/tools/osbuilder/rootfs-builder/rootfs.sh"
+	ROOTFS_ONLY="yes" \
+		ROOTFS_DIR="${extension_rootfs}" \
+		USE_DOCKER="1" \
+		OS_VERSION="${os_version}" \
+		AGENT_INIT="no" \
+		AGENT_POLICY="no" \
+		AGENT_TARBALL="" \
+		"${rootfs_sh}" devkit || die "building the devkit rootfs failed"
+
+	local install_dir="${destdir}/${prefix}/share/kata-containers/"
+	mkdir -p "${install_dir}"
+
+	local image_builder="${repo_root_dir}/tools/osbuilder/image-builder/image_builder.sh"
+
+	export USE_DOCKER="1"
+	export BUILD_VARIANT="devkit-extension"
+	export FS_TYPE="erofs"
+	# s390x does not use a measured rootfs, so no dm-verity hash is produced.
+	if [[ "${ARCH}" == "s390x" ]]; then
+		export MEASURED_ROOTFS="no"
+	else
+		export MEASURED_ROOTFS="yes"
+	fi
+	export SKIP_DAX_HEADER="yes"
+	export SKIP_ROOTFS_CHECK="yes"
+
+	"${image_builder}" -o "${install_dir}/kata-containers-devkit-extension.img" "${extension_rootfs}"
+
+	if [[ -e "${install_dir}/root_hash_devkit-extension.txt" ]]; then
+		info "Root hash file: ${install_dir}/root_hash_devkit-extension.txt"
+	fi
+
+	# mmdebstrap builds a root-owned tree; remove it with sudo (passwordless in
+	# the build container) so cleanup works from the unprivileged build user.
+	# --one-file-system: a mount left behind inside the tree (mmdebstrap mounts
+	# /proc, /sys and /dev while it works) must not turn this into a deletion of
+	# the host's own files.
+	if command -v sudo >/dev/null 2>&1; then
+		sudo rm -rf --one-file-system "${extension_rootfs:?}"
+	else
+		rm -rf --one-file-system "${extension_rootfs:?}"
+	fi
 }
 
 #Install cbl-mariner guest image
@@ -557,11 +991,11 @@ install_initrd() {
 			latest_artefact+="-$(get_latest_nvidia_ctk_version)"
 			latest_artefact+="-$(get_latest_nvidia_nvrc_version)"
 			latest_artefact+="-$(get_latest_nvidia_nvat_version)"
+			latest_artefact+="-$(get_latest_nvidia_repo_version)"
 		else
 			latest_artefact+="-$(get_latest_kernel_artefact_and_builder_image_version)"
 		fi
 		latest_artefact+="-$(get_latest_coco_guest_components_artefact_and_builder_image_version)"
-		latest_artefact+="-$(get_latest_pause_image_artefact_and_builder_image_version)"
 	fi
 
 	if [[ "${variant}" == "nvidia-gpu" ]]; then
@@ -570,12 +1004,10 @@ install_initrd() {
 		latest_artefact+="-$(get_latest_nvidia_driver_version)"
 		latest_artefact+="-$(get_latest_nvidia_ctk_version)"
 		latest_artefact+="-$(get_latest_nvidia_nvrc_version)"
+		latest_artefact+="-$(get_latest_nvidia_repo_version)"
 	fi
 
 	latest_builder_image=""
-
-	# shellcheck disable=SC2154
-	[[ "${ARCH}" == "aarch64" && "${CROSS_BUILD}" == "true" ]] && echo "warning: Don't cross build initrd for aarch64 as it's too slow" && exit 0
 
 	install_cached_tarball_component \
 		"${component}" \
@@ -591,12 +1023,11 @@ install_initrd() {
 		if [[ "${variant}" == *confidential ]]; then
 			COCO_GUEST_COMPONENTS_TARBALL="$(get_coco_guest_components_tarball_path)"
 			export COCO_GUEST_COMPONENTS_TARBALL
-			PAUSE_IMAGE_TARBALL="$(get_pause_image_tarball_path)"
-			export PAUSE_IMAGE_TARBALL
 		fi
 	else
-		# No variant is passed, it means vanilla kata containers
-		if [[ "${os_name}" = "alpine" ]]; then
+		# Vanilla initrd uses kata-agent as /sbin/init (no systemd), except on s390x.
+		unset AGENT_INIT
+		if [[ "${ARCH}" != "s390x" ]]; then
 			export AGENT_INIT=yes
 		fi
 	fi
@@ -683,10 +1114,55 @@ install_image_nvidia_gpu_confidential() {
 	install_image "nvidia-gpu-confidential"
 }
 
+# Install the driver-agnostic nvidia base image: the NVRC-init half of the
+# chiseled NVIDIA tree (see docs/design/composable-vm-images.md).
+# The driver still has to be installed to build the shared stage-one (the GPU
+# files are carved out afterwards), so keep the same NVIDIA_GPU_STACK as the
+# monolith.
+install_image_nvidia() {
+	export AGENT_POLICY
+	export MEASURED_ROOTFS="yes"
+	export FS_TYPE="erofs"
+	export SKIP_DAX_HEADER="yes"
+	local version
+	version=$(get_latest_nvidia_driver_version)
+	EXTRA_PKGS="apt curl ${EXTRA_PKGS}"
+	NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:-"driver=${version},compute,dcgm,nvswitch"}
+	install_image "nvidia"
+}
+
+# Install the gpu extension image: driver userspace selected directly from the
+# package-installed rootfs and laid out for /run/kata-extensions/gpu (see
+# docs/design/composable-vm-images.md).  It is an erofs+verity image
+# (MEASURED_ROOTFS) and is driver-versioned, so multiple driver extensions can
+# coexist against a single nvidia base image.
+install_image_nvidia_gpu_extension() {
+	# The gpu extension ships no kata-agent, so there is no agent to enforce a
+	# policy: disable it (install_image defaults AGENT_POLICY to "yes").
+	export AGENT_POLICY="no"
+	export MEASURED_ROOTFS="yes"
+	export FS_TYPE="erofs"
+	export SKIP_DAX_HEADER="yes"
+	# The gpu extension is GPU-userspace-only content mounted into the nvidia base image; it
+	# ships no /sbin/init, so skip the rootfs init/agent sanity check.
+	export SKIP_ROOTFS_CHECK="yes"
+	local version
+	version=$(get_latest_nvidia_driver_version)
+	EXTRA_PKGS="apt curl ${EXTRA_PKGS}"
+	NVIDIA_GPU_STACK=${NVIDIA_GPU_STACK:-"driver=${version},compute,dcgm,nvswitch"}
+	install_image "nvidia-gpu-extension"
+}
+
 install_se_image() {
 	# shellcheck disable=SC2154
 	info "Create IBM SE image configured with AA_KBC=${AA_KBC}"
 	"${se_image_builder}" --destdir="${destdir}"
+}
+
+install_se_image_runtime_rs() {
+	# shellcheck disable=SC2154
+	info "Create IBM SE composable image (runtime-rs) configured with AA_KBC=${AA_KBC}"
+	"${se_image_builder}" --composable --destdir="${destdir}"
 }
 
 #Install kernel component helper
@@ -802,16 +1278,6 @@ install_kernel_debug() {
 		""
 }
 
-install_kernel_cca_confidential() {
-	export CONFIDENTIAL_GUEST="yes"
-	export MEASURED_ROOTFS="yes"
-
-	install_kernel_helper \
-		"assets.kernel-arm-experimental.confidential" \
-		"kernel-confidential" \
-		"-x -H deb"
-}
-
 install_kernel_dragonball_experimental() {
 	install_kernel_helper \
 		"assets.kernel-dragonball-experimental" \
@@ -873,15 +1339,18 @@ install_qemu() {
 		"${qemu_builder}"
 }
 
-install_qemu_cca_experimental() {
-	export qemu_suffix="cca-experimental"
+# Install the static qemu asset trimmed down to the runtime classes that run
+# without a shared filesystem.  It is the same qemu as install_qemu, so it
+# tracks the same versions.yaml entry.
+install_qemu_no_shared_fs() {
+	export qemu_suffix="no-shared-fs"
 	export qemu_tarball_name="kata-static-qemu-${qemu_suffix}.tar.gz"
 
 	install_qemu_helper \
-		"assets.hypervisor.qemu-${qemu_suffix}.url" \
-		"assets.hypervisor.qemu-${qemu_suffix}.tag" \
+		"assets.hypervisor.qemu.url" \
+		"assets.hypervisor.qemu.version" \
 		"qemu-${qemu_suffix}" \
-		"${qemu_experimental_builder}"
+		"${qemu_flavour_builder}"
 }
 
 install_qemu_snp_experimental() {
@@ -892,7 +1361,7 @@ install_qemu_snp_experimental() {
 		"assets.hypervisor.qemu-${qemu_suffix}.url" \
 		"assets.hypervisor.qemu-${qemu_suffix}.tag" \
 		"qemu-${qemu_suffix}" \
-		"${qemu_experimental_builder}"
+		"${qemu_flavour_builder}"
 }
 
 install_qemu_tdx_experimental() {
@@ -903,7 +1372,7 @@ install_qemu_tdx_experimental() {
 		"assets.hypervisor.qemu-${qemu_suffix}.url" \
 		"assets.hypervisor.qemu-${qemu_suffix}.tag" \
 		"qemu-${qemu_suffix}" \
-		"${qemu_experimental_builder}"
+		"${qemu_flavour_builder}"
 }
 
 # Install static firecracker asset
@@ -964,15 +1433,29 @@ install_clh() {
 	install_clh_helper "musl" "${features}"
 }
 
-# Install static cloud-hypervisor-glibc asset
-install_clh_glibc() {
-	if [[ "${ARCH}" == "x86_64" ]]; then
-		features="mshv"
-	else
-		features=""
-	fi
+# Install static openvmm asset.
+#
+# OpenVMM publishes no released binaries, so it is always built from source
+# (see static-build/openvmm/build.sh); there is no pull-released-binary fast
+# path like cloud-hypervisor. Repeat builds are still short-circuited by the
+# cached-artefact tarball via install_cached_tarball_component.
+install_openvmm() {
+	latest_artefact="$(get_from_kata_deps ".assets.hypervisor.openvmm.version")"
+	latest_builder_image="$(get_openvmm_image_name)"
 
-	install_clh_helper "gnu" "${features}" "-glibc"
+	install_cached_tarball_component \
+		"openvmm" \
+		"${latest_artefact}" \
+		"${latest_builder_image}" \
+		"${final_tarball_name}" \
+		"${final_tarball_path}" \
+		&& return 0
+
+	info "build static openvmm"
+	"${openvmm_builder}"
+	info "Install static openvmm"
+	mkdir -p "${destdir}/opt/kata/bin/"
+	install -D --mode "${default_binary_permissions}" openvmm/openvmm "${destdir}/opt/kata/bin/openvmm"
 }
 
 # Install static stratovirt asset
@@ -1042,38 +1525,16 @@ install_nydus() {
 	install -D --mode "${default_binary_permissions}" nydus-static/nydusd "${destdir}/opt/kata/libexec/nydusd"
 }
 
-#Install all components that are not assets
-install_shimv2() {
-	local shim_v2_last_commit
-	shim_v2_last_commit="$(get_last_modification "${repo_root_dir}/src/runtime")"
-	local runtime_rs_last_commit
-	runtime_rs_last_commit="$(get_last_modification "${repo_root_dir}/src/runtime-rs")"
-	local protocols_last_commit
-	protocols_last_commit="$(get_last_modification "${repo_root_dir}/src/libs/protocols")"
-	local GO_VERSION
-	GO_VERSION="$(get_from_kata_deps ".languages.golang.meta.newest-version")"
-	local RUST_VERSION
-	RUST_VERSION="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
-
-	latest_artefact="$(get_kata_version)-${shim_v2_last_commit}-${protocols_last_commit}-${runtime_rs_last_commit}-${GO_VERSION}-${RUST_VERSION}"
-	latest_builder_image="$(get_shim_v2_image_name)"
-
-	install_cached_tarball_component \
-		"shim-v2" \
-		"${latest_artefact}" \
-		"${latest_builder_image}" \
-		"${final_tarball_name}" \
-		"${final_tarball_path}" \
-		&& return 0
-
-	export GO_VERSION
-	export RUST_VERSION
-	export MEASURED_ROOTFS
-	export RUNTIME_CHOICE
-
-	for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
+# Shared helper: extract measured-rootfs root hashes from confidential image tarballs.
+# These are needed by the Rust runtime (runtime-rs) at build time for dm-verity.
+_collect_root_hashes() {
+	for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+		# The measured base image ships as kata-static-rootfs-image.tar.zst
+		# (no variant suffix), but carries its root hash under the "base" label.
+		local tarball_glob="kata-static-rootfs-image-${variant}.tar.zst"
+		[[ "${variant}" == "base" ]] && tarball_glob="kata-static-rootfs-image.tar.zst"
 		local image_conf_tarball
-		image_conf_tarball="$(find "${workdir}" -maxdepth 1 -name "kata-static-rootfs-image-${variant}.tar.zst" 2>/dev/null | head -n 1)"
+		image_conf_tarball="$(find "${workdir}" -maxdepth 1 -name "${tarball_glob}" 2>/dev/null | head -n 1)"
 		# Only one variant may be built at a time so we need to
 		# skip one or the other if not available.
 		[[ -f "${image_conf_tarball}" ]] || continue
@@ -1087,6 +1548,70 @@ install_shimv2() {
 
 		mv "root_hash_${variant}.txt" "${workdir}/root_hash_${variant}.txt"
 	done
+}
+
+# Install the Go shim only (containerd-shim-kata-v2 Go runtime + kata-runtime + Go configs).
+install_shim_v2_go() {
+	local shim_v2_last_commit
+	shim_v2_last_commit="$(get_last_modification "${repo_root_dir}/src/runtime")"
+	local protocols_last_commit
+	protocols_last_commit="$(get_last_modification "${repo_root_dir}/src/libs/protocols")"
+	local GO_VERSION
+	GO_VERSION="$(get_from_kata_deps ".languages.golang.meta.newest-version")"
+	local RUST_VERSION
+	RUST_VERSION="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
+
+	latest_artefact="$(get_kata_version)-${shim_v2_last_commit}-${protocols_last_commit}-${GO_VERSION}"
+	latest_builder_image="$(get_shim_v2_image_name)"
+
+	install_cached_tarball_component \
+		"shim-v2-go" \
+		"${latest_artefact}" \
+		"${latest_builder_image}" \
+		"${final_tarball_name}" \
+		"${final_tarball_path}" \
+		&& return 0
+
+	export GO_VERSION
+	export RUST_VERSION
+	export MEASURED_ROOTFS
+	RUNTIME_CHOICE="go"
+	export RUNTIME_CHOICE
+
+	_collect_root_hashes
+
+	DESTDIR="${destdir}" PREFIX="${prefix}" "${shimv2_builder}"
+}
+
+# Install the Rust shim only (containerd-shim-kata-v2 runtime-rs + runtime-rs configs).
+install_shim_v2_rust() {
+	local runtime_rs_last_commit
+	runtime_rs_last_commit="$(get_last_modification "${repo_root_dir}/src/runtime-rs")"
+	local protocols_last_commit
+	protocols_last_commit="$(get_last_modification "${repo_root_dir}/src/libs/protocols")"
+	local GO_VERSION
+	GO_VERSION="$(get_from_kata_deps ".languages.golang.meta.newest-version")"
+	local RUST_VERSION
+	RUST_VERSION="$(get_from_kata_deps ".languages.rust.meta.newest-version")"
+
+	latest_artefact="$(get_kata_version)-${runtime_rs_last_commit}-${protocols_last_commit}-${RUST_VERSION}"
+	latest_builder_image="$(get_shim_v2_image_name)"
+
+	install_cached_tarball_component \
+		"shim-v2-rust" \
+		"${latest_artefact}" \
+		"${latest_builder_image}" \
+		"${final_tarball_name}" \
+		"${final_tarball_path}" \
+		&& return 0
+
+	export GO_VERSION
+	export RUST_VERSION
+	export MEASURED_ROOTFS
+	RUNTIME_CHOICE="rust"
+	export RUNTIME_CHOICE
+
+	_collect_root_hashes
 
 	DESTDIR="${destdir}" PREFIX="${prefix}" "${shimv2_builder}"
 }
@@ -1095,10 +1620,8 @@ install_ovmf() {
 	ovmf_type="${1:-x86_64}"
 	tarball_name="${2:-edk2-x86_64.tar.gz}"
 	if [[ "${ARCH}" == "aarch64" ]]; then
-	  if [[ "${ovmf_type}" != "cca" ]]; then
-		  ovmf_type="arm64"
-		  tarball_name="edk2-arm64.tar.gz"
-		fi
+		ovmf_type="arm64"
+		tarball_name="edk2-arm64.tar.gz"
 	fi
 
 	local component_name="ovmf"
@@ -1130,11 +1653,6 @@ install_ovmf_tdx() {
 	install_ovmf "tdx" "edk2-tdx.tar.gz"
 }
 
-# Install OVMF CCA
-install_ovmf_cca() {
-	install_ovmf "cca" "edk2-cca.tar.gz"
-}
-
 install_busybox() {
 	latest_artefact="$(get_from_kata_deps ".externals.busybox.version")"
 	latest_builder_image="$(get_busybox_image_name)"
@@ -1153,7 +1671,6 @@ install_busybox() {
 
 install_agent() {
 	latest_artefact="$(get_kata_version)-$(git log -1 --abbrev=9 --pretty=format:"%h" "${repo_root_dir}"/src/agent)"
-	artefact_tag="$(git log -1 --pretty=format:"%H" "${repo_root_dir}")"
 	latest_builder_image="$(get_agent_image_name)"
 
 	install_cached_tarball_component \
@@ -1178,9 +1695,9 @@ install_agent() {
 }
 
 install_coco_guest_components() {
-	latest_artefact="$(get_from_kata_deps ".externals.coco-guest-components.version")-$(get_from_kata_deps ".externals.coco-guest-components.toolchain")"
+	latest_artefact="$(get_latest_coco_guest_components_artefact_and_builder_image_version)"
 	artefact_tag="$(get_from_kata_deps ".externals.coco-guest-components.version")"
-	latest_builder_image="$(get_coco_guest_components_image_name)"
+	latest_builder_image=""
 
 	install_cached_tarball_component \
 		"${build_target}" \
@@ -1190,8 +1707,8 @@ install_coco_guest_components() {
 		"${final_tarball_path}" \
 		&& return 0
 
-	info "build static coco-guest-components"
-	DESTDIR="${destdir}" "${coco_guest_components_builder}"
+	info "Pull published CoCo guest components OCI container image"
+	install_coco_guest_components_from_oci
 }
 
 install_pause_image() {
@@ -1318,7 +1835,6 @@ install_tools_helper() {
 	fi
 
 	if [[ "${tool}" == "agent-ctl" ]]; then
-		artefact_tag="$(git log -1 --pretty=format:"%H" "${repo_root_dir}")"
 		defaults_path="${destdir}/opt/kata/share/defaults/kata-containers/agent-ctl"
 		mkdir -p "${defaults_path}"
 		install -D --mode 0644 "${repo_root_dir}/src/tools/${tool}/template/oci_config.json" "${defaults_path}/oci_config.json"
@@ -1382,7 +1898,6 @@ handle_build() {
 		install_kata_ctl
 		install_kata_manager
 		install_kernel
-		install_kernel_cca_confidential
 		install_kernel_dragonball_experimental
 		install_log_parser_rs
 		install_nydus
@@ -1390,10 +1905,12 @@ handle_build() {
 		install_ovmf_sev
 		install_ovmf_tdx
 		install_qemu
+		install_qemu_no_shared_fs
 		install_qemu_snp_experimental
 		install_qemu_tdx_experimental
 		install_stratovirt
-		install_shimv2
+		install_shim_v2_go
+		install_shim_v2_rust
 		install_trace_forwarder
 		install_virtiofsd
 		;;
@@ -1406,11 +1923,13 @@ handle_build() {
 
 	boot-image-se) install_se_image ;;
 
+	boot-image-se-runtime-rs) install_se_image_runtime_rs ;;
+
 	coco-guest-components) install_coco_guest_components ;;
 
 	cloud-hypervisor) install_clh ;;
 
-	cloud-hypervisor-glibc) install_clh_glibc ;;
+	openvmm) install_openvmm ;;
 
 	firecracker) install_firecracker ;;
 
@@ -1423,8 +1942,6 @@ handle_build() {
 	kernel) install_kernel ;;
 
 	kernel-debug) install_kernel_debug ;;
-
-	kernel-cca-confidential) install_kernel_cca_confidential ;;
 
 	kernel-dragonball-experimental) install_kernel_dragonball_experimental ;;
 
@@ -1440,13 +1957,11 @@ handle_build() {
 
 	ovmf-tdx) install_ovmf_tdx ;;
 
-	ovmf-cca) install_ovmf_cca ;;
-
 	pause-image) install_pause_image ;;
 
 	qemu) install_qemu ;;
 
-	qemu-cca-experimental) install_qemu_cca_experimental ;;
+	qemu-no-shared-fs) install_qemu_no_shared_fs ;;
 
 	qemu-snp-experimental) install_qemu_snp_experimental ;;
 
@@ -1454,9 +1969,13 @@ handle_build() {
 
 	stratovirt) install_stratovirt ;;
 
-	rootfs-image) install_image ;;
+	rootfs-image) install_image_base ;;
 
 	rootfs-image-confidential) install_image_confidential ;;
+
+	rootfs-image-coco-extension) install_image_coco_extension ;;
+
+	rootfs-image-devkit-extension) install_image_devkit_extension ;;
 
 	rootfs-image-mariner) install_image_mariner ;;
 
@@ -1468,18 +1987,20 @@ handle_build() {
 
 	rootfs-image-nvidia-gpu-confidential) install_image_nvidia_gpu_confidential ;;
 
-	rootfs-cca-confidential-image) install_image_confidential ;;
+	rootfs-image-nvidia) install_image_nvidia ;;
 
-	rootfs-cca-confidential-initrd) install_initrd_confidential ;;
+	rootfs-image-nvidia-gpu-extension) install_image_nvidia_gpu_extension ;;
 
-	shim-v2) install_shimv2 ;;
+	shim-v2-go) install_shim_v2_go ;;
+
+	shim-v2-rust) install_shim_v2_rust ;;
 
 	trace-forwarder) install_trace_forwarder ;;
 
 	virtiofsd) install_virtiofsd ;;
 
 	dummy)
-		tar --zstd -cvf "${final_tarball_path}" --files-from /dev/null
+		kata_tar_zstd -cvf "${final_tarball_path}" --files-from /dev/null
 	       	;;
 
 	*)
@@ -1489,9 +2010,15 @@ handle_build() {
 
 	if [[ ! -f "${final_tarball_path}" ]]; then
 		cd "${destdir}"
-		tar --zstd -cvf "${final_tarball_path}" "."
+		kata_tar_zstd -cvf "${final_tarball_path}" "."
 	fi
 	tar --zstd -tvf "${final_tarball_path}"
+
+	# Every component ends up merged into kata-static.tar.zst, which is
+	# unpacked with "tar -C /", so a component carrying (say) etc/resolv.conf
+	# takes the resolver of whatever machine installs it down with it.
+	"${repo_root_dir}/tools/packaging/scripts/assert-tarball-host-safe.sh" \
+		"${final_tarball_path}"
 
 	case ${build_target} in
 		kernel-nvidia-gpu|kernel-nvidia-gpu-dragonball-experimental)
@@ -1505,7 +2032,7 @@ handle_build() {
 
 				pushd "${parent_dir}"
 				rm -f "${parent_dir_basename}"/build
-				tar --zstd -cvf "${modules_final_tarball_path}" "."
+				kata_tar_zstd -cvf "${modules_final_tarball_path}" "."
 				popd
 			fi
 			tar --zstd -tvf "${modules_final_tarball_path}"
@@ -1518,15 +2045,15 @@ handle_build() {
 
 				pushd "${modules_dir}"
 				rm -f build
-				tar --zstd -cvf "${modules_final_tarball_path}" "."
+				kata_tar_zstd -cvf "${modules_final_tarball_path}" "."
 				popd
 			fi
 			tar --zstd -tvf "${modules_final_tarball_path}"
 			;;
-		shim-v2)
+		shim-v2-go|shim-v2-rust)
 			if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
-				for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
-					[[ -f "${workdir}/root_hash_${variant}.txt" ]] && mv "${workdir}/root_hash_${variant}.txt" "${workdir}/shim-v2-root_hash_${variant}.txt"
+				for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+					[[ -f "${workdir}/root_hash_${variant}.txt" ]] && mv "${workdir}/root_hash_${variant}.txt" "${workdir}/${build_target}-root_hash_${variant}.txt"
 				done
 			fi
 			;;
@@ -1549,7 +2076,14 @@ handle_build() {
 		echo "${ARTEFACT_REGISTRY_PASSWORD}" | oras login "${ARTEFACT_REGISTRY}" -u "${ARTEFACT_REGISTRY_USERNAME}" --password-stdin
 
 		tags=(latest-"${TARGET_BRANCH}")
-		if [[ -n "${artefact_tag:-}" ]]; then
+
+		# Always tag with HEAD commit SHA to ensure all components are traceable
+		# to the exact repository state, regardless of which files were modified
+		head_sha="$(git -C "${repo_root_dir}" log -1 --pretty=format:"%H")"
+		tags+=("${head_sha}")
+
+		# Add component-specific tag if set and different from HEAD SHA
+		if [[ -n "${artefact_tag:-}" && "${artefact_tag}" != "${head_sha}" ]]; then
 			tags+=("${artefact_tag}")
 		fi
 		if [[ "${RELEASE}" == "yes" ]]; then
@@ -1561,14 +2095,11 @@ handle_build() {
 		normalized_tags=""
 		for tag in "${tags[@]}"; do
 			# tags can only contain lowercase and uppercase letters, digits, underscores, periods, and hyphens
-			# and limited to 128 characters, so filter out non-printable characers, replace invalid printable
-			# characters with underscode and trim down to leave enough space for the arch suffix
+			# and are limited to 128 characters. Sanitize via the shared helper
+			# (the pull path uses the same helper) and trim down to leave room
+			# for the arch suffix.
 			tag_length_limit="$((128 - $(echo "-$(uname -m)" | wc -c)))"
-			normalized_tag="$(echo "${tag}" \
-				| tr -dc '[:print:]' \
-				| tr -c 'a-zA-Z0-9_.\-' _ \
-				| head -c "${tag_length_limit}" \
-			)-$(uname -m)"
+			normalized_tag="$(sanitize_tag_component "${tag}" | head -c "${tag_length_limit}")-$(uname -m)"
 			normalized_tags="${normalized_tags},${normalized_tag}"
 		done
 		declare -a files_to_push=(
@@ -1584,18 +2115,17 @@ handle_build() {
 					"kata-static-${build_target}-modules.tar.zst"
 				)
 				;;
-			shim-v2)
-				if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
-					local found_any=""
-					for variant in confidential nvidia-gpu nvidia-gpu-confidential; do
-						# The variants could be built independently we need to check if
-						# they exist and then push them to the registry
-					[[ -f "${workdir}/shim-v2-root_hash_${variant}.txt" ]] && files_to_push+=("shim-v2-root_hash_${variant}.txt")
-						found_any="yes"
-					done
-					[[ -z "${found_any}" ]] && die "No files to push for shim-v2 with MEASURED_ROOTFS support"
-				fi
-				;;
+		shim-v2-go|shim-v2-rust)
+			if [[ "${MEASURED_ROOTFS}" == "yes" ]]; then
+				local found_any=""
+				for variant in "${MEASURED_ROOTFS_VARIANTS[@]}"; do
+					# The variants could be built independently we need to check if
+					# they exist and then push them to the registry
+					[[ -f "${workdir}/${build_target}-root_hash_${variant}.txt" ]] && files_to_push+=("${build_target}-root_hash_${variant}.txt") && found_any="yes"
+				done
+				[[ -z "${found_any}" ]] && die "No files to push for ${build_target} with MEASURED_ROOTFS support"
+			fi
+			;;
 			*)
 				;;
 		esac
@@ -1642,7 +2172,8 @@ main() {
 		rootfs-initrd
 		rootfs-initrd-confidential
 		rootfs-initrd-mariner
-		shim-v2
+		shim-v2-go
+		shim-v2-rust
 		trace-forwarder
 		virtiofsd
 		dummy

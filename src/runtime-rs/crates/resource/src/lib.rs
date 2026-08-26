@@ -12,13 +12,14 @@ extern crate slog;
 
 logging::logger_with_subsystem!(sl, "resource");
 
+mod block_device;
 pub mod cgroups;
 pub mod manager;
 mod manager_inner;
 pub mod network;
 pub mod resource_persist;
 use hypervisor::{
-    vfio_device::VfioDeviceBase, BlockConfig, HybridVsockConfig, PortDeviceConfig,
+    vfio_device::VfioDeviceBase, BlockConfigModern, HybridVsockConfig, PortDeviceConfig,
     ProtectionDeviceConfig, VsockConfig,
 };
 use network::NetworkConfig;
@@ -36,13 +37,14 @@ use kata_types::config::hypervisor::SharedFsInfo;
 pub enum ResourceConfig {
     Network(NetworkConfig),
     ShareFs(SharedFsInfo),
-    VmRootfs(BlockConfig),
+    VmRootfs(BlockConfigModern),
+    GuestExtensionImage(BlockConfigModern),
     HybridVsock(HybridVsockConfig),
     Vsock(VsockConfig),
     Protection(ProtectionDeviceConfig),
     VfioDeviceModern(VfioDeviceBase),
     PortDevice(PortDeviceConfig),
-    InitData(BlockConfig),
+    InitData(BlockConfigModern),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

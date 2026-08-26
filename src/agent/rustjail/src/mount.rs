@@ -32,6 +32,7 @@ use crate::selinux;
 use crate::sync::write_count;
 use std::string::ToString;
 
+use crate::cgroups_rs as cgroups;
 use crate::log_child;
 use safe_path::scoped_join;
 
@@ -522,19 +523,18 @@ fn pivot_root<P1: ?Sized + NixPath, P2: ?Sized + NixPath>(
 
 pub fn pivot_rootfs<P: ?Sized + NixPath + std::fmt::Debug>(path: &P) -> Result<()> {
     let oldroot = fcntl::open("/", OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty())?;
-    defer!(unistd::close(oldroot).unwrap());
     let newroot = fcntl::open(path, OFlag::O_DIRECTORY | OFlag::O_RDONLY, Mode::empty())?;
-    defer!(unistd::close(newroot).unwrap());
+    // OwnedFd will close automatically when they go out of scope
 
     // Change to the new root so that the pivot_root actually acts on it.
-    unistd::fchdir(newroot)?;
+    unistd::fchdir(&newroot)?;
     pivot_root(".", ".").context(format!("failed to pivot_root on {path:?}"))?;
 
     // Currently our "." is oldroot (according to the current kernel code).
     // However, purely for safety, we will fchdir(oldroot) since there isn't
     // really any guarantee from the kernel what /proc/self/cwd will be after a
     // pivot_root(2).
-    unistd::fchdir(oldroot)?;
+    unistd::fchdir(&oldroot)?;
 
     // Make oldroot rslave to make sure our unmounts don't propagate to the
     // host. We don't use rprivate because this is known to cause issues due
@@ -1016,7 +1016,7 @@ pub fn finish_rootfs(cfd_log: RawFd, spec: &Spec, process: &Process) -> Result<(
     unistd::chdir("/")?;
 
     let process_cwd = process.cwd().display().to_string();
-    if process_cwd.is_empty() {
+    if !process_cwd.is_empty() {
         // Although the process.cwd string can be unclean/malicious (../../dev, etc),
         // we are running on our own mount namespace and we just chrooted into the
         // container's root. It's safe to create CWD from there.
@@ -1339,6 +1339,52 @@ mod tests {
         assert!(ret.is_ok(), "Should pass. Got: {:?}", ret);
     }
 
+    // Regression test for the bug where the create_dir_all guard was inverted
+    // and CWD was only created when process.cwd was empty (the opposite of
+    // what we want).  See PR #2375 (original fix for #2374) and the regression
+    // introduced by PR #9944 ("agent: Align agent OCI spec with oci-spec-rs").
+    #[test]
+    #[serial(chdir)]
+    fn test_finish_rootfs_creates_missing_cwd() {
+        let stdout_fd = std::io::stdout().as_raw_fd();
+
+        // Pick a unique absolute path that does not yet exist on disk.  The
+        // function chdirs to "/" before creating CWD, so the path is taken to
+        // be relative to the (test process's) filesystem root.
+        let unique = format!(
+            "kata-rustjail-cwd-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let cwd_path = std::path::PathBuf::from("/tmp").join(&unique);
+        assert!(
+            !cwd_path.exists(),
+            "test cwd path unexpectedly already exists: {:?}",
+            cwd_path,
+        );
+
+        let mut spec = oci::Spec::default();
+        spec.set_linux(Some(oci::Linux::default()));
+
+        let mut process = oci::Process::default();
+        process.set_cwd(cwd_path.clone());
+
+        let ret = finish_rootfs(stdout_fd, &spec, &process);
+
+        let created = cwd_path.exists();
+        let _ = remove_dir_all(&cwd_path);
+
+        assert!(ret.is_ok(), "finish_rootfs failed: {:?}", ret);
+        assert!(
+            created,
+            "finish_rootfs did not create process.cwd: {:?}",
+            cwd_path,
+        );
+    }
+
     #[test]
     fn test_readonly_path() {
         let ret = readonly_path("abc");
@@ -1444,11 +1490,7 @@ mod tests {
             let msg = format!("test[{}]: {:?}", i, d);
             let tempdir = tempdir().unwrap();
 
-            let (rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
-            defer!({
-                unistd::close(rfd).unwrap();
-                unistd::close(wfd).unwrap();
-            });
+            let (_rfd, wfd) = unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
 
             let source_path = tempdir.path().join(d.source).to_str().unwrap().to_string();
             if d.make_source_directory {
@@ -1464,7 +1506,7 @@ mod tests {
             mount.set_options(Some(vec![]));
 
             let result = mount_from(
-                wfd,
+                wfd.as_raw_fd(),
                 &mount,
                 tempdir.path().to_str().unwrap(),
                 d.flags,
@@ -1600,7 +1642,7 @@ mod tests {
             },
             TestData {
                 mountinfo_data: Some(
-                    "22 933 0:20 /foo\x20-\x20bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
+                    r"22 933 0:20 /foo\040-\040bar /sys rw,nodev shared:2 - sysfs sysfs rw,noexec",
                 ),
                 result: Ok(vec![Info {
                     mount_point: "/sys".to_string(),

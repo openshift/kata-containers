@@ -9,7 +9,8 @@ For details of the other Kata Containers repositories, see the
 
 ## Getting Started
 
-* [Installation guides](./install/README.md): Install and run Kata Containers with Docker or Kubernetes
+* [Quick Start Guide](./quick-start-guide.md): Understand the basics and run your first Kata workload in minutes
+* [Installation guide](./installation.md): Install and run Kata Containers with Docker or Kubernetes
 
 ## Tracing
 

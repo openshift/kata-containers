@@ -228,7 +228,7 @@ func TestPrepareEphemeralMounts(t *testing.T) {
 		assert.Equal(t, s.Driver, KataEphemeralDevType)
 		assert.Equal(t, s.Source, "tmpfs")
 		assert.Equal(t, s.Fstype, "tmpfs")
-		assert.Equal(t, s.MountPoint, filepath.Join(ephemeralPath(), "tmp"))
+		assert.Equal(t, s.MountPoint, filepath.Join(defaultEphemeralPath, "tmp"))
 		assert.Equal(t, len(s.Options), 2) // remount, size=1024M
 
 		validSet := map[string]struct{}{
@@ -1678,4 +1678,121 @@ func TestSandboxHugepageLimit(t *testing.T) {
 	}
 	err = s.updateResources(context.Background())
 	assert.NoError(t, err)
+}
+
+// TestCheckVCPUsPinningNUMAMemoryOnly verifies that when vCPUs < NUMA nodes
+// (memory-only topology for pxb-pcie GPU placement), the function does not
+// return a vCPU-distribution error — the single vCPU is assigned to the first
+// node, memory-only nodes receive 0 vCPUs and are skipped in the pinning loop.
+// SetThreadAffinity may fail in the test environment (no real thread to pin),
+// so we accept any low-level affinity error but must not see a topology error.
+func TestCheckVCPUsPinningNUMAMemoryOnly(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	// 1 vCPU, 2 NUMA nodes — simulates memory-only node 1 for pxb-pcie.
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "0-3"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	if err != nil {
+		// The only permissible failure here is a low-level affinity syscall
+		// error (no real thread in the test process).  A NUMA-topology error
+		// — "no NUMA nodes", "HostCPUs … must not be empty", or a vCPU
+		// distribution failure — must never be returned.
+		assert.NotContains(err.Error(), "no NUMA nodes")
+		assert.NotContains(err.Error(), "HostCPUs")
+		assert.NotContains(err.Error(), "failed to compute NUMA vCPU distribution")
+	}
+}
+
+func TestCheckVCPUsPinningNUMABadHostCPUs(t *testing.T) {
+	assert := assert.New(t)
+	s := &Sandbox{}
+	vCPUThreadsMap := VcpuThreadIDs{vcpus: map[int]int{0: 100, 1: 101, 2: 102, 3: 103}}
+	numaNodes := []types.GuestNUMANode{
+		{HostNodes: "0", HostCPUs: "not-valid"},
+		{HostNodes: "1", HostCPUs: "4-7"},
+	}
+	err := s.checkVCPUsPinningNUMA(context.Background(), vCPUThreadsMap, numaNodes, []int{0, 1, 2, 3, 4, 5, 6, 7})
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to parse HostCPUs")
+}
+
+func TestHotplugVfioNetworkDeviceAlreadyAttached(t *testing.T) {
+	assert := assert.New(t)
+
+	pciPath, err := types.PciPathFromString("02")
+	assert.NoError(err)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	// An endpoint whose guest PCI path is already known has been hotplugged
+	// before: the call must be a no-op, even when no hotplug port is
+	// configured.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		PCIPath:      pciPath,
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	assert.NoError(s.hotplugVfioNetworkDevice(context.Background(), ep))
+	assert.Equal(pciPath, ep.PciPath())
+}
+
+func TestHotplugVfioNetworkDeviceNoPort(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.NoPort,
+			},
+		},
+	}
+
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "0000:ff:1f.7",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "hot_plug_vfio")
+	assert.True(ep.PciPath().IsNil())
+}
+
+func TestHotplugVfioNetworkDevicePortConfigured(t *testing.T) {
+	assert := assert.New(t)
+
+	s := &Sandbox{
+		config: &SandboxConfig{
+			HypervisorConfig: HypervisorConfig{
+				HotPlugVFIO: config.RootPort,
+			},
+		},
+	}
+
+	// With a hotplug port configured the guards are passed and the VFIO
+	// device path resolution is attempted. The malformed BDF cannot match
+	// any sysfs PCI device directory, so the resolution fails
+	// deterministically on every host.
+	ep := &VfioEndpoint{
+		EndpointType: VfioEndpointType,
+		HostBDF:      "not-a-bdf",
+		Iface:        NetworkInterface{Name: "eth1"},
+	}
+
+	err := s.hotplugVfioNetworkDevice(context.Background(), ep)
+	assert.Error(err)
+	assert.Contains(err.Error(), "failed to resolve VFIO device path")
 }

@@ -53,7 +53,18 @@ use hypervisor::ch::CloudHypervisor;
 ))]
 use kata_types::config::{hypervisor::HYPERVISOR_NAME_CH, CloudHypervisorConfig};
 
-use crate::factory::vm::VmConfig;
+#[cfg(all(
+    feature = "openvmm",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use hypervisor::{openvmm::OpenVmm, HYPERVISOR_NAME_OPENVMM};
+#[cfg(all(
+    feature = "openvmm",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use kata_types::config::OpenVmmConfig;
+
+use crate::factory::{template_device_state_path, vm::VmConfig};
 use resource::cpu_mem::initial_size::InitialSizeManager;
 use resource::ResourceManager;
 use sandbox::VIRTCONTAINER;
@@ -101,6 +112,15 @@ impl RuntimeHandler for VirtContainer {
 
         let remote_config = Arc::new(RemoteConfig::new());
         register_hypervisor_plugin("remote", remote_config);
+
+        #[cfg(all(
+            feature = "openvmm",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            let openvmm_config = Arc::new(OpenVmmConfig::new());
+            register_hypervisor_plugin(HYPERVISOR_NAME_OPENVMM, openvmm_config);
+        }
 
         Ok(())
     }
@@ -185,7 +205,9 @@ async fn build_vm_from_template() -> Result<(Arc<dyn Hypervisor>, Arc<dyn Agent>
         h.vm_template.boot_from_template = true;
         let path = Path::new(&h.factory.template_path);
         h.vm_template.memory_path = path.join("memory").to_string_lossy().to_string();
-        h.vm_template.device_state_path = path.join("state").to_string_lossy().to_string();
+        h.vm_template.device_state_path = template_device_state_path(&hypervisor_name, path)
+            .to_string_lossy()
+            .to_string();
         let _ = VmConfig::validate_hypervisor_config(h);
     } else {
         return Err(anyhow!("hypervisor '{}' not found", hypervisor_name));
@@ -253,6 +275,17 @@ async fn new_hypervisor(toml_config: &TomlConfig) -> Result<Arc<dyn Hypervisor>>
         }
         HYPERVISOR_REMOTE => {
             let hypervisor = Remote::new();
+            hypervisor
+                .set_hypervisor_config(hypervisor_config.clone())
+                .await;
+            Ok(Arc::new(hypervisor))
+        }
+        #[cfg(all(
+            feature = "openvmm",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        HYPERVISOR_NAME_OPENVMM => {
+            let hypervisor = OpenVmm::new();
             hypervisor
                 .set_hypervisor_config(hypervisor_config.clone())
                 .await;

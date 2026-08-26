@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 #[cfg(feature = "agent-policy")]
 use kata_agent_policy::policy::PolicyCopyFileRequest;
+use pathrs::flags::OpenFlags;
 use rustjail::{pipestream::PipeStream, process::StreamType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::sync::Mutex;
@@ -29,7 +30,7 @@ use ttrpc::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use cgroups::freezer::FreezerState;
+use cgroups::FreezerState;
 use oci::{Hooks, LinuxNamespace, Spec};
 use oci_spec::runtime as oci;
 #[cfg(feature = "agent-policy")]
@@ -38,8 +39,8 @@ use protobuf::MessageField;
 use protocols::agent::{
     AddSwapPathRequest, AddSwapRequest, AgentDetails, CopyFileRequest, GetIPTablesRequest,
     GetIPTablesResponse, GuestDetailsResponse, Interfaces, Metrics, OOMEvent, ReadStreamResponse,
-    Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse, VolumeStatsRequest,
-    WaitProcessResponse, WriteStreamResponse,
+    ResizeVolumeRequest, Routes, SetIPTablesRequest, SetIPTablesResponse, StatsContainerResponse,
+    VolumeStatsRequest, WaitProcessResponse, WriteStreamResponse,
 };
 use protocols::csi::{
     volume_usage::Unit as VolumeUsage_Unit, VolumeCondition, VolumeStatsResponse, VolumeUsage,
@@ -62,6 +63,8 @@ use nix::mount::MsFlags;
 use nix::sys::{stat, statfs};
 use nix::unistd::{self, Pid};
 use rustjail::process::ProcessOperations;
+#[cfg(all(test, not(target_arch = "powerpc64")))]
+use std::os::fd::AsRawFd;
 
 #[cfg(target_arch = "s390x")]
 use crate::ccw;
@@ -71,7 +74,10 @@ use crate::device::block_device_handler::get_virtio_blk_pci_device_name;
 use crate::device::network_device_handler::wait_for_ccw_net_interface;
 #[cfg(not(target_arch = "s390x"))]
 use crate::device::network_device_handler::wait_for_pci_net_interface;
-use crate::device::{add_devices, dump_nvidia_cdi_yaml, handle_cdi_devices, update_env_pci};
+use crate::device::{
+    add_devices, cdi_devices_from_visible_devices, dump_nvidia_cdi_yaml, handle_cdi_devices,
+    update_env_pci,
+};
 use crate::features::get_build_features;
 use crate::metrics::get_metrics;
 use crate::mount::baremount;
@@ -86,6 +92,8 @@ use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
 use crate::AGENT_CONFIG;
 use crate::{confidential_data_hub, linux_abi::*};
+#[cfg(feature = "devicemapper")]
+use kata_types::dmverity::cleanup_dmverity_devices;
 
 use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
@@ -105,7 +113,7 @@ use std::os::unix::prelude::PermissionsExt;
 use std::process::{Command, Stdio};
 
 use nix::unistd::{Gid, Uid};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -137,6 +145,14 @@ const ERR_NO_SANDBOX_PIDNS: &str = "Sandbox does not have sandbox_pidns";
 // filesystem lock. Based on this, 5 seconds seems a resonable timeout period in case the lock is
 // not available.
 const IPTABLES_RESTORE_WAIT_SEC: u64 = 5;
+
+/// This mask is applied to parent directories implicitly created for CopyFile requests.
+const IMPLICIT_DIRECTORY_PERMISSION_MASK: u32 = 0o777;
+
+/// This mask is applied to files and directories created for CopyFile requests.
+/// In addition to the permissions, it allows setuid/setgid/sticky bits.
+/// Note that the setuid bit does not have an effect on Linux, though.
+const FILE_PERMISSION_MASK: u32 = 0o7777;
 
 // Convenience function to obtain the scope logger.
 fn sl() -> slog::Logger {
@@ -177,11 +193,37 @@ trait ResultToTtrpcResult<T, E: Debug>: Sized {
     }
 }
 
-impl<T, E: Debug> ResultToTtrpcResult<T, E> for Result<T, E> {
-    fn map_ttrpc_err<R: Debug>(self, msg_builder: impl FnOnce(E) -> R) -> ttrpc::Result<T> {
-        self.map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, msg_builder(e)))
+impl<T> ResultToTtrpcResult<T, anyhow::Error> for anyhow::Result<T> {
+    fn map_ttrpc_err<R: Debug>(
+        self,
+        msg_builder: impl FnOnce(anyhow::Error) -> R,
+    ) -> ttrpc::Result<T> {
+        self.map_err(|e| match e.downcast::<ttrpc::error::Error>() {
+            Ok(ttrpc_err) => ttrpc_err,
+            Err(e) => ttrpc_error(ttrpc::Code::INTERNAL, msg_builder(e)),
+        })
     }
 }
+
+macro_rules! impl_ttrpc_result_simple {
+    ($($err_ty:ty),* $(,)?) => {
+        $(
+            impl<T> ResultToTtrpcResult<T, $err_ty> for Result<T, $err_ty> {
+                fn map_ttrpc_err<R: Debug>(self, msg_builder: impl FnOnce($err_ty) -> R) -> ttrpc::Result<T> {
+                    self.map_err(|e| ttrpc_error(ttrpc::Code::INTERNAL, msg_builder(e)))
+                }
+            }
+        )*
+    };
+}
+
+impl_ttrpc_result_simple!(
+    nix::errno::Errno,
+    tokio::time::error::Elapsed,
+    tokio::task::JoinError,
+    i32,
+    std::io::Error,
+);
 
 trait OptionToTtrpcResult<T>: Sized {
     fn map_ttrpc_err(self, code: ttrpc::Code, msg: &str) -> ttrpc::Result<T>;
@@ -251,7 +293,22 @@ impl AgentService {
         // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
         // readonly
         dump_nvidia_cdi_yaml(&sl())?;
-        handle_cdi_devices(&sl(), &mut oci, "/var/run/cdi", AGENT_CONFIG.cdi_timeout).await?;
+        // When enabled, translate the container's VISIBLE_CDI_DEVICES
+        // environment variable into CDI GPU device requests, so that a
+        // container can select which of the VM's GPUs it sees at runtime.
+        let visible_cdi_devices = if AGENT_CONFIG.visible_cdi_devices {
+            cdi_devices_from_visible_devices(&oci)?
+        } else {
+            Vec::new()
+        };
+        handle_cdi_devices(
+            &sl(),
+            &mut oci,
+            "/var/run/cdi",
+            AGENT_CONFIG.cdi_timeout,
+            &visible_cdi_devices,
+        )
+        .await?;
 
         // Handle trusted storage configuration before mounting any storage
         cdh_handler_trusted_storage(&mut oci)
@@ -466,6 +523,14 @@ impl AgentService {
     async fn do_signal_process(&self, req: protocols::agent::SignalProcessRequest) -> Result<()> {
         let cid = req.container_id;
         let eid = req.exec_id;
+        let mut sig: libc::c_int = req.signal as libc::c_int;
+
+        let all = eid.is_empty() && sig == libc::SIGKILL;
+        // NOTE: kata runtime encodes all = true by setting eid = "".
+        // However, containerd can send eid = "", sig = SIGTERM, all = false when deleting containers
+        // (and containerd will send eid = "", sig = SIGKILL, all = true when forcefully deleting containers)
+        // Luckily, containerd never sends eid = "", sig = SIGKILL, all = false outside of ctr
+        // So we can recover the original value of all here by checking eid and sig
 
         info!(
             sl(),
@@ -473,10 +538,10 @@ impl AgentService {
             "container-id" => &cid,
             "exec-id" => &eid,
             "signal" => req.signal,
+            "all" => all,
         );
 
-        let mut sig: libc::c_int = req.signal as libc::c_int;
-        {
+        if !all {
             let mut sandbox = self.sandbox.lock().await;
             let p = sandbox
                 .find_container_process(cid.as_str(), eid.as_str())
@@ -488,6 +553,15 @@ impl AgentService {
             if p.init && sig == libc::SIGTERM && !is_signal_handled(&proc_status_file, sig as u32) {
                 sig = libc::SIGKILL;
             }
+
+            debug!(
+                sl(),
+                "signaling a container process";
+                "container-id" => &cid,
+                "exec-id" => &eid,
+                "pid" => p.pid,
+                "signal" => sig,
+            );
 
             match p.signal(sig) {
                 Err(Errno::ESRCH) => {
@@ -503,10 +577,8 @@ impl AgentService {
                 Err(err) => return Err(anyhow!(err)),
                 Ok(()) => (),
             }
-        };
-
-        if eid.is_empty() {
-            // eid is empty, signal all the remaining processes in the container cgroup
+        } else {
+            // Signalling all processes in the cgroup
             info!(
                 sl(),
                 "signal all the remaining processes";
@@ -962,11 +1034,35 @@ impl agent_ttrpc::AgentService for AgentService {
         trace_rpc_call!(ctx, "stats_container", req);
         is_allowed(&req).await?;
 
-        let mut sandbox = self.sandbox.lock().await;
-        let ctr = sandbox
-            .get_container(&req.container_id)
-            .map_ttrpc_err(ttrpc::Code::INVALID_ARGUMENT, "invalid container id")?;
-        ctr.stats().map_ttrpc_err(same)
+        // Clone the container's cgroup manager (an Arc) while holding the sandbox lock, then
+        // release the lock BEFORE the blocking cgroup read below.
+        //
+        // The sandbox lock is a single global mutex taken by nearly every agent RPC,
+        // including the signal_process/kill path. Previously stats_container held it across
+        // the synchronous get_stats() cgroup read; if that read blocked on a container whose
+        // cgroup is being torn down (e.g. during pod termination), it serialized the whole
+        // agent and starved the kill RPC, leaving the pod stuck Terminating with the host
+        // seeing ttrpc "Receive packet timeout". Cloning the Arc lets stats read the cgroup
+        // without blocking any other RPC.
+        let cgroup_manager = {
+            let mut sandbox = self.sandbox.lock().await;
+            let ctr = sandbox
+                .get_container(&req.container_id)
+                .map_ttrpc_err(ttrpc::Code::INVALID_ARGUMENT, "invalid container id")?;
+            ctr.cgroup_manager.clone()
+        };
+
+        // get_stats() performs blocking synchronous cgroup file reads; run it on the blocking
+        // thread pool so a slow/stuck read cannot park an async reactor worker.
+        let cgroup_stats = tokio::task::spawn_blocking(move || cgroup_manager.get_stats())
+            .await
+            .map_ttrpc_err(same)?
+            .map_ttrpc_err(same)?;
+
+        Ok(StatsContainerResponse {
+            cgroup_stats: MessageField::some(cgroup_stats),
+            ..Default::default()
+        })
     }
 
     async fn pause_container(
@@ -1150,9 +1246,51 @@ impl agent_ttrpc::AgentService for AgentService {
             }
         }
 
-        self.sandbox
-            .lock()
-            .await
+        let mut sandbox = self.sandbox.lock().await;
+
+        #[cfg(not(target_arch = "s390x"))]
+        if !interface.devicePath.is_empty() && !interface.hwAddr.is_empty() {
+            match sandbox
+                .rtnl
+                .netdev_name_from_pci_path(&interface.devicePath)
+            {
+                Ok(Some(netdev_name)) => {
+                    if let Err(err) = sandbox
+                        .rtnl
+                        .set_link_mac_by_name(&netdev_name, &interface.hwAddr)
+                        .await
+                    {
+                        warn!(
+                            sl(),
+                            "update_interface: VFIO MAC reconciliation failed, fallback to by-MAC lookup";
+                            "device-path" => interface.devicePath.as_str(),
+                            "target-mac" => interface.hwAddr.as_str(),
+                            "netdev" => netdev_name.as_str(),
+                            "error" => format!("{:?}", err),
+                        );
+                    }
+                }
+                Ok(None) => {
+                    info!(
+                        sl(),
+                        "update_interface: no netdev found for PCI path before by-MAC lookup";
+                        "device-path" => interface.devicePath.as_str(),
+                        "target-mac" => interface.hwAddr.as_str(),
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        sl(),
+                        "update_interface: unable to resolve netdev from PCI path, fallback to by-MAC lookup";
+                        "device-path" => interface.devicePath.as_str(),
+                        "target-mac" => interface.hwAddr.as_str(),
+                        "error" => format!("{:?}", err),
+                    );
+                }
+            }
+        }
+
+        sandbox
             .rtnl
             .update_interface(&interface)
             .await
@@ -1600,7 +1738,9 @@ impl agent_ttrpc::AgentService for AgentService {
         #[cfg(not(feature = "agent-policy"))]
         is_allowed(&req).await?;
 
-        do_copy_file(&req).map_ttrpc_err(same)?;
+        // Potentially untrustworthy data from the host needs to go into the shared dir.
+        let root_path = PathBuf::from(KATA_GUEST_SHARE_DIR);
+        do_copy_file(&req, &root_path).map_ttrpc_err(same)?;
 
         Ok(Empty::new())
     }
@@ -1625,10 +1765,11 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::GetOOMEventRequest,
     ) -> ttrpc::Result<OOMEvent> {
         is_allowed(&req).await?;
-        let s = self.sandbox.lock().await;
-        let event_rx = &s.event_rx.clone();
+        let event_rx = {
+            let s = self.sandbox.lock().await;
+            s.event_rx.clone()
+        };
         let mut event_rx = event_rx.lock().await;
-        drop(s);
 
         let container_id = event_rx
             .recv()
@@ -1675,6 +1816,20 @@ impl agent_ttrpc::AgentService for AgentService {
         resp.usage = usage_vec;
         resp.volume_condition = MessageField::some(condition);
         Ok(resp)
+    }
+
+    async fn resize_volume(
+        &self,
+        ctx: &TtrpcContext,
+        req: ResizeVolumeRequest,
+    ) -> ttrpc::Result<Empty> {
+        trace_rpc_call!(ctx, "resize_volume", req);
+        is_allowed(&req).await?;
+
+        Err(ttrpc_error(
+            ttrpc::Code::UNIMPLEMENTED,
+            "resize_volume is not implemented in kata-agent",
+        ))
     }
 
     async fn add_swap(
@@ -1741,6 +1896,7 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &::ttrpc::r#async::TtrpcContext,
         config: protocols::agent::MemAgentMemcgConfig,
     ) -> ::ttrpc::Result<Empty> {
+        is_allowed(&config).await?;
         if let Some(ma) = &self.oma {
             ma.memcg_set_config_async(mem_agent_memcgconfig_to_memcg_optionconfig(&config))
                 .await
@@ -1765,6 +1921,7 @@ impl agent_ttrpc::AgentService for AgentService {
         _ctx: &::ttrpc::r#async::TtrpcContext,
         config: protocols::agent::MemAgentCompactConfig,
     ) -> ::ttrpc::Result<Empty> {
+        is_allowed(&config).await?;
         if let Some(ma) = &self.oma {
             ma.compact_set_config_async(mem_agent_compactconfig_to_compact_optionconfig(&config))
                 .await
@@ -2033,6 +2190,15 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
         }
     }
 
+    // Cleanup dm-verity devices for this container (after all mounts are unmounted)
+    if let Some(verity_devices) = sandbox.container_verity_devices.remove(cid) {
+        #[cfg(feature = "devicemapper")]
+        if !verity_devices.is_empty() {
+            cleanup_dmverity_devices(&verity_devices, &sandbox.logger);
+        }
+        let _ = verity_devices;
+    }
+
     sandbox.container_mounts.remove(cid);
     sandbox.containers.remove(cid);
     // Remove any host -> guest mappings for this container
@@ -2134,125 +2300,173 @@ fn do_set_guest_date_time(sec: i64, usec: i64) -> Result<()> {
     Ok(())
 }
 
-fn do_copy_file(req: &CopyFileRequest) -> Result<()> {
-    let path = PathBuf::from(req.path.as_str());
+/// do_copy_file creates a file, directory or symlink beneath the provided directory.
+///
+/// The function guarantees that no content is written outside of the directory. However, a symlink
+/// created by this function might point outside the shared directory. Other users of that
+/// directory need to consider whether they trust the host, or handle the directory with the same
+/// care as do_copy_file.
+///
+/// Parent directories are created, if they don't exist already. For these implicit operations, the
+/// permissions are set with req.dir_mode. The actual target is created with permissions from
+/// req.file_mode, even if it's a directory.
+///
+/// If req.file_mode requests a symbolic link, the link is created pointing to the path in
+/// req.data. In that case, req.file_mode is ignored because symlinks don't have permissions on
+/// Linux.
+///
+/// If this function returns an error, the filesystem may be in an unexpected state. This is not
+/// significant for the caller, since errors are almost certainly not retriable. The runtime should
+/// abandon this VM instead.
+fn do_copy_file(req: &CopyFileRequest, shared_dir: &PathBuf) -> Result<()> {
+    let insecure_full_path = PathBuf::from(req.path.as_str());
+    let path = insecure_full_path
+        .strip_prefix(shared_dir)
+        .context(format!(
+            "removing {:?} prefix from {}",
+            shared_dir, req.path
+        ))?;
 
-    if !path.starts_with(CONTAINER_BASE) {
-        return Err(anyhow!(
-            "Path {:?} does not start with {}",
-            path,
-            CONTAINER_BASE
-        ));
-    }
+    // The shared directory might not exist yet, but we need to create it in order to open the root.
+    std::fs::create_dir_all(shared_dir)?;
+    let root = pathrs::Root::open(shared_dir)?;
 
     // Create parent directories if missing
     if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            let dir = parent.to_path_buf();
-            // Attempt to create directory, ignore AlreadyExists errors
-            if let Err(e) = fs::create_dir_all(&dir) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(e.into());
-                }
-            }
+        let dir = root
+            .mkdir_all(
+                parent,
+                &std::fs::Permissions::from_mode(req.dir_mode & IMPLICIT_DIRECTORY_PERMISSION_MASK),
+            )
+            .context("mkdir_all parent")?
+            .reopen(OpenFlags::O_DIRECTORY)
+            .context("reopen parent")?;
 
-            // Set directory permissions and ownership
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(req.dir_mode))?;
-            unistd::chown(
-                &dir,
-                Some(Uid::from_raw(req.uid as u32)),
-                Some(Gid::from_raw(req.gid as u32)),
-            )?;
-        }
+        // TODO(burgerdev): why are we only applying this to the immediate parent?
+        unistd::fchown(
+            dir,
+            Some(Uid::from_raw(req.uid as u32)),
+            Some(Gid::from_raw(req.gid as u32)),
+        )
+        .context("fchown parent")?
     }
 
     let sflag = stat::SFlag::from_bits_truncate(req.file_mode);
 
     if sflag.contains(stat::SFlag::S_IFDIR) {
-        // Remove existing non-directory file if present
-        if path.exists() && !path.is_dir() {
-            fs::remove_file(&path)?;
-        }
-
-        fs::create_dir(&path).or_else(|e| {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e);
+        // Directories are somewhat special: for backwards compatibility, we need to preserve an
+        // existing directory at path, so we can't just remove_all. Instead, we try to remove a
+        // file and just don't propagate the error if it's a directory or doesn't exist.
+        root.remove_file(path).or_else(|e| match e.kind() {
+            pathrs::error::ErrorKind::OsError(Some(errno))
+                if errno == libc::ENOENT || errno == libc::EISDIR =>
+            {
+                Ok(())
             }
-            Ok(())
+            _ => Err(e),
         })?;
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(req.file_mode))?;
+        // mkdir_all does not support the setuid/setgid/sticky bits, so we first create the
+        // directory with the stricter mask and then change permissions with the correct mask.
+        let dir = root
+            .mkdir_all(
+                path,
+                &std::fs::Permissions::from_mode(
+                    req.file_mode & IMPLICIT_DIRECTORY_PERMISSION_MASK,
+                ),
+            )
+            .context("mkdir_all dir")?
+            .reopen(OpenFlags::O_DIRECTORY)
+            .context("reopen dir")?;
+        dir.set_permissions(std::fs::Permissions::from_mode(
+            req.file_mode & FILE_PERMISSION_MASK,
+        ))?;
 
-        unistd::chown(
-            &path,
+        unistd::fchown(
+            dir,
             Some(Uid::from_raw(req.uid as u32)),
             Some(Gid::from_raw(req.gid as u32)),
-        )?;
+        )
+        .context("fchown dir")?;
 
         return Ok(());
+    }
+
+    // Remove any existing file if we're not resuming a chunked upload.
+    if req.offset == 0 {
+        // Remove anything that might already exist at the target location.
+        // This is safe even for a symlink leaf, remove_all removes the named inode in its parent dir.
+        root.remove_all(path).or_else(|e| match e.kind() {
+            pathrs::error::ErrorKind::OsError(Some(errno)) if errno == libc::ENOENT => Ok(()),
+            _ => Err(e),
+        })?;
     }
 
     // Handle symlink creation
     if sflag.contains(stat::SFlag::S_IFLNK) {
-        // Clean up existing path (whether symlink, dir, or file)
-        if path.exists() || path.is_symlink() {
-            // Use appropriate removal method based on path type
-            if path.is_symlink() {
-                unistd::unlink(&path)?;
-            } else if path.is_dir() {
-                fs::remove_dir_all(&path)?;
-            } else {
-                fs::remove_file(&path)?;
-            }
-        }
-
         // Create new symbolic link
         let symlink_target = PathBuf::from(OsStr::from_bytes(&req.data));
-        unistd::symlinkat(&symlink_target, None, &path)?;
+        root.create(path, &pathrs::InodeType::Symlink(symlink_target))
+            .context("create symlink")?;
 
-        // Set symlink ownership (permissions not supported for symlinks)
-        let path_str = CString::new(path.as_os_str().as_bytes())?;
+        // Set symlink ownership.
+        // At the time of writing this, there was no API for creating the symlink and opening a
+        // handle to the created inode. Best we can do is to resolve it again under the root and
+        // hope that its still the same inode, but at least we guarantee that we're changing
+        // ownership only within the shared directory.
+        nix::unistd::fchownat(
+            root,
+            path,
+            Some(Uid::from_raw(req.uid as u32)),
+            Some(Gid::from_raw(req.gid as u32)),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .context("fchownat")?;
 
-        let ret = unsafe { libc::lchown(path_str.as_ptr(), req.uid as u32, req.gid as u32) };
-        Errno::result(ret).map(drop)?;
-
+        // Symlinks don't have permissions on Linux!
         return Ok(());
     }
 
-    let mut tmpfile = path.clone();
+    let mut tmpfile = path.to_path_buf();
     tmpfile.set_extension("tmp");
 
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(req.offset == 0) // Only truncate when offset is 0
-        .open(&tmpfile)?;
+    // Write file content.
+    let flags = if req.offset == 0 {
+        OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC
+    } else {
+        OpenFlags::O_RDWR | OpenFlags::O_CREAT
+    };
+    let file = root
+        .create_file(
+            &tmpfile,
+            flags,
+            &std::fs::Permissions::from_mode(req.file_mode & FILE_PERMISSION_MASK),
+        )
+        .context("create_file")?;
+    file.write_all_at(req.data.as_slice(), req.offset as u64)
+        .context("write_all_at")?;
 
-    file.write_all_at(req.data.as_slice(), req.offset as u64)?;
-    let st = stat::stat(&tmpfile)?;
+    // Check whether we're waiting for more data.
 
+    let st = nix::sys::stat::fstat(&file).context("fstat")?;
     if st.st_size != req.file_size {
         return Ok(());
     }
 
-    file.set_permissions(std::fs::Permissions::from_mode(req.file_mode))?;
+    // Things like umask can change the permissions after create, make sure that they stay
+    file.set_permissions(std::fs::Permissions::from_mode(
+        req.file_mode & FILE_PERMISSION_MASK,
+    ))
+    .context("set_permissions")?;
 
-    unistd::chown(
-        &tmpfile,
+    unistd::fchown(
+        file,
         Some(Uid::from_raw(req.uid as u32)),
         Some(Gid::from_raw(req.gid as u32)),
-    )?;
+    )
+    .context("fchown")?;
 
-    // Remove existing target path before rename
-    if path.exists() || path.is_symlink() {
-        if path.is_dir() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-
-    fs::rename(tmpfile, path)?;
+    nix::fcntl::renameat(&root, &tmpfile, &root, path).context("renameat")?;
 
     Ok(())
 }
@@ -2543,6 +2757,7 @@ mod tests {
 
     use super::*;
     use crate::{namespace::Namespace, protocols::agent_ttrpc_async::AgentService as _};
+    use anyhow::{bail, ensure};
     use nix::mount;
     use nix::sched::{unshare, CloneFlags};
     use oci::{
@@ -2550,6 +2765,7 @@ mod tests {
         LinuxNamespaceBuilder, LinuxResourcesBuilder, SpecBuilder,
     };
     use oci_spec::runtime::{LinuxNamespaceType, Root};
+    use serial_test::serial;
     use tempfile::{tempdir, TempDir};
     use test_utils::{assert_result, skip_if_not_root};
     use ttrpc::{r#async::TtrpcContext, MessageHeader};
@@ -2563,7 +2779,6 @@ mod tests {
 
     fn mk_ttrpc_context() -> TtrpcContext {
         TtrpcContext {
-            fd: -1,
             mh: MessageHeader::default(),
             metadata: std::collections::HashMap::new(),
             timeout_nano: 0,
@@ -2753,6 +2968,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(not(target_arch = "powerpc64"))]
+    #[serial]
     async fn test_do_write_stream() {
         skip_if_not_root!();
 
@@ -2828,9 +3044,12 @@ mod tests {
             let mut sandbox = Sandbox::new(&logger).unwrap();
 
             let (rfd, wfd) = unistd::pipe().unwrap();
-            if d.break_pipe {
-                unistd::close(rfd).unwrap();
-            }
+            let rfd = if d.break_pipe {
+                drop(rfd); // OwnedFd closes automatically on drop
+                None
+            } else {
+                Some(rfd)
+            };
 
             if d.create_container {
                 let (mut linux_container, _root) = create_linuxcontainer();
@@ -2848,13 +3067,14 @@ mod tests {
                 )
                 .unwrap();
 
-                let fd = {
-                    if d.has_fd {
-                        Some(wfd)
-                    } else {
-                        unistd::close(wfd).unwrap();
-                        None
-                    }
+                let fd = if d.has_fd {
+                    let raw_fd = wfd.as_raw_fd();
+                    std::mem::forget(wfd); // Prevent OwnedFd from closing the fd
+                    Some(raw_fd)
+                } else {
+                    // Let wfd drop naturally to close the fd
+                    drop(wfd);
+                    None
                 };
 
                 if d.has_tty {
@@ -2886,9 +3106,7 @@ mod tests {
                 })
                 .await;
 
-            if !d.break_pipe {
-                unistd::close(rfd).unwrap();
-            }
+            drop(rfd);
             // XXX: Do not close wfd.
             // the fd will be closed on Process's dropping.
             // unistd::close(wfd).unwrap();
@@ -3563,5 +3781,577 @@ COMMIT
             let result = is_sealed_secret_path(d.source_path);
             assert_eq!(d.result, result, "{msg}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_oom_event_no_deadlock() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Sandbox::new(&logger).unwrap();
+
+        let agent_service = Arc::new(AgentService {
+            sandbox: Arc::new(Mutex::new(sandbox)),
+            init_mode: true,
+            oma: None,
+        });
+
+        let svc1 = agent_service.clone();
+        let handle1 = tokio::spawn(async move {
+            let ctx = mk_ttrpc_context();
+            let req = protocols::agent::GetOOMEventRequest::default();
+            svc1.get_oom_event(&ctx, req).await
+        });
+
+        // Yield until handler #1 has released the sandbox lock (entered recv()).
+        // Each yield_now() gives the spawned task a chance to make progress.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                tokio::task::yield_now().await;
+                if agent_service.sandbox.try_lock().is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("sandbox lock should be free while get_oom_event waits");
+
+        let svc2 = agent_service.clone();
+        let handle2 = tokio::spawn(async move {
+            let ctx = mk_ttrpc_context();
+            let req = protocols::agent::GetOOMEventRequest::default();
+            svc2.get_oom_event(&ctx, req).await
+        });
+
+        // Yield until handler #2 has also released the sandbox lock (entered recv()).
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                tokio::task::yield_now().await;
+                if agent_service.sandbox.try_lock().is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("sandbox lock should be free with two concurrent get_oom_event handlers");
+
+        let tx = {
+            let s = agent_service.sandbox.lock().await;
+            s.event_tx.as_ref().unwrap().clone()
+        };
+        tx.send("container-1".to_string()).await.unwrap();
+        tx.send("container-2".to_string()).await.unwrap();
+
+        let result1 = tokio::time::timeout(std::time::Duration::from_secs(5), handle1).await;
+        let result2 = tokio::time::timeout(std::time::Duration::from_secs(5), handle2).await;
+
+        assert!(result1.is_ok(), "handler #1 timed out — possible deadlock");
+        assert!(result2.is_ok(), "handler #2 timed out — possible deadlock");
+
+        let resp1 = result1.unwrap().unwrap().unwrap();
+        let resp2 = result2.unwrap().unwrap().unwrap();
+
+        let mut ids: Vec<String> = vec![resp1.container_id, resp2.container_id];
+        ids.sort();
+        assert_eq!(ids, vec!["container-1", "container-2"]);
+    }
+
+    #[tokio::test]
+    async fn test_do_copy_file() {
+        let temp_dir = tempdir().expect("creating temp dir failed");
+        // We start one directory deeper such that we catch problems when the shared directory does
+        // not exist yet.
+        let base = temp_dir.path().join("shared");
+
+        type Assertions = Box<dyn Fn(&Path) -> Result<()>>;
+        struct TestCase {
+            name: String,
+            request: CopyFileRequest,
+            assertions: Assertions,
+            should_fail: bool,
+        }
+
+        // Attention: these test cases depend on each other and can't be reordered.
+        // The first few cases build up a directory structure that the subsequent tests then rely
+        // on or try to exploit.
+        // TODO(burgerdev): define a common  directory structure for all tests up front.
+        let tests = [
+            TestCase {
+                name: "Create a top-level file".into(),
+                request: CopyFileRequest {
+                    path: base.join("f").to_string_lossy().into(),
+                    file_mode: 0o644 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let f = base.join("f");
+                    let f_stat = fs::metadata(&f).context("stat ./f failed")?;
+                    ensure!(f_stat.is_file());
+                    ensure!(0o644 == f_stat.permissions().mode() & 0o777);
+                    let content = std::fs::read_to_string(&f).context("read ./f failed")?;
+                    ensure!(content.is_empty());
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Writing a file onto an existing file replaces it".into(),
+                request: CopyFileRequest {
+                    path: base.join("f").to_string_lossy().into(),
+                    file_mode: 0o600 | libc::S_IFREG,
+                    data: b"Hello!".to_vec(),
+                    file_size: 6,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let f = base.join("f");
+                    let f_stat = fs::metadata(&f).context("stat ./f failed")?;
+                    ensure!(f_stat.is_file());
+                    ensure!(0o600 == f_stat.permissions().mode() & 0o777);
+                    let content = std::fs::read_to_string(&f).context("read ./f failed")?;
+                    ensure!("Hello!" == content);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a file implicitly creates parent directories".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/b").to_string_lossy().into(),
+                    dir_mode: 0o755 | libc::S_IFDIR,
+                    file_mode: 0o644 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let a_stat = fs::metadata(base.join("a")).context("stat ./a failed")?;
+                    ensure!(a_stat.is_dir());
+                    ensure!(0o755 == a_stat.permissions().mode() & 0o777);
+                    let b_stat = fs::metadata(base.join("a/b")).context("stat ./a/b failed")?;
+                    ensure!(b_stat.is_file());
+                    ensure!(0o644 == b_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Create a file within an existing directory".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/c").to_string_lossy().into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that existing directories are not touched - we expect this to stay 0o755.
+                    file_mode: 0o621 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let a_stat = fs::metadata(base.join("a")).context("stat ./a failed")?;
+                    ensure!(a_stat.is_dir());
+                    ensure!(0o755 == a_stat.permissions().mode() & 0o777);
+                    let c_stat = fs::metadata(base.join("a/c")).context("stat ./a/c failed")?;
+                    ensure!(c_stat.is_file());
+                    ensure!(0o621 == c_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Create a directory".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/d").to_string_lossy().into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that the permissions are taken from file_mode.
+                    file_mode: 0o755 | libc::S_IFDIR,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let a_stat = fs::metadata(base.join("a")).context("stat ./a failed")?;
+                    ensure!(a_stat.is_dir());
+                    ensure!(0o755 == a_stat.permissions().mode() & 0o777);
+                    let d_stat = fs::metadata(base.join("a/d")).context("stat ./a/d failed")?;
+                    ensure!(d_stat.is_dir());
+                    ensure!(0o755 == d_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a dir onto an existing file replaces the file".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/b").to_string_lossy().into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that the permissions are taken from file_mode.
+                    file_mode: 0o755 | libc::S_IFDIR,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let b_stat = fs::metadata(base.join("a/b")).context("stat ./a/b failed")?;
+                    ensure!(b_stat.is_dir());
+                    ensure!(0o755 == b_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a file onto an existing dir replaces the dir".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/b").to_string_lossy().into(),
+                    dir_mode: 0o755 | libc::S_IFDIR,
+                    file_mode: 0o644 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let b_stat = fs::metadata(base.join("a/b")).context("stat ./a/b failed")?;
+                    ensure!(b_stat.is_file());
+                    ensure!(0o644 == b_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a dir onto an existing dir does not replace that dir".into(),
+                request: CopyFileRequest {
+                    path: base.join("a").to_string_lossy().into(),
+                    dir_mode: 0o755 | libc::S_IFDIR,
+                    file_mode: 0o751 | libc::S_IFDIR,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    // Check that a/b still exists
+                    let b_stat = fs::metadata(base.join("a/b")).context("stat ./a/b failed")?;
+                    ensure!(b_stat.is_file());
+                    let a_stat = fs::metadata(base.join("a")).context("stat ./a failed")?;
+                    ensure!(0o751 == a_stat.permissions().mode() & 0o777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Create a symlink".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/link").to_string_lossy().into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that the permissions are taken from file_mode.
+                    file_mode: 0o755 | libc::S_IFLNK,
+                    data: b"/etc/passwd".to_vec(),
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let link = base.join("a/link");
+                    let link_stat = nix::sys::stat::lstat(&link).context("stat ./a/link failed")?;
+                    // Linux symlinks have no permissions!
+                    ensure!(0o777 | libc::S_IFLNK == link_stat.st_mode);
+                    let target = fs::read_link(&link).context("read_link ./a/link failed")?;
+                    ensure!(target.to_string_lossy() == "/etc/passwd");
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Create a directory with setgid and sticky bit".into(),
+                request: CopyFileRequest {
+                    path: base.join("x/y").to_string_lossy().into(),
+                    dir_mode: 0o3755 | libc::S_IFDIR,
+                    file_mode: 0o3770 | libc::S_IFDIR,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    // Implicitly created directories should not get a sticky bit.
+                    let x_stat = fs::metadata(base.join("x")).context("stat ./x failed")?;
+                    ensure!(x_stat.is_dir());
+                    ensure!(0o755 == x_stat.permissions().mode() & 0o7777);
+                    // Explicitly created directories should.
+                    let y_stat = fs::metadata(base.join("x/y")).context("stat ./x/y failed")?;
+                    ensure!(y_stat.is_dir());
+                    ensure!(0o3770 == y_stat.permissions().mode() & 0o7777);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Chunked upload 1".into(),
+                request: CopyFileRequest {
+                    path: base.join("x/chunked").to_string_lossy().into(),
+                    dir_mode: 0o755 | libc::S_IFDIR,
+                    file_mode: 0o644 | libc::S_IFREG,
+                    offset: 0,
+                    file_size: 11,
+                    data: b"Hello ".to_vec(),
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    ensure!(
+                        !(fs::exists(base.join("x/chunked"))
+                            .context("exists ./x/chunked failed")?)
+                    );
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Chunked upload 2".into(),
+                request: CopyFileRequest {
+                    path: base.join("x/chunked").to_string_lossy().into(),
+                    dir_mode: 0o755 | libc::S_IFDIR,
+                    file_mode: 0o644 | libc::S_IFREG,
+                    offset: 6,
+                    file_size: 11,
+                    data: b"World".to_vec(),
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    let content = std::fs::read(base.join("x/chunked"))?;
+                    println!("{:?}", content);
+                    ensure!(b"Hello World".to_vec() == content);
+                    Ok(())
+                }),
+            },
+            // =================================
+            // Below are some adversarial tests.
+            // =================================
+            TestCase {
+                name: "Malicious intermediate directory is a symlink".into(),
+                request: CopyFileRequest {
+                    path: base
+                        .join("a/link/this-could-just-be-shadow-but-I-am-not-risking-it")
+                        .to_string_lossy()
+                        .into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that the permissions are taken from file_mode.
+                    file_mode: 0o755 | libc::S_IFLNK,
+                    data: b"root:password:19000:0:99999:7:::\n".to_vec(),
+                    file_size: 33,
+                    ..Default::default()
+                },
+                should_fail: true,
+                assertions: Box::new(|base| -> Result<()> {
+                    let link_stat = nix::sys::stat::lstat(&base.join("a/link"))
+                        .context("stat ./a/link failed")?;
+                    ensure!(0o777 | libc::S_IFLNK == link_stat.st_mode);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a symlink onto an existing symlink should replace the symlink, not follow it".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/link").to_string_lossy().into(),
+                    dir_mode: 0o700 | libc::S_IFDIR, // Test that the permissions are taken from file_mode.
+                    file_mode: 0o755 | libc::S_IFLNK,
+                    data: b"/etc".to_vec(),
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    // The symlink should be created at the same place (not followed), with the new content.
+                    let a_stat = fs::metadata(base.join("a")).context("stat ./a failed")?;
+                    ensure!(a_stat.is_dir());
+                    ensure!(0o751 == a_stat.permissions().mode() & 0o777);
+                    let link = base.join("a/link");
+                    let link_stat = nix::sys::stat::lstat(&link).context("stat ./a/link failed")?;
+                    // Linux symlinks have no permissions!
+                    ensure!(0o777 | libc::S_IFLNK == link_stat.st_mode);
+                    let target = fs::read_link(&link).context("read_link ./a/link failed")?;
+                    ensure!(target.to_string_lossy() == "/etc");
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Creating a file at an existing symlink replaces the link and does not follow it".into(),
+                request: CopyFileRequest {
+                    path: base.join("a/link").to_string_lossy().into(),
+                    file_mode: 0o600 | libc::S_IFREG,
+                    data: b"Hello!".to_vec(),
+                    file_size: 6,
+                    ..Default::default()
+                },
+                should_fail: false,
+                assertions: Box::new(|base| -> Result<()> {
+                    // The symlink itself should be replaced with the file, not followed.
+                    let link = base.join("a/link");
+                    let link_stat = nix::sys::stat::lstat(&link).context("stat ./a/link failed")?;
+                    ensure!(0o600 | libc::S_IFREG == link_stat.st_mode);
+                    let content = std::fs::read_to_string(&link).context("read ./a/link failed")?;
+                    ensure!("Hello!" == content);
+                    Ok(())
+                }),
+            },
+            TestCase {
+                name: "Writing outside the shared directory is rejected".into(),
+                request: CopyFileRequest {
+                    path: base.parent().unwrap().join("not-shared").to_string_lossy().into(),
+                    file_mode: 0o600 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: true,
+                assertions: Box::new(|base| -> Result<()> {
+                    match fs::metadata(base.parent().unwrap().join("not-shared")) {
+                        Ok(_) => bail!("successful write outside shared directory"),
+                        Err(_) => Ok(())
+                    }
+                }),
+            },
+            TestCase {
+                name: "Traversal outside shared directory is rejected".into(),
+                request: CopyFileRequest {
+                    path: base.join("../not-shared").to_string_lossy().into(),
+                    file_mode: 0o600 | libc::S_IFREG,
+                    ..Default::default()
+                },
+                should_fail: true,
+                assertions: Box::new(|base| -> Result<()> {
+                    match fs::metadata(base.join("../not-shared")) {
+                        Ok(_) => bail!("successful write outside shared directory"),
+                        Err(_) => Ok(())
+                    }
+                }),
+            },
+        ];
+
+        let uid = unistd::getuid().as_raw() as i32;
+        let gid = unistd::getgid().as_raw() as i32;
+
+        for mut tc in tests {
+            println!("Running test case: {}", tc.name);
+            // Since we're in a unit test, using root ownership causes issues with cleaning the temp dir.
+            tc.request.uid = uid;
+            tc.request.gid = gid;
+
+            let res = do_copy_file(&tc.request, &base);
+            if tc.should_fail != res.is_err() {
+                panic!("{}: unexpected do_copy_file result: {:?}", tc.name, res)
+            }
+            (tc.assertions)(&base).context(tc.name).unwrap()
+        }
+    }
+
+    #[test]
+    fn test_map_ttrpc_err_preserves_not_found() {
+        let not_found_err = ttrpc_error(ttrpc::Code::NOT_FOUND, "process not found");
+        let anyhow_err: anyhow::Result<()> = Err(not_found_err.into());
+
+        let result = anyhow_err.map_ttrpc_err(same);
+
+        match &result.unwrap_err() {
+            ttrpc::Error::RpcStatus(status) => {
+                assert_eq!(status.code(), ttrpc::Code::NOT_FOUND);
+            }
+            other => panic!("expected RpcStatus, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_map_ttrpc_err_wraps_non_ttrpc_as_internal() {
+        let plain_err: anyhow::Result<()> = Err(anyhow!("something went wrong"));
+
+        let result = plain_err.map_ttrpc_err(same);
+
+        match &result.unwrap_err() {
+            ttrpc::Error::RpcStatus(status) => {
+                assert_eq!(status.code(), ttrpc::Code::INTERNAL);
+            }
+            other => panic!("expected RpcStatus, got: {:?}", other),
+        }
+    }
+
+    // A cgroup Manager whose get_stats() blocks until released, used to prove that
+    // stats_container does not hold the global sandbox lock across the (blocking) cgroup
+    // read.
+    struct BlockingStatsManager {
+        started: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl rustjail::cgroups::Manager for BlockingStatsManager {
+        fn get_stats(&self) -> anyhow::Result<protocols::agent::CgroupStats> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(protocols::agent::CgroupStats::default())
+        }
+
+        fn name(&self) -> &str {
+            "blocking-stats-test"
+        }
+    }
+
+    // Regression test for the stats_container / kill starvation deadlock: while
+    // stats_container is reading a container's cgroup stats (a blocking operation), the
+    // global sandbox lock must remain free so other RPCs — crucially signal_process/kill —
+    // can proceed. Previously the lock was held across get_stats(), so a stats read that
+    // blocked on a torn-down cgroup during teardown wedged the whole agent and left the pod
+    // stuck Terminating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_stats_container_does_not_hold_sandbox_lock() {
+        skip_if_not_root!();
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let (mut linux_container, _root) = create_linuxcontainer();
+        linux_container.id = "1".to_string();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+
+        // Always release the blocking get_stats() thread, even if the test panics before the
+        // explicit release below. Tokio cannot cancel spawn_blocking tasks, so a still-looping
+        // thread would otherwise hang the whole test binary at runtime shutdown.
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release_guard = ReleaseOnDrop(release.clone());
+
+        linux_container.cgroup_manager = Arc::new(BlockingStatsManager {
+            started: started.clone(),
+            release: release.clone(),
+        });
+
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        sandbox.add_container(linux_container);
+
+        let agent_service = Arc::new(AgentService {
+            sandbox: Arc::new(Mutex::new(sandbox)),
+            init_mode: true,
+            oma: None,
+        });
+
+        // Fire stats_container; get_stats() will block on the blocking thread pool.
+        let svc = agent_service.clone();
+        let handle = tokio::spawn(async move {
+            svc.stats_container(
+                &mk_ttrpc_context(),
+                protocols::agent::StatsContainerRequest {
+                    container_id: "1".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        // Wait until get_stats() is actually executing.
+        for _ in 0..500 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(started.load(Ordering::SeqCst), "get_stats never started");
+
+        // The regression assertion: the sandbox lock must be acquirable while stats is
+        // mid-read. With the old code (lock held across get_stats) this times out — exactly
+        // the condition that starves the kill and wedges pod teardown.
+        let lock_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent_service.sandbox.lock(),
+        )
+        .await;
+        assert!(
+            lock_res.is_ok(),
+            "sandbox lock held during stats_container get_stats: signal_process/kill would be starved"
+        );
+        drop(lock_res);
+
+        // Unblock the read and confirm the RPC completes successfully.
+        release.store(true, Ordering::SeqCst);
+        let res = handle.await.unwrap();
+        assert!(res.is_ok(), "stats_container returned error: {:?}", res);
     }
 }

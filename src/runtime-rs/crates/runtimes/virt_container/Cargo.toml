@@ -8,7 +8,7 @@ license = { workspace = true }
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-awaitgroup = "0.6.0"
+awaitgroup = { workspace = true }
 containerd-shim-protos = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 slog = { workspace = true }
 slog-scope = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 oci-spec = { workspace = true }
@@ -46,6 +47,8 @@ cloud-hypervisor = ["hypervisor/cloud-hypervisor"]
 # Enable the build-in VMM Dragtonball
 dragonball = ["hypervisor/dragonball"]
 
+# Enable the OpenVMM driver
+openvmm = ["hypervisor/openvmm"]
 
 [package.metadata.cargo-machete]
 ignored = ["slog-scope"]

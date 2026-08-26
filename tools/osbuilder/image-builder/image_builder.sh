@@ -14,15 +14,7 @@ DOCKER_RUNTIME=${DOCKER_RUNTIME:-runc}
 MEASURED_ROOTFS=${MEASURED_ROOTFS:-no}
 IMAGE_SIZE_ALIGNMENT_MB=${IMAGE_SIZE_ALIGNMENT_MB:-128}
 
-#For cross build
-CROSS_BUILD=${CROSS_BUILD:-false}
-BUILDX=""
-PLATFORM=""
-TARGET_ARCH=${TARGET_ARCH:-$(uname -m)}
 ARCH=${ARCH:-$(uname -m)}
-[[ "${TARGET_ARCH}" == "aarch64" ]] && TARGET_ARCH=arm64
-TARGET_OS=${TARGET_OS:-linux}
-[[ "${CROSS_BUILD}" == "true" ]] && BUILDX=buildx && PLATFORM="--platform=${TARGET_OS}/${TARGET_ARCH}"
 BUILD_VARIANT=${BUILD_VARIANT:-}
 
 readonly script_name="${0##*/}"
@@ -144,7 +136,7 @@ build_with_container() {
 	fi
 
 	# shellcheck disable=SC2154,SC2086,SC2248
-	"${container_engine}" ${BUILDX} build ${PLATFORM}  \
+	"${container_engine}" build \
 		   ${engine_build_args} \
 		   --build-arg http_proxy="${http_proxy}" \
 		   --build-arg https_proxy="${https_proxy}" \
@@ -179,10 +171,10 @@ build_with_container() {
 		   --env NSDAX_BIN="${nsdax_bin}" \
 		   --env SKIP_DAX_HEADER="${SKIP_DAX_HEADER}" \
 		   --env MEASURED_ROOTFS="${MEASURED_ROOTFS}" \
+		   --env SKIP_ROOTFS_CHECK="${SKIP_ROOTFS_CHECK:-no}" \
 		   --env SELINUX="${SELINUX}" \
 		   --env DEBUG="${DEBUG}" \
 		   --env ARCH="${ARCH}" \
-		   --env TARGET_ARCH="${TARGET_ARCH}" \
 		   --env USER="$(id -u)" \
 		   --env GROUP="$(id -g)" \
 		   --env IMAGE_SIZE_ALIGNMENT_MB="${IMAGE_SIZE_ALIGNMENT_MB}" \
@@ -456,6 +448,12 @@ setup_selinux() {
 }
 
 setup_systemd() {
+		# Extension content images (e.g. the gpu extension) carry no /etc and are not
+		# bootable systemd rootfses, so there is nothing to set up here.
+		if [[ ! -d "${mount_dir}/etc" ]]; then
+			info "No /etc in rootfs; skipping systemd machine-id setup"
+			return 0
+		fi
 		info "Creating empty machine-id to allow systemd to bind-mount it"
 		touch "${mount_dir}/etc/machine-id"
 }
@@ -715,8 +713,10 @@ main() {
 		exit $?
 	fi
 
-	if ! check_rootfs "${rootfs}" ; then
-		die "Invalid rootfs"
+	if [[ "${SKIP_ROOTFS_CHECK:-no}" != "yes" ]]; then
+		if ! check_rootfs "${rootfs}" ; then
+			die "Invalid rootfs"
+		fi
 	fi
 
 	local skip_dax="${SKIP_DAX_HEADER:-no}"

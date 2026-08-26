@@ -9,8 +9,9 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ops::Deref;
+use std::os::unix::io::AsRawFd;
 
-use dbs_acpi::sdt::Sdt;
+use dbs_acpi::*;
 use dbs_address_space::{AddressSpace, AddressSpaceRegionType};
 use dbs_boot::{
     add_e820_entry, bootparam, layout, mptable, tdshim::*, BootParamsWrapper, FirmwareType,
@@ -20,18 +21,21 @@ use dbs_interrupt::IOAPIC_MAX_NR_REDIR_ENTRIES;
 use dbs_utils::epoll_manager::EpollManager;
 use dbs_utils::time::TimestampUs;
 use kvm_bindings::{
-    kvm_enable_cap, kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_CAP_SPLIT_IRQCHIP,
-    KVM_PIT_SPEAKER_DUMMY,
+    kvm_enable_cap, kvm_irqchip, kvm_pit_config, kvm_pit_state2, KVM_CAP_EXIT_HYPERCALL,
+    KVM_CAP_SPLIT_IRQCHIP, KVM_PIT_SPEAKER_DUMMY,
 };
 use linux_loader::cmdline::Cmdline;
 use linux_loader::configurator::{linux::LinuxBootConfigurator, BootConfigurator, BootParams};
 use slog::info;
+use tdx::launch::MemRegion;
 use vm_memory::{Address, GuestAddress, GuestAddressSpace, GuestMemory};
 
 use crate::address_space_manager::{GuestAddressSpaceImpl, GuestMemoryImpl};
+use crate::api::v1::ConfidentialVmType;
 use crate::error::{Error, Result, StartMicroVmError};
 use crate::event_manager::EventManager;
-use crate::vm::{Vm, VmError};
+use crate::vcpu::KVM_HC_MAP_GPA_RANGE;
+use crate::vm::{VcpuManagerError, Vm, VmError};
 
 /// Configures the system and should be called once per vm before starting vcpu
 /// threads.
@@ -215,8 +219,11 @@ impl Vm {
                 .cloned()
                 .ok_or(StartMicroVmError::GuestMemoryNotInitialized)?;
             let mut hob_address = 0;
-            // TODO: Fill the empty list with ACPI table content
-            let acpi_tables: Vec<Sdt> = Vec::new();
+            let acpi_tables: Vec<sdt::Sdt> = vec![
+                create_madt_table(self.vm_config.max_vcpu_count, self.vm_config.vcpu_count),
+                create_fadt_table(),
+                create_dsdt_table(),
+            ];
 
             self.load_kernel_with_tdshim(
                 &sections,
@@ -231,6 +238,13 @@ impl Vm {
                 .map_err(StartMicroVmError::Vcpu)?
                 .create_vcpus(boot_vcpu_count, Some(request_ts), None, self.firmware_type)
                 .map_err(StartMicroVmError::Vcpu)?;
+
+            if self.confidential_vm_type() == Some(ConfidentialVmType::TDX) {
+                self.enable_hc_map_gpa_range()?;
+                self.tdx_init_vcpus(hob_address)?;
+                self.tdx_init_mem_region(vm_memory.deref(), &sections)?;
+                self.tdx_finalize()?;
+            }
 
             return Ok(());
         }
@@ -377,13 +391,17 @@ impl Vm {
         self.shared_info.read().unwrap().split_irqchip()
     }
 
+    pub(crate) fn kvm_mem_attr_private(&self) -> bool {
+        self.confidential_vm_type() == Some(ConfidentialVmType::TDX)
+    }
+
     fn load_kernel_with_tdshim(
         &mut self,
         sections: &Vec<TdvfSection>,
         vm_memory: &GuestMemoryImpl,
         address_space: AddressSpace,
         hob_address: &mut u64,
-        acpi_tables: &Vec<Sdt>,
+        acpi_tables: &Vec<sdt::Sdt>,
     ) -> std::result::Result<(), StartMicroVmError> {
         let mut required_sections = vec!["Bfv", "TdHob", "PayloadParam"];
 
@@ -461,7 +479,7 @@ impl Vm {
         vm_memory: &GuestMemoryImpl,
         address_space: AddressSpace,
         payload_info: PayloadInfo,
-        acpi_tables: &Vec<Sdt>,
+        acpi_tables: &Vec<sdt::Sdt>,
     ) -> std::result::Result<(), StartMicroVmError> {
         let mut hob = TdHob::start(hob_address);
 
@@ -504,6 +522,87 @@ impl Vm {
         hob.finish(vm_memory)
             .map_err(StartMicroVmError::TdvfError)?;
 
+        Ok(())
+    }
+
+    pub(super) fn enable_hc_map_gpa_range(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        let mut enable_hc_map_gpa_range = kvm_enable_cap {
+            cap: KVM_CAP_EXIT_HYPERCALL,
+            ..Default::default()
+        };
+        enable_hc_map_gpa_range.args[0] = 1 << KVM_HC_MAP_GPA_RANGE;
+        self.vm_fd()
+            .enable_cap(&enable_hc_map_gpa_range)
+            .map_err(StartMicroVmError::EnableHcMapGpaRange)
+    }
+
+    pub(super) fn tdx_init_vm(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        let supported_cpuid = self
+            .kvm
+            .supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(VcpuManagerError::Kvm)
+            .map_err(StartMicroVmError::Vcpu)?;
+
+        self.tdx_launcher
+            .as_mut()
+            .unwrap()
+            .init_vm(self.tdx_capabilities.as_ref().unwrap(), supported_cpuid)
+            .map_err(StartMicroVmError::TdxError)?;
+
+        Ok(())
+    }
+
+    pub(super) fn tdx_init_vcpus(
+        &mut self,
+        hob_address: u64,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let mut vcpu_fds = Vec::new();
+        self.vcpu_manager()
+            .map_err(StartMicroVmError::Vcpu)?
+            .vcpus()
+            .iter()
+            .for_each(|vcpu| {
+                vcpu_fds.push(vcpu.vcpu_fd().as_raw_fd());
+            });
+
+        let launcher = self.tdx_launcher.as_mut().unwrap();
+        vcpu_fds.iter().for_each(|fd| launcher.add_vcpu_fd(*fd));
+        launcher
+            .init_vcpus(hob_address)
+            .map_err(StartMicroVmError::TdxError)?;
+
+        Ok(())
+    }
+
+    pub(super) fn tdx_init_mem_region(
+        &mut self,
+        vm_memory: &GuestMemoryImpl,
+        sections: &Vec<TdvfSection>,
+    ) -> std::result::Result<(), StartMicroVmError> {
+        let launcher = self.tdx_launcher.as_mut().unwrap();
+        for section in sections {
+            let host_address = vm_memory
+                .get_host_address(GuestAddress(section.address))
+                .map_err(StartMicroVmError::GuestMemoryError)?;
+            let region = MemRegion::new(
+                section.address,
+                section.size / dbs_boot::PAGE_SIZE as u64,
+                section.attributes,
+                host_address as u64,
+            );
+            launcher
+                .init_mem_region(region)
+                .map_err(StartMicroVmError::TdxError)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn tdx_finalize(&mut self) -> std::result::Result<(), StartMicroVmError> {
+        self.tdx_launcher
+            .as_mut()
+            .unwrap()
+            .finalize()
+            .map_err(StartMicroVmError::TdxError)?;
         Ok(())
     }
 }

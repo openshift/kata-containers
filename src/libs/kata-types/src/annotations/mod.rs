@@ -38,9 +38,6 @@ pub const KATA_ANNO_PREFIX: &str = "io.katacontainers.";
 pub const KATA_ANNO_CFG_PREFIX: &str = "io.katacontainers.config.";
 /// Prefix for Kata container annotations
 pub const KATA_ANNO_CONTAINER_PREFIX: &str = "io.katacontainers.container.";
-/// The annotation key to fetch runtime configuration file.
-pub const SANDBOX_CFG_PATH_KEY: &str = "io.katacontainers.config_path";
-
 // OCI section
 /// The annotation key to fetch the OCI configuration file path.
 pub const BUNDLE_PATH_KEY: &str = "io.katacontainers.pkg.oci.bundle_path";
@@ -99,9 +96,14 @@ pub const KATA_ANNO_CFG_HYPERVISOR_JAILER_PATH: &str =
 pub const KATA_ANNO_CFG_HYPERVISOR_JAILER_HASH: &str =
     "io.katacontainers.config.hypervisor.jailer_hash";
 /// A sandbox annotation to enable IO to be processed in a separate thread.
-/// Supported currently for virtio-scsi driver.
+/// Supported for the virtio-scsi driver, and also used for virtio-blk-pci when
+/// combined with `KATA_ANNO_CFG_HYPERVISOR_INDEP_IO_THREADS`.
 pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_IO_THREADS: &str =
     "io.katacontainers.config.hypervisor.enable_iothreads";
+/// A sandbox annotation to specify the number of independent IO threads.
+/// Used for virtio-blk-pci devices during hotplug.
+pub const KATA_ANNO_CFG_HYPERVISOR_INDEP_IO_THREADS: &str =
+    "io.katacontainers.config.hypervisor.indep_iothreads";
 /// The hash type used for assets verification
 pub const KATA_ANNO_CFG_HYPERVISOR_ASSET_HASH_TYPE: &str =
     "io.katacontainers.config.hypervisor.asset_hash_type";
@@ -186,10 +188,6 @@ pub const KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MAX_VCPUS: &str =
     "io.katacontainers.config.hypervisor.default_max_vcpus";
 
 // Hypervisor Device related annotations
-/// A sandbox annotation used to indicate if devices need to be hotplugged on the root bus instead
-/// of a bridge.
-pub const KATA_ANNO_CFG_HYPERVISOR_HOTPLUG_VFIO_ON_ROOT_BUS: &str =
-    "io.katacontainers.config.hypervisor.hotplug_vfio_on_root_bus";
 /// PCIeRootPort is used to indicate the number of PCIe Root Port devices
 pub const KATA_ANNO_CFG_HYPERVISOR_PCIE_ROOT_PORT: &str =
     "io.katacontainers.config.hypervisor.pcie_root_port";
@@ -230,9 +228,6 @@ pub const KATA_ANNO_CFG_HYPERVISOR_ENABLE_HUGEPAGES: &str =
 /// A sandbox annotation to specify huge page mode of memory backend.
 pub const KATA_ANNO_CFG_HYPERVISOR_HUGEPAGE_TYPE: &str =
     "io.katacontainers.config.hypervisor.hugepage_type";
-/// A sandbox annotation to soecify file based memory backend root directory.
-pub const KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR: &str =
-    "io.katacontainers.config.hypervisor.file_mem_backend";
 /// A sandbox annotation that is used to enable/disable virtio-mem.
 pub const KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM: &str =
     "io.katacontainers.config.hypervisor.enable_virtio_mem";
@@ -321,9 +316,6 @@ pub const KATA_ANNO_CFG_RUNTIME_AGENT: &str = "io.katacontainers.config.runtime.
 /// A sandbox annotation that determines if seccomp should be applied inside guest.
 pub const KATA_ANNO_CFG_DISABLE_GUEST_SECCOMP: &str =
     "io.katacontainers.config.runtime.disable_guest_seccomp";
-/// A sandbox annotation that determines if it should create Kubernetes emptyDir mounts on the guest filesystem.
-pub const KATA_ANNO_CFG_DISABLE_GUEST_EMPTY_DIR: &str =
-    "io.katacontainers.config.runtime.disable_guest_empty_dir";
 
 /// A sandbox annotation that determines if pprof enabled.
 pub const KATA_ANNO_CFG_ENABLE_PPROF: &str = "io.katacontainers.config.runtime.enable_pprof";
@@ -430,11 +422,6 @@ impl Annotation {
 
 // Miscellaneous annotations.
 impl Annotation {
-    /// Get the annotation of sandbox configuration file path.
-    pub fn get_sandbox_config_path(&self) -> Option<String> {
-        self.get(SANDBOX_CFG_PATH_KEY)
-    }
-
     /// Get the annotation of bundle path.
     pub fn get_bundle_path(&self) -> Option<String> {
         self.get(BUNDLE_PATH_KEY)
@@ -568,6 +555,15 @@ impl Annotation {
                         }
                         Err(_e) => {
                             return Err(bool_err);
+                        }
+                    },
+                    KATA_ANNO_CFG_HYPERVISOR_INDEP_IO_THREADS => match self.get_value::<u32>(key) {
+                        Ok(r) => {
+                            let indep_iothreads = r.unwrap_or_default();
+                            hv.indep_iothreads = indep_iothreads;
+                        }
+                        Err(_e) => {
+                            return Err(u32_err);
                         }
                     },
                     // Hypervisor Block Device related annotations
@@ -710,16 +706,6 @@ impl Annotation {
                         }
                     }
                     // Hypervisor Device related annotations
-                    KATA_ANNO_CFG_HYPERVISOR_HOTPLUG_VFIO_ON_ROOT_BUS => {
-                        match self.get_value::<bool>(key) {
-                            Ok(r) => {
-                                hv.device_info.hotplug_vfio_on_root_bus = r.unwrap_or_default();
-                            }
-                            Err(_e) => {
-                                return Err(bool_err);
-                            }
-                        }
-                    }
                     // Limitations documents aligned with runtime-go:
                     // If number of PCIe root ports > 16 then bail out otherwise we may
                     // use up all slots or IO memory on the root bus and vfio-XXX-pci devices
@@ -802,37 +788,24 @@ impl Annotation {
                     }
                     // Hypervisor Memory related annotations
                     KATA_ANNO_CFG_HYPERVISOR_DEFAULT_MEMORY => {
-                        match byte_unit::Byte::parse_str(value, true) {
-                            Ok(mem_bytes) => {
-                                let memory_size = mem_bytes
-                                    .get_adjusted_unit(byte_unit::Unit::MiB)
-                                    .get_value()
-                                    as u32;
-                                info!(sl!(), "get mem {} from annotations: {}", memory_size, value);
-                                if memory_size
-                                    < get_hypervisor_plugin(hypervisor_name)
-                                        .unwrap()
-                                        .get_min_memory()
-                                {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "memory specified in annotation {} is less than minimum limitation {}",
-                                            memory_size,
-                                            get_hypervisor_plugin(hypervisor_name)
-                                                .unwrap()
-                                                .get_min_memory()
-                                        ),
-                                    ));
-                                }
-                                hv.memory_info.default_memory = memory_size;
+                        if let Some(memory_size) = convert_to_megabytes(value)? {
+                            if memory_size
+                                < get_hypervisor_plugin(hypervisor_name)
+                                    .unwrap()
+                                    .get_min_memory()
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "memory specified in annotation {} is less than minimum limitation {}",
+                                        memory_size,
+                                        get_hypervisor_plugin(hypervisor_name)
+                                            .unwrap()
+                                            .get_min_memory()
+                                    ),
+                                ));
                             }
-                            Err(error) => {
-                                error!(
-                                    sl!(),
-                                    "failed to parse byte from string {} error {:?}", value, error
-                                );
-                            }
+                            hv.memory_info.default_memory = memory_size;
                         }
                     }
                     KATA_ANNO_CFG_HYPERVISOR_MEMORY_SLOTS => match self.get_value::<u32>(key) {
@@ -874,10 +847,6 @@ impl Annotation {
                                 ));
                             }
                         }
-                    }
-                    KATA_ANNO_CFG_HYPERVISOR_FILE_BACKED_MEM_ROOT_DIR => {
-                        hv.memory_info.validate_memory_backend_path(value)?;
-                        hv.memory_info.file_mem_backend = value.to_string();
                     }
                     KATA_ANNO_CFG_HYPERVISOR_VIRTIO_MEM => match self.get_value::<bool>(key) {
                         Ok(r) => {
@@ -1129,14 +1098,6 @@ impl Annotation {
                             return Err(bool_err);
                         }
                     },
-                    KATA_ANNO_CFG_DISABLE_GUEST_EMPTY_DIR => match self.get_value::<bool>(key) {
-                        Ok(r) => {
-                            config.runtime.disable_guest_empty_dir = r.unwrap_or_default();
-                        }
-                        Err(_e) => {
-                            return Err(bool_err);
-                        }
-                    },
                     KATA_ANNO_CFG_ENABLE_PPROF => match self.get_value::<bool>(key) {
                         Ok(r) => {
                             config.runtime.enable_pprof = r.unwrap_or_default();
@@ -1185,14 +1146,12 @@ impl Annotation {
                         config.runtime.shared_mounts = serde_json::from_str(value.as_str())?;
                     }
                     KATA_ANNO_CFG_SANDBOX_BIND_MOUNTS => {
-                        let args: Vec<String> = value
-                            .to_string()
-                            .split_ascii_whitespace()
-                            .map(str::to_string)
-                            .collect();
-                        for arg in args {
-                            config.runtime.sandbox_bind_mounts.push(arg.to_string());
-                        }
+                        // Host bind-mount paths are operator-controlled configuration only.
+                        // Never honor them from untrusted workload annotations.
+                        warn!(
+                            sl!(),
+                            "Annotation {} is not permitted from workload annotations", key
+                        );
                     }
                     _ => {
                         warn!(sl!(), "Annotation {} not enabled", key);
@@ -1216,5 +1175,64 @@ impl Annotation {
         config.adjust_config()?;
 
         Ok(())
+    }
+}
+
+fn convert_to_megabytes(mem_size_str: &str) -> Result<Option<u32>> {
+    match byte_unit::Byte::parse_str(mem_size_str, true) {
+        Ok(mut mem_size) => {
+            let no_suffix_given = mem_size_str
+                .trim()
+                .chars()
+                .all(|c: char| c.is_ascii_digit());
+            if no_suffix_given {
+                // NOTE the error is apparently unreachable at the moment:
+                // Byte::from_u64_with_unit() doesn't fail unless its argument
+                // is too big, however that same too big arg will fail to
+                // Byte::parse_str() in the first place.  (Obviously we still
+                // need to handle it anyway.)
+                mem_size =
+                    byte_unit::Byte::from_u64_with_unit(mem_size.as_u64(), byte_unit::Unit::MiB)
+                        .ok_or(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("failed to convert {} to MiB", mem_size.as_u64()),
+                        ))?;
+            }
+            let memory_size = mem_size.get_adjusted_unit(byte_unit::Unit::MiB).get_value() as u32;
+            Ok(Some(memory_size))
+        }
+        Err(error) => {
+            error!(
+                sl!(),
+                "failed to parse byte from string {} error {:?}", mem_size_str, error
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_memory_no_unit() {
+        let result = convert_to_megabytes("2048");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(2048));
+    }
+
+    #[test]
+    fn parse_memory_with_units() {
+        let result = convert_to_megabytes("2 GiB");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(2048));
+    }
+
+    #[test]
+    fn parse_memory_parse_error() {
+        let result = convert_to_megabytes("2048r");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
     }
 }

@@ -6,7 +6,7 @@
 
 use std::{collections::HashMap, convert::TryFrom};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use kata_types::{
     annotations::Annotation, config::TomlConfig, container::ContainerType,
     cpu::LinuxContainerCpuResources, k8s::container_type,
@@ -132,6 +132,25 @@ impl InitialSizeManager {
         })
     }
 
+    // Merge sizing values from sandbox annotations when the current source
+    // (typically the OCI spec) does not carry CRI sandbox sizing keys.
+    pub fn supplement_from_annotations(
+        &mut self,
+        annotation: &HashMap<String, String>,
+    ) -> Result<()> {
+        let from_annotation =
+            InitialSize::try_from(annotation).context("failed to construct static resource")?;
+
+        if self.resource.vcpu == 0.0 {
+            self.resource.vcpu = from_annotation.vcpu;
+        }
+        if self.resource.mem_mb == 0 {
+            self.resource.mem_mb = from_annotation.mem_mb;
+        }
+
+        Ok(())
+    }
+
     pub fn setup_config(&mut self, config: &mut TomlConfig) -> Result<()> {
         // update this data to the hypervisor config for later use by hypervisor
         let hypervisor_name = &config.runtime.hypervisor_name;
@@ -140,34 +159,49 @@ impl InitialSizeManager {
             .get_mut(hypervisor_name)
             .context("failed to get hypervisor config")?;
 
-        if self.resource.vcpu > 0.0 {
-            info!(sl!(), "resource with vcpu {}", self.resource.vcpu);
-            if config.runtime.static_sandbox_resource_mgmt {
-                hv.cpu_info.default_vcpus += self.resource.vcpu;
-            }
-        }
-
-        if config.runtime.static_sandbox_resource_mgmt {
-            let new_vcpus_ceil = hv.cpu_info.default_vcpus.ceil() as u32;
-            hv.cpu_info.default_maxvcpus = new_vcpus_ceil;
-        }
-
         self.resource.orig_toml_default_mem = hv.memory_info.default_memory;
-        if self.resource.mem_mb > 0 {
-            info!(sl!(), "resource with memory {}", self.resource.mem_mb);
-            if config.runtime.static_sandbox_resource_mgmt {
-                hv.memory_info.default_memory += self.resource.mem_mb;
-                if hv.memory_info.default_maxmemory < hv.memory_info.default_memory {
-                    hv.memory_info.default_maxmemory = hv.memory_info.default_memory;
-                }
-            }
+
+        // Non-static mode keeps configured defaults unchanged.
+        if !config.runtime.static_sandbox_resource_mgmt {
+            validate_non_zero_sandbox_memory(hypervisor_name, hv.memory_info.default_memory)?;
+            return Ok(());
         }
+
+        if self.resource.vcpu > 0.0 || self.resource.mem_mb > 0 {
+            if self.resource.vcpu > 0.0 {
+                info!(sl!(), "resource with vcpu {}", self.resource.vcpu);
+            }
+            if self.resource.mem_mb > 0 {
+                info!(sl!(), "resource with memory {}", self.resource.mem_mb);
+            }
+
+            hv.cpu_info.default_vcpus = (hv.cpu_info.overhead_vcpus + self.resource.vcpu).max(1.0);
+
+            hv.memory_info.default_memory = hv.memory_info.overhead_memory + self.resource.mem_mb;
+            hv.memory_info.default_maxmemory = hv
+                .memory_info
+                .default_maxmemory
+                .max(hv.memory_info.default_memory);
+        }
+
+        hv.cpu_info.default_maxvcpus = hv.cpu_info.default_vcpus.ceil() as u32;
+
+        validate_non_zero_sandbox_memory(hypervisor_name, hv.memory_info.default_memory)?;
         Ok(())
     }
 
     pub fn get_orig_toml_default_mem(&self) -> u32 {
         self.resource.orig_toml_default_mem
     }
+}
+
+fn validate_non_zero_sandbox_memory(hypervisor_name: &str, memory_mib: u32) -> Result<()> {
+    ensure!(
+        memory_mib > 0,
+        "computed sandbox memory is 0 MiB for hypervisor '{}'; set a non-zero memory limit or configure non-zero default_memory/overhead_memory",
+        hypervisor_name
+    );
+    Ok(())
 }
 
 fn get_nr_vcpu(resource: &LinuxContainerCpuResources) -> f32 {
@@ -204,10 +238,14 @@ fn get_sizing_info(annotation: Annotation) -> Result<(u64, i64, i64)> {
 }
 
 #[cfg(test)]
+// rstest cases expand to functions taking one argument per #[case] value,
+// which can exceed clippy's argument-count limit.
+#[allow(clippy::too_many_arguments)]
 mod tests {
     use super::*;
     use kata_types::annotations::cri_containerd;
     use oci_spec::runtime::{LinuxBuilder, LinuxMemory, LinuxMemoryBuilder, LinuxResourcesBuilder};
+    use rstest::rstest;
     use std::collections::HashMap;
     #[derive(Clone)]
     struct InputData {
@@ -379,8 +417,10 @@ mod tests {
 
     fn make_config(
         default_vcpus: f32,
+        overhead_vcpus: f32,
         default_maxvcpus: u32,
         default_memory: u32,
+        overhead_memory: u32,
         default_maxmemory: u32,
         static_sandbox_resource_mgmt: bool,
     ) -> TomlConfig {
@@ -392,8 +432,10 @@ mod tests {
             .insert("qemu".to_owned(), Hypervisor::default());
         config.hypervisor.entry("qemu".to_owned()).and_modify(|hv| {
             hv.cpu_info.default_vcpus = default_vcpus;
+            hv.cpu_info.overhead_vcpus = overhead_vcpus;
             hv.cpu_info.default_maxvcpus = default_maxvcpus;
             hv.memory_info.default_memory = default_memory;
+            hv.memory_info.overhead_memory = overhead_memory;
             hv.memory_info.default_maxmemory = default_maxmemory;
         });
         config.runtime.hypervisor_name = "qemu".to_owned();
@@ -403,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_setup_config_static_applies_vcpu_and_memory() {
-        let mut config = make_config(1.0, 4, 256, 4096, true);
+        let mut config = make_config(1.0, 0.5, 4, 256, 128, 4096, true);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 1.2,
@@ -414,13 +456,13 @@ mod tests {
 
         mgr.setup_config(&mut config).unwrap();
         let hv = config.hypervisor.get("qemu").unwrap();
-        assert_eq!(hv.cpu_info.default_vcpus, 2.2);
-        assert_eq!(hv.memory_info.default_memory, 768);
+        assert_eq!(hv.cpu_info.default_vcpus, 1.7);
+        assert_eq!(hv.memory_info.default_memory, 640);
     }
 
     #[test]
     fn test_setup_config_non_static_does_not_apply() {
-        let mut config = make_config(1.0, 4, 256, 4096, false);
+        let mut config = make_config(1.0, 0.5, 4, 256, 128, 4096, false);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 1.2,
@@ -437,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_setup_config_clamps_maxvcpus() {
-        let mut config = make_config(1.0, 2, 256, 4096, true);
+        let mut config = make_config(1.0, 1.0, 2, 256, 128, 4096, true);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 2.5,
@@ -454,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_setup_config_static_reduces_maxvcpus_to_static_total() {
-        let mut config = make_config(1.0, 8, 256, 4096, true);
+        let mut config = make_config(1.0, 0.5, 8, 256, 128, 4096, true);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 1.2,
@@ -465,13 +507,13 @@ mod tests {
 
         mgr.setup_config(&mut config).unwrap();
         let hv = config.hypervisor.get("qemu").unwrap();
-        assert_eq!(hv.cpu_info.default_vcpus, 2.2);
-        assert_eq!(hv.cpu_info.default_maxvcpus, 3);
+        assert_eq!(hv.cpu_info.default_vcpus, 1.7);
+        assert_eq!(hv.cpu_info.default_maxvcpus, 2);
     }
 
     #[test]
     fn test_setup_config_clamps_maxmemory() {
-        let mut config = make_config(1.0, 4, 256, 300, true);
+        let mut config = make_config(1.0, 0.5, 4, 256, 128, 300, true);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 0.0,
@@ -482,13 +524,13 @@ mod tests {
 
         mgr.setup_config(&mut config).unwrap();
         let hv = config.hypervisor.get("qemu").unwrap();
-        assert_eq!(hv.memory_info.default_memory, 768);
-        assert_eq!(hv.memory_info.default_maxmemory, 768);
+        assert_eq!(hv.memory_info.default_memory, 640);
+        assert_eq!(hv.memory_info.default_maxmemory, 640);
     }
 
     #[test]
     fn test_setup_config_preserves_orig_toml_default_mem() {
-        let mut config = make_config(1.0, 4, 256, 4096, true);
+        let mut config = make_config(1.0, 0.5, 4, 256, 128, 4096, true);
         let mut mgr = InitialSizeManager {
             resource: InitialSize {
                 vcpu: 0.0,
@@ -499,5 +541,110 @@ mod tests {
 
         mgr.setup_config(&mut config).unwrap();
         assert_eq!(mgr.get_orig_toml_default_mem(), 256);
+    }
+
+    #[test]
+    fn test_supplement_from_annotations_fills_missing_spec_sizing() {
+        let mut mgr = InitialSizeManager {
+            resource: InitialSize {
+                vcpu: 0.0,
+                mem_mb: 0,
+                orig_toml_default_mem: 0,
+            },
+        };
+
+        let ann = HashMap::from([
+            (
+                cri_containerd::SANDBOX_CPU_PERIOD_KEY.to_string(),
+                "100000".to_string(),
+            ),
+            (
+                cri_containerd::SANDBOX_CPU_QUOTA_KEY.to_string(),
+                "120000".to_string(),
+            ),
+            (
+                cri_containerd::SANDBOX_MEM_KEY.to_string(),
+                (256 * MIB).to_string(),
+            ),
+        ]);
+
+        mgr.supplement_from_annotations(&ann).unwrap();
+
+        const VCPU_TOLERANCE: f32 = 0.0001;
+        assert!((mgr.resource.vcpu - 1.2).abs() < VCPU_TOLERANCE);
+        assert_eq!(mgr.resource.mem_mb, 256);
+    }
+
+    #[test]
+    fn test_setup_config_static_without_limits_uses_toml_defaults() {
+        let mut config = make_config(2.0, 0.5, 8, 512, 128, 4096, true);
+        let mut mgr = InitialSizeManager {
+            resource: InitialSize {
+                vcpu: 0.0,
+                mem_mb: 0,
+                orig_toml_default_mem: 0,
+            },
+        };
+
+        mgr.setup_config(&mut config).unwrap();
+        let hv = config.hypervisor.get("qemu").unwrap();
+        assert_eq!(hv.cpu_info.default_vcpus, 2.0);
+        assert_eq!(hv.memory_info.default_memory, 512);
+    }
+
+    #[test]
+    fn test_setup_config_static_errors_on_zero_memory() {
+        let mut config = make_config(1.0, 0.5, 8, 1024, 0, 4096, true);
+        let mut mgr = InitialSizeManager {
+            resource: InitialSize {
+                vcpu: 1.0,
+                mem_mb: 0,
+                orig_toml_default_mem: 0,
+            },
+        };
+
+        let err = mgr.setup_config(&mut config).unwrap_err().to_string();
+        assert!(err.contains("computed sandbox memory is 0 MiB"));
+        assert!(err.contains("default_memory/overhead_memory"));
+    }
+
+    #[rstest]
+    #[case::both_limits(3.0, 0.75, 1024, 256, 1.25, 1024, 2.0, 1280)]
+    #[case::cpu_only_limit(3.0, 0.5, 1024, 128, 1.5, 0, 2.0, 128)]
+    #[case::memory_only_limit(3.0, 0.5, 1024, 128, 0.0, 512, 1.0, 640)]
+    #[case::both_limits_zero_overhead(3.0, 0.0, 1024, 0, 1.25, 1024, 1.25, 1024)]
+    #[case::memory_only_zero_overhead(3.0, 0.0, 1024, 0, 0.0, 512, 1.0, 512)]
+    fn test_setup_config_static_requested_vs_defaults(
+        #[case] default_vcpus: f32,
+        #[case] overhead_vcpus: f32,
+        #[case] default_memory: u32,
+        #[case] overhead_memory: u32,
+        #[case] requested_vcpus: f32,
+        #[case] requested_mem_mb: u32,
+        #[case] expected_default_vcpus: f32,
+        #[case] expected_default_memory: u32,
+    ) {
+        let mut config = make_config(
+            default_vcpus,
+            overhead_vcpus,
+            8,
+            default_memory,
+            overhead_memory,
+            4096,
+            true,
+        );
+        let mut mgr = InitialSizeManager {
+            resource: InitialSize {
+                vcpu: requested_vcpus,
+                mem_mb: requested_mem_mb,
+                orig_toml_default_mem: 0,
+            },
+        };
+
+        mgr.setup_config(&mut config).unwrap();
+        let hv = config.hypervisor.get("qemu").unwrap();
+
+        assert_eq!(hv.cpu_info.default_vcpus, expected_default_vcpus);
+        assert_eq!(hv.memory_info.default_memory, expected_default_memory);
     }
 }
