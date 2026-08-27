@@ -207,7 +207,7 @@ slog-stdlog = "4.0.0"
 slog-term = "2.9.0"
 strum = { version = "0.24.0", features = ["derive"] }
 strum_macros = "0.26.2"
-sysinfo = "0.39.5"
+sysinfo = "0.38.4"
 tar = "0.4.46"
 tdx = "0.1.1"
 tempfile = "3.19.1"
