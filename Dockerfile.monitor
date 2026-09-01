@@ -13,7 +13,7 @@ RUN SKIP_GO_VERSION_CHECK=true CGO_ENABLED=1 GOFLAGS=-tags=strictfipsruntime mak
 RUN chmod u-s kata-monitor
 RUN setcap "cap_dac_override+eip" kata-monitor
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1787647261
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1788166357
 
 COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
 
