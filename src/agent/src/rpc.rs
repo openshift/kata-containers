@@ -596,7 +596,22 @@ impl AgentService {
                 );
             }
 
-            let pids = self.get_pids(&cid).await?;
+            // When the cgroup is destroyed early (e.g., systemd deactivated the scope before
+            // we finish processing), get_pids() may fail. This is not an error - it just means
+            // there are no processes left to signal. Log and continue.
+            let pids = match self.get_pids(&cid).await {
+                Ok(pids) => pids,
+                Err(err) => {
+                    warn!(
+                        sl(),
+                        "get_pids failed, cgroup may be destroyed";
+                        "container-id" => &cid,
+                        "exec-id" => &eid,
+                        "error" => format!("{:?}", err),
+                    );
+                    Vec::new()
+                }
+            };
             for pid in pids.iter() {
                 let res = unsafe { libc::kill(*pid, sig) };
                 if let Err(err) = Errno::result(res).map(drop) {
