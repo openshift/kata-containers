@@ -17,10 +17,12 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1788166357
 
 COPY --from=builder /workdir/src/runtime/kata-monitor /usr/bin/kata-monitor
 
+ARG VERSION
+
 # Red Hat labels
 LABEL name="openshift-sandboxed-containers/osc-monitor-rhel9" \
 cpe="cpe:/a:redhat:confidential_compute_attestation:1.130::el9" \
-version="1.13" \
+version="$VERSION" \
 com.redhat.component="osc-monitor-container" \
 summary="osc-monitor provides the kata-monitor binary to expose sandboxed containers custom metrics" \
 maintainer="support@redhat.com" \
