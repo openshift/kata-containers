@@ -114,9 +114,6 @@ pub const SHA512: &str = "sha512";
 /// Specify the driver to be used for block device either VirtioSCSI or VirtioBlock
 pub const KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER: &str =
     "io.katacontainers.config.hypervisor.block_device_driver";
-/// A sandbox annotation that disallows a block device from being used.
-pub const KATA_ANNO_CFG_HYPERVISOR_DISABLE_BLOCK_DEV_USE: &str =
-    "io.katacontainers.config.hypervisor.disable_block_device_use";
 /// A sandbox annotation that specifies cache-related options will be set to block devices or not.
 pub const KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_SET: &str =
     "io.katacontainers.config.hypervisor.block_device_cache_set";
@@ -454,6 +451,29 @@ impl Annotation {
         value.unwrap_or(0)
     }
 
+    /// Get the pod's summed container resources as reported by CRI-O.
+    ///
+    /// CRI-O states them as one JSON annotation rather than the per-resource
+    /// keys containerd uses, so a caller after sandbox sizing has to ask for
+    /// them separately. Returns `None` when the annotation is absent or does
+    /// not parse.
+    pub fn get_crio_pod_linux_resources(&self) -> Option<crio::PodLinuxResources> {
+        let value = self
+            .get(crio::POD_LINUX_RESOURCES_KEY)
+            .or_else(|| self.get(crio::POD_LINUX_RESOURCES_KEY_DEPRECATED))?;
+
+        match serde_json::from_str::<crio::PodLinuxResources>(&value) {
+            Ok(resources) => Some(resources),
+            Err(e) => {
+                warn!(
+                    sl!(),
+                    "sandbox-sizing: failed to parse CRI-O pod resources: {}", e
+                );
+                None
+            }
+        }
+    }
+
     /// Get the annotation to specify the Resources.Memory.Swappiness.
     pub fn get_container_resource_swappiness(&self) -> Result<Option<u32>> {
         match self.get_value::<u32>(KATA_ANNO_CONTAINER_RES_SWAPPINESS) {
@@ -569,16 +589,6 @@ impl Annotation {
                     // Hypervisor Block Device related annotations
                     KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_DRIVER => {
                         hv.blockdev_info.block_device_driver = value.to_string();
-                    }
-                    KATA_ANNO_CFG_HYPERVISOR_DISABLE_BLOCK_DEV_USE => {
-                        match self.get_value::<bool>(key) {
-                            Ok(r) => {
-                                hv.blockdev_info.disable_block_device_use = r.unwrap_or_default();
-                            }
-                            Err(_e) => {
-                                return Err(bool_err);
-                            }
-                        }
                     }
                     KATA_ANNO_CFG_HYPERVISOR_BLOCK_DEV_CACHE_SET => {
                         match self.get_value::<bool>(key) {

@@ -214,6 +214,7 @@ jobs:
   publish-manifest:
     name: publish-manifest
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write # needed to push manifest images to ghcr.io
@@ -241,6 +242,7 @@ jobs:
   publish-kata-monitor-manifest:
     name: publish-kata-monitor-manifest
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     permissions:
       contents: read
       packages: write # needed to push manifest images to ghcr.io
@@ -267,18 +269,16 @@ jobs:
 
       - name: Push multi-arch monitor manifest
         run: |
-          # kata-monitor has no job-dispatcher sidecar image, so opt out of the
-          # kata-deploy-specific dispatcher manifest derivation.
           ./tools/packaging/release/release.sh publish-multiarch-manifest
         env:
           KATA_DEPLOY_IMAGE_TAGS: "kata-monitor-latest"
           KATA_DEPLOY_REGISTRIES: "quay.io/kata-containers/kata-monitor-ci ghcr.io/${{ github.repository_owner }}/kata-monitor-ci"
-          KATA_DEPLOY_PUBLISH_JOB_DISPATCHER: "false"
 
   upload-helm-chart-tarball:
     name: upload-helm-chart-tarball
     needs: publish-manifest
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     permissions:
       packages: write # needed to push the helm chart to ghcr.io
     steps:

@@ -54,6 +54,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: ${{ matrix.environment.runner }}
+    timeout-minutes: 70
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
@@ -93,9 +94,10 @@ jobs:
         timeout-minutes: 10
         run: bash tests/integration/kubernetes/gha-run.sh uninstall-kbs-client
 
+      # On SNP the deploy refreshes the VCEK cache, which may build snphost first.
       - name: Deploy CoCo KBS
         if: matrix.environment.coco
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: bash tests/integration/kubernetes/gha-run.sh deploy-coco-kbs
         env:
           NVIDIA_VERIFIER_MODE: remote

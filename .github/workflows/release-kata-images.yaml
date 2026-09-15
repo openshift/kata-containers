@@ -21,6 +21,7 @@ jobs:
   resolve-tags:
     name: Resolve image tags
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     outputs:
       tags: ${{ steps.tags.outputs.tags }}
     steps:
@@ -78,6 +79,7 @@ jobs:
     name: Publish multi-arch manifest
     needs: [resolve-tags, publish-monitor]
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write # needed to push build artifacts to ghcr.io
@@ -106,9 +108,6 @@ jobs:
           TAGS: ${{ needs.resolve-tags.outputs.tags }}
           REGISTRIES: ${{ inputs.registries }}
         run: |
-          # kata-monitor has no job-dispatcher sidecar image, so opt out of the
-          # kata-deploy-specific dispatcher manifest derivation.
           KATA_DEPLOY_IMAGE_TAGS="${TAGS}" \
           KATA_DEPLOY_REGISTRIES="${REGISTRIES}" \
-          KATA_DEPLOY_PUBLISH_JOB_DISPATCHER="false" \
           ./tools/packaging/release/release.sh publish-multiarch-manifest

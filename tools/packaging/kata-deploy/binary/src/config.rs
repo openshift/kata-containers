@@ -180,6 +180,10 @@ pub struct Config {
     pub snapshotter_handler_mapping_for_arch: Option<String>,
     pub agent_https_proxy: Option<String>,
     pub agent_no_proxy: Option<String>,
+    /// Shims whose guests run the NVIDIA DCGM stack (nv-hostengine and
+    /// dcgm-exporter). A set rather than a per-shim mapping: the setting is a
+    /// boolean, so naming a shim here means it is on.
+    pub nvrc_enable_dcgm: Vec<String>,
     pub pull_type_mapping_for_arch: Option<String>,
     pub installation_prefix: Option<String>,
     pub multi_install_suffix: Option<String>,
@@ -236,12 +240,16 @@ pub struct Config {
     /// of the install, and the less they can reach the better. Absent (the
     /// DaemonSet), the value is read from the Node.
     pub container_runtime_version: Option<String>,
-    /// The Kubernetes flavour the chart was configured for (`K8S_DISTRIBUTION`),
-    /// which is what chose the host directory mounted at /etc/containerd.
+    /// The Kubernetes flavour the chart was configured for (`K8S_DISTRIBUTION`).
     ///
-    /// Absent when the operator pinned that directory themselves, or when this
-    /// process was not started by the chart.
+    /// Absent when this process was not started by the chart.
     pub k8s_distribution: Option<String>,
+    /// The host directory holding containerd's configuration, when the operator
+    /// pinned it themselves (`CONTAINERD_CONFIG_DIR`). Its presence means the
+    /// flavour above no longer chose that directory, so the two cannot be
+    /// cross-checked against each other. Never used as a path: it is mounted at
+    /// /etc/containerd in this pod either way.
+    pub containerd_config_dir: Option<String>,
 }
 
 impl Config {
@@ -287,6 +295,13 @@ impl Config {
         // Normalize empty strings to None at the boundary
         let agent_https_proxy = env::var("AGENT_HTTPS_PROXY").ok().filter(|s| !s.is_empty());
         let agent_no_proxy = env::var("AGENT_NO_PROXY").ok().filter(|s| !s.is_empty());
+
+        let nvrc_enable_dcgm = env::var("NVRC_ENABLE_DCGM")
+            .unwrap_or_default()
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
         let pull_type_mapping_for_arch = get_arch_var_or_base("PULL_TYPE_MAPPING", &arch);
 
@@ -447,6 +462,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let containerd_config_dir = env::var("CONTAINERD_CONFIG_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let config = Config {
             node_name,
             debug,
@@ -456,6 +476,7 @@ impl Config {
             snapshotter_handler_mapping_for_arch,
             agent_https_proxy,
             agent_no_proxy,
+            nvrc_enable_dcgm,
             pull_type_mapping_for_arch,
             installation_prefix,
             multi_install_suffix,
@@ -481,6 +502,7 @@ impl Config {
             startup_taints,
             container_runtime_version,
             k8s_distribution,
+            containerd_config_dir,
         };
 
         // Validate the configuration
@@ -605,6 +627,25 @@ impl Config {
             _ => {}
         }
 
+        // Validate NVRC_ENABLE_DCGM
+        // Format: "shim1;shim2", naming the shims whose guests run DCGM.
+        //
+        // Only the NVIDIA GPU images carry DCGM and an NVRC to start it, so
+        // nvrc.dcgm=on anywhere else is a setting that would silently do
+        // nothing. Membership in shims_for_arch is deliberately not required:
+        // the chart builds this list from every enabled shim, and the same
+        // value reaches nodes of every architecture, so a GPU shim missing here
+        // means "not on this node" rather than a mistake.
+        for shim in &self.nvrc_enable_dcgm {
+            if !shim.contains("nvidia-gpu") {
+                return Err(anyhow::anyhow!(
+                    "NVRC_ENABLE_DCGM references '{}', which is not an NVIDIA GPU shim. \
+                     DCGM only runs in the NVIDIA GPU guest images.",
+                    shim
+                ));
+            }
+        }
+
         // Validate SNAPSHOTTER_HANDLER_MAPPING_FOR_ARCH
         // Format: "shim1:snapshotter1,shim2:snapshotter2"
         match self.snapshotter_handler_mapping_for_arch.as_ref() {
@@ -689,7 +730,14 @@ impl Config {
         Ok(())
     }
 
-    pub fn print_info(&self, action: &str) {
+    /// `full` prints the resolved configuration too. See its caller for why the
+    /// later stages of a staged run leave it out.
+    pub fn print_info(&self, action: &str, full: bool) {
+        if !full {
+            info!("Action: {action}");
+            return;
+        }
+
         info!("Action:");
         info!("* {action}");
         info!("");
@@ -708,6 +756,7 @@ impl Config {
         );
         info!("* AGENT_HTTPS_PROXY: {:?}", self.agent_https_proxy);
         info!("* AGENT_NO_PROXY: {:?}", self.agent_no_proxy);
+        info!("* NVRC_ENABLE_DCGM: {:?}", self.nvrc_enable_dcgm);
         info!("* PULL_TYPE_MAPPING: {:?}", self.pull_type_mapping_for_arch);
         info!("* INSTALLATION_PREFIX: {:?}", self.installation_prefix);
         info!("* MULTI_INSTALL_SUFFIX: {:?}", self.multi_install_suffix);
@@ -726,6 +775,8 @@ impl Config {
             "* EXPERIMENTAL_FORCE_GUEST_PULL: {}",
             self.experimental_force_guest_pull_for_arch.join(",")
         );
+        info!("* K8S_DISTRIBUTION: {:?}", self.k8s_distribution);
+        info!("* CONTAINERD_CONFIG_DIR: {:?}", self.containerd_config_dir);
         info!("* CONTAINERD_CONF_FILE: {}", self.containerd_conf_file);
         info!(
             "* CONTAINERD_USER_DROP_IN_SOURCE_FILE: {:?}",
@@ -1195,6 +1246,7 @@ mod tests {
             "ALLOWED_HYPERVISOR_ANNOTATIONS_PPC64LE",
             "AGENT_HTTPS_PROXY",
             "AGENT_NO_PROXY",
+            "NVRC_ENABLE_DCGM",
             "SNAPSHOTTER_HANDLER_MAPPING",
             "SNAPSHOTTER_HANDLER_MAPPING_X86_64",
             "SNAPSHOTTER_HANDLER_MAPPING_AARCH64",
@@ -1642,6 +1694,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("AGENT_HTTPS_PROXY references unknown shim"));
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_nvrc_enable_dcgm_parses_shim_set() {
+        setup_minimal_env();
+        set_arch_var("SHIMS", "qemu qemu-nvidia-gpu");
+        std::env::set_var(
+            "NVRC_ENABLE_DCGM",
+            "qemu-nvidia-gpu;qemu-nvidia-gpu-snp-runtime-rs",
+        );
+
+        let config = Config::from_env().unwrap();
+        // The chart lists every enabled shim regardless of architecture, so a
+        // name absent from SHIMS is carried rather than rejected.
+        assert_eq!(
+            config.nvrc_enable_dcgm,
+            vec!["qemu-nvidia-gpu", "qemu-nvidia-gpu-snp-runtime-rs"]
+        );
+
+        cleanup_env_vars();
+    }
+
+    #[serial]
+    #[test]
+    fn test_validate_nvrc_enable_dcgm_rejects_non_gpu_shim() {
+        setup_minimal_env();
+        set_arch_var("SHIMS", "qemu qemu-nvidia-gpu");
+        std::env::set_var("NVRC_ENABLE_DCGM", "qemu");
+
+        let result = Config::from_env();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not an NVIDIA GPU shim"));
 
         cleanup_env_vars();
     }

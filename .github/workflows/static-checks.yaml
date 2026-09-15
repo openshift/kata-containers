@@ -26,6 +26,7 @@ jobs:
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: Checkout the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -57,6 +58,7 @@ jobs:
   build-checks-depending-on-kvm:
     name: build-checks-depending-on-kvm
     runs-on: ubuntu-22.04
+    timeout-minutes: 130
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     strategy:
@@ -101,6 +103,7 @@ jobs:
   kata-deploy-binary-build-check:
     name: kata-deploy-binary-build-check
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     permissions:
@@ -121,13 +124,11 @@ jobs:
           cargo fmt -p kata-deploy --check
           cargo clippy -p kata-deploy --all-targets --all-features -- -D warnings
           RUSTFLAGS="-D warnings" cargo test -p kata-deploy -- --test-threads=1
-          cargo fmt -p kata-deploy-job-dispatcher --check
-          cargo clippy -p kata-deploy-job-dispatcher --all-targets --all-features -- -D warnings
-          RUSTFLAGS="-D warnings" cargo test -p kata-deploy-job-dispatcher -- --test-threads=1
 
   static-checks:
     name: static-checks
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     strategy:
@@ -192,6 +193,7 @@ jobs:
   codegen:
     name: codegen
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     permissions:
@@ -226,6 +228,7 @@ jobs:
   go-mod-tidy:
     name: go-mod-tidy
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     permissions:
@@ -302,6 +305,7 @@ jobs:
     needs: skipper
     if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - name: Checkout the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -310,3 +314,18 @@ jobs:
           persist-credentials: false
       - name: Check agent policy coverage
         run: bash ci/check_agent_policy_coverage.sh
+
+  check-broken-symlinks:
+    name: check-broken-symlinks
+    needs: skipper
+    if: ${{ needs.skipper.outputs.skip_static != 'yes' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check for broken symbolic links
+        run: bash ci/check_broken_symlinks.sh

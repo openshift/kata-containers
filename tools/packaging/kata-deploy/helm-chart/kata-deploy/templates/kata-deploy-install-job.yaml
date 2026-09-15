@@ -1,8 +1,8 @@
 {{- /*
 Install dispatcher (deploymentMode: job).
 
-A single, tiny post-install/post-upgrade hook Job that runs the dispatcher
-(kata-deploy-job-dispatcher). The dispatcher enumerates the selected nodes LIVE, then
+A single, tiny post-install/post-upgrade hook Job that runs k8s-job-dispatcher.
+The dispatcher enumerates the selected nodes LIVE, then
 creates one node-pinned install Job per node from the job-templates ConfigMap,
 keeping at most job.parallelism in flight and refilling as they finish. This
 guarantees one install per node (coverage) with a paced rollout, while the Helm
@@ -45,6 +45,9 @@ metadata:
     "helm.sh/hook": post-install,post-upgrade
     "helm.sh/hook-weight": "5"
     "helm.sh/hook-delete-policy": before-hook-creation
+{{- /* Otherwise Helm reports only that a hook Job failed, leaving the reader to
+       find a pod that holds the names of the nodes that failed. */}}
+    "helm.sh/hook-output-log-policy": hook-failed
 spec:
   # The dispatcher does per-node retries (job.backoffLimit) itself; a dispatcher
   # failure means "some node failed" and should surface, not be retried blindly.
@@ -85,6 +88,8 @@ spec:
         - name: dispatcher
           image: {{ include "kata-deploy.dispatcherImage" $root }}
           imagePullPolicy: {{ $root.Values.imagePullPolicy }}
+          {{- /* The dispatcher's last words are its per-node summary. */}}
+          terminationMessagePolicy: FallbackToLogsOnError
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -93,7 +98,7 @@ spec:
               drop:
                 - ALL
           command:
-            - /usr/bin/kata-deploy-job-dispatcher
+            - /usr/bin/k8s-job-dispatcher
             - "--job-template=/etc/kata-job/install-job.yaml"
             - "--cleanup-job-template=/etc/kata-job/cleanup-job.yaml"
             - "--name-prefix={{ $base }}-install"

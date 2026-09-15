@@ -67,6 +67,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-k8s-tee-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 130
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
@@ -122,9 +123,10 @@ jobs:
         timeout-minutes: 10
         run: bash tests/integration/kubernetes/gha-run.sh uninstall-kbs-client
 
+      # On SNP the deploy refreshes the VCEK cache, which may build snphost first.
       - name: Deploy CoCo KBS
         if: ${{ env.SKIP_JOB != 'true' }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: bash tests/integration/kubernetes/gha-run.sh deploy-coco-kbs
 
       - name: Install `kbs-client`
@@ -166,6 +168,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     permissions:
       contents: read
     environment:
@@ -293,6 +296,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ toJSON(matrix) }}
       cancel-in-progress: true
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     environment:
       name: ci
       deployment: false

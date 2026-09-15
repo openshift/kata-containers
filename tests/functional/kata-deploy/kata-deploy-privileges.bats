@@ -34,6 +34,28 @@ per_node_jobs() {
 	render_job_mode kata-deploy-job-templates.yaml "$@"
 }
 
+# The DaemonSet, which runs every stage in one container.
+render_daemonset_mode() {
+	helm template kata-deploy "${CHART_PATH}" \
+		--set deploymentMode=daemonset \
+		--show-only templates/kata-deploy.yaml \
+		"$@"
+}
+
+# One nodeBinaries entry, enough to render the containers that stage and install
+# it. Its key names the staging container, so "erofs-utils" is both.
+NODE_BINARIES_VALUES=(
+	--set 'nodeBinaries.erofs-utils.image=quay.io/kata-containers/erofs-utils:1.9.3'
+	--set 'nodeBinaries.erofs-utils.binaries[0]=mkfs.erofs'
+)
+
+# The 1-based line on which a pattern first appears, or empty. Used to assert
+# container *ordering*, which is what decides whether a stage can start at all.
+first_line_of() {
+	local haystack="${1}" pattern="${2}"
+	echo "${haystack}" | grep -n -- "${pattern}" | head -1 | cut -d: -f1
+}
+
 # Assert that rendered output does NOT contain a pattern. Not `! grep`: set -e
 # ignores its status, so anywhere but the last line of a test it could never fail
 # one.
@@ -60,6 +82,18 @@ per_node_pod_spec() {
 		inside && $0 == "        spec:" { pod = 1; next }
 		pod && /^        [^ ]/ { pod = 0 }
 		pod { print }
+	'
+}
+
+# One named container out of a staged per-node Job. Its env entries are indented
+# deeper than the container itself, so the next peer `- name:` ends it.
+stage_container() {
+	local stage="${1}" name="${2}"
+	shift 2
+	per_node_pod_spec "${stage}" "$@" | awk -v want="            - name: ${name}" '
+		$0 == want { inside = 1 }
+		inside && $0 != want && $0 ~ /^            - name: / { exit }
+		inside { print }
 	'
 }
 
@@ -122,11 +156,69 @@ rbac_doc() {
 
 	# The stages that are left, in order. Install ends with the CRI restart, which
 	# is why it is the main container rather than an init container.
+	echo "${jobs}" | grep -q 'install-stage-load-kernel-modules'
 	echo "${jobs}" | grep -q 'install-stage-host-check'
 	echo "${jobs}" | grep -q 'install-stage-artifacts'
 	echo "${jobs}" | grep -q 'install-stage-cri'
 	echo "${jobs}" | grep -q 'cleanup-stage-revert-cri'
 	echo "${jobs}" | grep -q 'cleanup-stage-remove-artifacts'
+}
+
+@test "Helm template (job mode): module loading is the only privileged stage" {
+	local loader host_check artifacts cri cleanup revert_cri remove_artifacts
+	loader=$(stage_container install load-kernel-modules)
+	host_check=$(stage_container install host-check)
+	artifacts=$(stage_container install artifacts)
+	cri=$(stage_container install cri)
+	cleanup=$(per_node_pod_spec cleanup)
+	revert_cri=$(stage_container cleanup revert-cri)
+	remove_artifacts=$(stage_container cleanup remove-artifacts)
+
+	[[ -n "${loader}" ]]
+	echo "${loader}" | grep -q 'install-stage-load-kernel-modules'
+	echo "${loader}" | grep -qE '^                privileged: true$'
+	echo "${loader}" | grep -qE '^                  mountPath: /host$'
+	echo "${loader}" | grep -qE '^                  readOnly: true$'
+	echo "${loader}" | grep -qE '^                  mountPath: /host-modules-load.d$'
+
+	for container in "${host_check}" "${artifacts}" "${cri}"; do
+		[[ -n "${container}" ]]
+		echo "${container}" | grep -qE '^                privileged: false$'
+		refute_match "${container}" 'mountPath: /host$'
+		refute_match "${container}" 'mountPath: /host-modules-load.d$'
+	done
+
+	# Cleanup never touches host-global module state, so it needs the persistence
+	# file but not the host root.
+	refute_match "${cleanup}" 'install-stage-load-kernel-modules'
+	refute_match "${cleanup}" 'name: host-root'
+	refute_match "${revert_cri}" 'mountPath: /host-modules-load.d$'
+	echo "${remove_artifacts}" | grep -qE '^                  mountPath: /host-modules-load.d$'
+	echo "${remove_artifacts}" | grep -qE '^                privileged: false$'
+
+	# Module loading is job-mode only, so the DaemonSet path stays unprivileged.
+	local daemonset
+	daemonset=$(helm template kata-deploy "${CHART_PATH}" \
+		--set deploymentMode=daemonset \
+		--show-only templates/kata-deploy.yaml)
+	refute_match "${daemonset}" 'install-stage-load-kernel-modules'
+	refute_match "${daemonset}" 'name: host-root'
+	refute_match "${daemonset}" 'name: modules-load-d'
+	refute_match "${daemonset}" 'privileged: true'
+}
+
+@test "Helm template (job mode): module loading runs before host validation" {
+	# The host check rejects a node whose kernel lacks EROFS or device-mapper,
+	# and that is only true after the modules are in.
+	local actions
+	actions=$(per_node_jobs |
+		grep -o 'install-stage-[a-z-]*' |
+		awk '!seen[$0]++')
+	[[ "${actions}" == "$(printf '%s\n' \
+		install-stage-load-kernel-modules \
+		install-stage-host-check \
+		install-stage-artifacts \
+		install-stage-cri)" ]]
 }
 
 @test "Helm template (job mode): a per-node Job can tell which host it woke up on" {
@@ -160,10 +252,20 @@ rbac_doc() {
 }
 
 @test "Helm template (job mode): the dispatcher does the node-level work" {
-	local install cleanup
+	local install cleanup rendered
 	install=$(render_job_mode kata-deploy-install-job.yaml \
 		--set 'startupTaints[0]=kata/installing:NoSchedule')
 	cleanup=$(render_job_mode kata-deploy-cleanup-job.yaml)
+
+	for rendered in "${install}" "${cleanup}"; do
+		echo "${rendered}" | grep -q 'image: ghcr.io/kata-containers/k8s-job-dispatcher:0.3.0'
+		echo "${rendered}" | grep -q -- '/usr/bin/k8s-job-dispatcher'
+		echo "${rendered}" | grep -q -- '--tracking-label-prefix=kata-deploy-job-dispatcher'
+		echo "${rendered}" | grep -q -- '--node-label-key=katacontainers.io/kata-runtime'
+		echo "${rendered}" | grep -q -- '--instance-label-prefix=kata-deploy.katacontainers.io'
+		echo "${rendered}" | grep -q -- '--require-node-runtime-version'
+		echo "${rendered}" | grep -q -- '--require-node-machine-id'
+	done
 
 	# Labelling last, and only once the node is Ready again: the install restarts
 	# the node's CRI runtime, and the label is what admits workloads.
@@ -318,6 +420,151 @@ EOF
 		grep -q -- '--kubelet-timeout-warn-secs=600'
 	render_job_mode kata-rbac.yaml -f "${values_file}" | grep -q 'nodes/proxy'
 	rm -f "${values_file}"
+}
+
+@test "Helm template: SELinux confinement is off by default" {
+	# Opt-in, since it mutates the node's policy store - and enabling it by
+	# accident is hard to notice: on a node with SELinux off it changes nothing.
+	local jobs daemonset rendered
+	jobs=$(per_node_jobs)
+	daemonset=$(render_daemonset_mode)
+
+	for rendered in "${jobs}" "${daemonset}"; do
+		refute_match "${rendered}" 'seLinuxOptions'
+		refute_match "${rendered}" 'kata_deploy_'
+		refute_match "${rendered}" 'install-stage-selinux-policy'
+	done
+
+	# The host root is mounted for the policy stage alone.
+	refute_match "${daemonset}" 'name: host-root'
+}
+
+@test "Helm template (job mode): the SELinux policy loads before anything confined" {
+	# A stage asking for a domain the node does not define cannot start, so this
+	# ordering is the whole feature working.
+	local install cleanup policy_line first_confined
+	install=$(per_node_pod_spec install --set selinux.enabled=true "${NODE_BINARIES_VALUES[@]}")
+	cleanup=$(per_node_pod_spec cleanup --set selinux.enabled=true)
+
+	# node-binaries-install is the first confined stage when an entry is configured.
+	policy_line=$(first_line_of "${install}" 'install-stage-selinux-policy')
+	first_confined=$(first_line_of "${install}" 'name: node-binaries-install')
+	[[ -n "${policy_line}" && -n "${first_confined}" ]]
+	((policy_line < first_confined))
+
+	first_confined=$(first_line_of "${install}" 'install-stage-host-check')
+	[[ -n "${first_confined}" ]]
+	((policy_line < first_confined))
+
+	# Every cleanup stage is confined too, so without this a node whose module went
+	# missing could never be uninstalled.
+	policy_line=$(first_line_of "${cleanup}" 'install-stage-selinux-policy')
+	first_confined=$(first_line_of "${cleanup}" 'cleanup-stage-revert-cri')
+	[[ -n "${policy_line}" && -n "${first_confined}" ]]
+	((policy_line < first_confined))
+}
+
+@test "Helm template (job mode): the policy stage is privileged, and nothing else new is" {
+	local policy loader host_check
+	policy=$(stage_container install selinux-policy --set selinux.enabled=true)
+	loader=$(stage_container install load-kernel-modules --set selinux.enabled=true)
+	host_check=$(stage_container install host-check --set selinux.enabled=true)
+
+	[[ -n "${policy}" ]]
+	echo "${policy}" | grep -qE '^                privileged: true$'
+	# Writable, unlike every other /host mount in the chart: semodule rebuilds the
+	# node's policy store in place.
+	echo "${policy}" | grep -qE '^                  mountPath: /host$'
+	echo "${policy}" | grep -qE '^                  readOnly: false$'
+
+	# Privileged, so it is spc_t already: a domain here would be a downgrade.
+	refute_match "${policy}" 'seLinuxOptions'
+
+	# The stages that were privileged before are unchanged, and still read-only.
+	echo "${loader}" | grep -qE '^                  readOnly: true$'
+	refute_match "${loader}" 'seLinuxOptions'
+	echo "${host_check}" | grep -qE '^                privileged: false$'
+}
+
+@test "Helm template (job mode): each confined stage gets its own domain" {
+	# Sharing one domain would render just as cleanly while granting every stage
+	# the union, which is the whole thing this is meant to avoid.
+	local stage_domain stage name domain
+	while read -r stage name domain; do
+		stage_domain=$(stage_container "${stage}" "${name}" --set selinux.enabled=true |
+			grep -A1 'seLinuxOptions:' | awk '/type:/{print $2}')
+		[[ "${stage_domain}" == "${domain}" ]] || {
+			echo "${stage}/${name}: expected ${domain}, got '${stage_domain}'" >&2
+			return 1
+		}
+	done <<-EOF
+		install host-check       kata_deploy_check_t
+		install artifacts        kata_deploy_artifacts_t
+		install cri              kata_deploy_cri_t
+		cleanup revert-cri       kata_deploy_cri_t
+		cleanup remove-artifacts kata_deploy_artifacts_t
+		cleanup node-binaries-remove kata_deploy_node_binaries_t
+	EOF
+}
+
+@test "Helm template (job mode): the images nodeBinaries takes from stay unconfined" {
+	# They are the only containers here running images Kata does not build, and
+	# they write nothing but a pod-local emptyDir, so container_t is the right
+	# blast radius - while the one writing /usr/local/bin gets a domain of its own.
+	local jobs stage_c install_c
+	jobs=$(per_node_jobs --set selinux.enabled=true "${NODE_BINARIES_VALUES[@]}")
+
+	stage_c=$(stage_container install erofs-utils --set selinux.enabled=true \
+		"${NODE_BINARIES_VALUES[@]}")
+	[[ -n "${stage_c}" ]]
+	echo "${stage_c}" | grep -q 'image: "quay.io/kata-containers/erofs-utils:1.9.3"'
+	refute_match "${stage_c}" 'seLinuxOptions'
+
+	install_c=$(stage_container install node-binaries-install --set selinux.enabled=true \
+		"${NODE_BINARIES_VALUES[@]}")
+	[[ -n "${install_c}" ]]
+	echo "${install_c}" | grep -q 'type: kata_deploy_node_binaries_t'
+
+	# Its removal counterpart is confined the same way, or an uninstall could not
+	# take the binaries back out.
+	echo "${jobs}" | grep -q 'name: node-binaries-remove'
+	[[ "$(echo "${jobs}" | grep -c 'type: kata_deploy_node_binaries_t')" -eq 2 ]]
+}
+
+@test "Helm template (daemonset mode): the one container gets the union domain" {
+	# Every stage runs inside kube-kata here, so no per-stage domain can apply.
+	local daemonset
+	daemonset=$(render_daemonset_mode --set selinux.enabled=true)
+
+	echo "${daemonset}" | grep -q 'install-stage-selinux-policy'
+	echo "${daemonset}" | grep -qE '^            type: kata_deploy_t$'
+
+	# Bar node-binaries', which requires job mode.
+	refute_match "${daemonset}" 'kata_deploy_node_binaries_t'
+
+	# kube-kata itself stays unprivileged, which is the whole reason the policy is
+	# loaded for it.
+	[[ "$(echo "${daemonset}" | grep -c 'privileged: true')" -eq 1 ]]
+	echo "${daemonset}" | grep -qE '^          privileged: false$'
+}
+
+@test "Helm template: every domain the chart asks for is defined by the shipped policy" {
+	# A typo on either side renders cleanly and then fails on an enforcing node.
+	local policy chart_domains policy_domains
+	policy="${BATS_TEST_DIRNAME}/../../../tools/packaging/kata-deploy/selinux/kata-deploy.cil"
+	[[ -f "${policy}" ]]
+
+	chart_domains=$( {
+		per_node_jobs --set selinux.enabled=true "${NODE_BINARIES_VALUES[@]}"
+		render_daemonset_mode --set selinux.enabled=true
+	} | grep -oE 'type: kata_deploy[a-z_]*' | awk '{print $2}' | sort -u)
+
+	policy_domains=$(grep -oE '^\(type kata_deploy[a-z_]*' "${policy}" |
+		awk '{print $2}' | sort -u)
+
+	[[ -n "${chart_domains}" ]]
+	# Equality, not containment: a domain no stage uses is dead privilege.
+	[[ "${chart_domains}" == "${policy_domains}" ]]
 }
 
 @test "Helm template: neither mode grants the cluster-scoped rights the install shed" {

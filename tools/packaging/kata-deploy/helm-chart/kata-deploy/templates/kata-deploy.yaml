@@ -1,4 +1,7 @@
 {{- if eq (.Values.deploymentMode | default "daemonset") "daemonset" -}}
+{{- /* Only the staged install can place these, and it says so. Validated here
+       because the templates that stage them render in job mode alone. */}}
+{{- $_ := include "kata-deploy.nodeBinaries" . -}}
 {{- if index .Values "node-feature-discovery" "enabled" -}}
 {{- $existingNFDNamespace := include "kata-deploy.detectExistingNFD" . | trim -}}
 {{- if $existingNFDNamespace -}}
@@ -81,6 +84,11 @@ spec:
       # Cleanup restarts the CRI runtime and waits for the node to become
       # ready again, which can take several minutes on k3s/rke2.
       terminationGracePeriodSeconds: 600
+{{- if include "kata-deploy.selinuxEnabled" . | trim }}
+      {{- /* This mode's one privileged container, exiting before kube-kata starts. */}}
+      initContainers:
+{{- include "kata-deploy.stageContainer" (dict "root" . "name" "selinux-policy" "action" "install-stage-selinux-policy" "privileged" true "mountHost" true "mountHostRoot" true "hostRootWritable" true) | nindent 6 }}
+{{- end }}
       containers:
       - name: kube-kata
         image: {{ include "kata-deploy.image" . }}
@@ -96,6 +104,9 @@ spec:
         - {{ $logLevel | quote }}
         {{- end }}
         - install
+        {{- /* kata-deploy writes why it failed to /dev/termination-log, which
+               this pod's next restart cannot scroll past. */}}
+        terminationMessagePolicy: FallbackToLogsOnError
         env:
 {{- include "kata-deploy.commonEnv" . | nindent 8 }}
 {{- $healthDefaults := dict
@@ -110,6 +121,12 @@ spec:
         securityContext:
           privileged: false
           readOnlyRootFilesystem: true
+{{- /* Every stage runs in this one container, so it needs the union of their
+       domains -- bar node-binaries', which requires job mode. */}}
+{{- $seLinux := include "kata-deploy.seLinuxOptions" (dict "root" . "domain" "kata_deploy_t") | trim }}
+{{- if $seLinux }}
+{{- $seLinux | nindent 10 }}
+{{- end }}
 {{- if $health.startupProbe.enabled }}
         startupProbe:
           httpGet:
@@ -146,6 +163,12 @@ spec:
 {{- include "kata-deploy.commonVolumeMounts" . | nindent 8 }}
       volumes:
 {{- include "kata-deploy.commonVolumes" . | nindent 6 }}
+{{- if include "kata-deploy.selinuxEnabled" . | trim }}
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+{{- end }}
 {{- with .Values.updateStrategy }}
   updateStrategy:
     {{- toYaml . | nindent 4 }}
