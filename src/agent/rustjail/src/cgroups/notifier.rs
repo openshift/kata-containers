@@ -110,6 +110,18 @@ async fn register_memory_event_v2(
             // info!("is1: {}", event.wd == wd1);
             info!(sl(), "event.wd: {:?}", event.wd);
 
+            // When a cgroup is destroyed, an event is sent to eventfd.
+            // Check if the control paths are gone BEFORE trying to read from them.
+            // This prevents infinite loops and log floods when the cgroup is destroyed
+            // while events are being processed.
+            if !Path::new(&event_control_path).exists() || !Path::new(&cgroup_event_control_path).exists() {
+                info!(
+                    sl(),
+                    "container[{}] cgroup path no longer exists, stopping event monitoring", &containere_id
+                );
+                return;
+            }
+
             if event.wd == ev_wd {
                 let oom = get_value_from_cgroup(&event_control_path, "oom_kill");
                 if oom.unwrap_or(0) > 0 {
@@ -123,12 +135,6 @@ async fn register_memory_event_v2(
                 if pids.unwrap_or(-1) == 0 {
                     return;
                 }
-            }
-
-            // When a cgroup is destroyed, an event is sent to eventfd.
-            // So if the control path is gone, return instead of notifying.
-            if !Path::new(&event_control_path).exists() {
-                return;
             }
         }
     });
