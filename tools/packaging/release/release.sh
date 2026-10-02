@@ -14,16 +14,12 @@ set -o errtrace
 
 this_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root_dir="$(cd "${this_script_dir}/../../../" && pwd)"
+helm_chart_dir="${repo_root_dir}/tools/packaging/kata-deploy/helm-chart/kata-deploy"
 
 KATA_DEPLOY_IMAGE_TAGS="${KATA_DEPLOY_IMAGE_TAGS:-}"
 IFS=' ' read -r -a IMAGE_TAGS <<< "${KATA_DEPLOY_IMAGE_TAGS}"
 KATA_DEPLOY_REGISTRIES="${KATA_DEPLOY_REGISTRIES:-}"
 IFS=' ' read -r -a REGISTRIES <<< "${KATA_DEPLOY_REGISTRIES}"
-# Registries for the separate job-mode dispatcher image. When unset, derived
-# from KATA_DEPLOY_REGISTRIES by inserting "-job-dispatcher" before any "-ci"
-# suffix on each entry (so the "-ci" stays last).
-KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES="${KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES:-}"
-IFS=' ' read -r -a JOB_DISPATCHER_REGISTRIES <<< "${KATA_DEPLOY_JOB_DISPATCHER_REGISTRIES}"
 GH_TOKEN="${GH_TOKEN:-}"
 ARCHITECTURE="${ARCHITECTURE:-}"
 KATA_STATIC_TARBALL="${KATA_STATIC_TARBALL:-}"
@@ -153,33 +149,11 @@ function _publish_multiarch_manifest()
 	_check_required_env_var "KATA_DEPLOY_IMAGE_TAGS"
 	_check_required_env_var "KATA_DEPLOY_REGISTRIES"
 
-	# The dispatcher is a kata-deploy-specific sidecar image, shipped alongside
-	# kata-deploy with the same tags. It does not exist for other images (e.g.
-	# kata-monitor), so callers publishing a non-kata-deploy manifest must opt
-	# out by setting KATA_DEPLOY_PUBLISH_JOB_DISPATCHER=false.
-	#
-	# When enabled and no dedicated registries are given, derive them from each
-	# kata-deploy registry by inserting "-job-dispatcher" before any "-ci"
-	# suffix, so the "-ci" stays last:
-	#   .../kata-deploy     -> .../kata-deploy-job-dispatcher
-	#   .../kata-deploy-ci  -> .../kata-deploy-job-dispatcher-ci
-	if [[ "${KATA_DEPLOY_PUBLISH_JOB_DISPATCHER:-true}" == "true" \
-		&& ${#JOB_DISPATCHER_REGISTRIES[@]} -eq 0 ]]; then
-		JOB_DISPATCHER_REGISTRIES=()
-		for registry in "${REGISTRIES[@]}"; do
-			if [[ "${registry}" == *-ci ]]; then
-				JOB_DISPATCHER_REGISTRIES+=("${registry%-ci}-job-dispatcher-ci")
-			else
-				JOB_DISPATCHER_REGISTRIES+=("${registry}-job-dispatcher")
-			fi
-		done
-	fi
-
 	# Per-arch images are built without provenance/SBOM so each tag is a single image manifest;
 	# quay.io rejects pushing multi-arch manifest lists that include attestation manifests
 	# ("manifest invalid"), so we do not enable them for this workflow.
 	# imagetools create pushes to --tag by default.
-	for registry in "${REGISTRIES[@]}" "${JOB_DISPATCHER_REGISTRIES[@]}"; do
+	for registry in "${REGISTRIES[@]}"; do
 		for tag in "${IMAGE_TAGS[@]}"; do
 			docker buildx imagetools create --tag "${registry}:${tag}" \
 				"${registry}:${tag}-amd64" \
@@ -260,16 +234,18 @@ function _upload_libseccomp_tarball()
 
 	GOPATH=${HOME}/go ./ci/install_yq.sh
 
-	versions_yaml="versions.yaml"
+	versions_yaml="${repo_root_dir}/versions.yaml"
 	version=$("${HOME}"/go/bin/yq ".externals.libseccomp.version" "${versions_yaml}")
 	repo_url=$("${HOME}"/go/bin/yq ".externals.libseccomp.url" "${versions_yaml}")
-	download_url="${repo_url}releases/download/v${version}"
+	download_url="${repo_url%/}/releases/download/v${version}"
 	tarball="libseccomp-${version}.tar.gz"
 	asc="${tarball}.asc"
-	curl -sSLO "${download_url}/${tarball}"
-	curl -sSLO "${download_url}/${asc}"
-	gh release upload "${RELEASE_VERSION}" "${tarball}"
-	gh release upload "${RELEASE_VERSION}" "${asc}"
+	# --fail is a must here, otherwise the error page returned by GitHub
+	# would silently be uploaded in place of the actual assets.
+	curl -fsSL --retry 5 --retry-delay 5 -O "${download_url}/${tarball}"
+	curl -fsSL --retry 5 --retry-delay 5 -O "${download_url}/${asc}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${tarball}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${asc}"
 }
 
 function _upload_helm_chart_tarball()
@@ -278,8 +254,27 @@ function _upload_helm_chart_tarball()
 
 	RELEASE_VERSION="$(_release_version)"
 
-	helm package "${repo_root_dir}"/tools/packaging/kata-deploy/helm-chart/kata-deploy
+	helm package "${helm_chart_dir}"
 	gh release upload "${RELEASE_VERSION}" "kata-deploy-${RELEASE_VERSION}.tgz"
+}
+
+function _upload_helm_chart_values_files()
+{
+	_check_required_env_var "GH_TOKEN"
+
+	RELEASE_VERSION="$(_release_version)"
+
+	local values_files=()
+	shopt -s nullglob
+	values_files=( "${helm_chart_dir}"/try-kata-*.values.yaml )
+	shopt -u nullglob
+
+	[[ "${#values_files[@]}" -eq 0 ]] && \
+		_die "no try-kata-*.values.yaml presets found in ${helm_chart_dir}"
+
+	# Plain names, unlike the other assets, so /releases/latest/download/ works.
+	echo "uploading assets '${values_files[*]##*/}' for tag: ${RELEASE_VERSION}"
+	gh release upload --clobber "${RELEASE_VERSION}" "${values_files[@]}"
 }
 
 function main()
@@ -297,6 +292,7 @@ function main()
 		upload-vendored-code-tarball) _upload_vendored_code_tarball ;;
 		upload-libseccomp-tarball) _upload_libseccomp_tarball ;;
 		upload-helm-chart-tarball) _upload_helm_chart_tarball ;;
+		upload-helm-chart-values-files) _upload_helm_chart_values_files ;;
 		publish-release) _publish_release ;;
 		*) >&2 _die "Invalid argument" ;;
 	esac

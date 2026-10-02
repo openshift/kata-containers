@@ -25,6 +25,8 @@ cuda_repo_pkg="${5:?cuda_repo_pkg not specified}"
 tools_repo_url="${6:?tools_repo_url not specified}"
 tools_repo_pkg="${7:?tools_repo_pkg not specified}"
 ctk_version="${8:?ctk_version not specified}"
+dcgm_version="${9:?dcgm_version not specified}"
+dcgm_exporter_version="${10:?dcgm_exporter_version not specified}"
 APT_INSTALL="apt -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' -yqq --no-install-recommends install"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -69,12 +71,14 @@ install_userspace_components() {
 		libnvidia-decode libnvidia-fbc1 libnvidia-encode \
 		libnvidia-nscq libnvidia-compute nvidia-settings
 
-	# Needed for confidential-data-hub and NVAT runtime dependencies
-	eval "${APT_INSTALL}" cryptsetup-bin dmsetup         \
-		libargon2-1 e2fsprogs libxml2
+	# Needed for confidential-data-hub's secure_mount: cryptsetup to unlock
+	# encrypted storage and e2fsprogs to format it. cryptsetup-bin also carries
+	# veritysetup and pulls libdevmapper in via libcryptsetup12. NVAT's own
+	# dependencies (libxml2 among them) ship inside the coco-guest-components
+	# tarball, see chisseled_nvat().
+	eval "${APT_INSTALL}" cryptsetup-bin e2fsprogs
 
-	apt-mark hold cryptsetup-bin dmsetup libargon2-1     \
-		e2fsprogs libxml2
+	apt-mark hold cryptsetup-bin e2fsprogs
 
 	# NVRC loads the NVIDIA driver modules from the gpu extension's self-contained
 	# module tree via `modprobe --dirname <extension>`, a kmod feature the base
@@ -162,8 +166,16 @@ install_nvidia_dcgm() {
 
 	echo "chroot: Install NVIDIA DCGM"
 
-	eval "${APT_INSTALL}" datacenter-gpu-manager \
-		datacenter-gpu-manager-exporter
+	# -core pulls nv-hostengine and libdcgm, which is all the chisel takes; the
+	# CUDA flavour packages are multi-hundred-MB module blobs the guest never
+	# uses. The exporter provides the metrics endpoint the dcgm feature exposes.
+	# Both are version-locked because the repository only ever offers the newest
+	# DCGM, so an unpinned install re-bases the guest on whatever NVIDIA
+	# published last.
+	eval "${APT_INSTALL}" datacenter-gpu-manager-4-core="${dcgm_version}" \
+		datacenter-gpu-manager-exporter="${dcgm_exporter_version}"
+
+	apt-mark hold datacenter-gpu-manager-4-core datacenter-gpu-manager-exporter
 }
 
 install_devkit_packages() {

@@ -14,13 +14,22 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use flate2::read::GzDecoder;
 use log::{error, info};
-use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{BufRead, Write};
 
 /// Env var name used to thread the detected container runtime through the
 /// post-install re-exec. Avoids re-querying the apiserver after we've already
 /// committed to a runtime.
 const DETECTED_RUNTIME_ENV: &str = "KATA_DEPLOY_DETECTED_RUNTIME";
+
+/// Where the kubelet collects a container's last words, putting them in the
+/// pod's status rather than in a log the Job's TTL deletes minutes later.
+///
+/// A mount of its own, so it stays writable under `readOnlyRootFilesystem`.
+const TERMINATION_LOG: &str = "/dev/termination-log";
+
+/// What the kubelet keeps of that file; the rest is dropped.
+const TERMINATION_MESSAGE_MAX: usize = 4096;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -59,17 +68,27 @@ enum Action {
     Install,
     Cleanup,
     Reset,
-    /// Stage 0 of a staged (JobSet) install: validate host/node prerequisites
+    /// Load the SELinux policy module the confined stages need. Runs first in
+    /// both the install and the cleanup pipeline, privileged, since a stage
+    /// asking for a type the node does not define cannot start at all.
+    #[clap(name = "install-stage-selinux-policy")]
+    InstallStageSelinuxPolicy,
+    /// Stage 0 of a staged (JobSet) install: load the host kernel modules the
+    /// enabled runtimes and snapshotters need. The only privileged stage, and
+    /// the only one the DaemonSet path does not share.
+    #[clap(name = "install-stage-load-kernel-modules")]
+    InstallStageLoadKernelModules,
+    /// Stage 1 of a staged (JobSet) install: validate host/node prerequisites
     /// without mutating the host. Fails fast with actionable diagnostics when
     /// the node cannot support installation.
     #[clap(name = "install-stage-host-check")]
     InstallStageHostCheck,
-    /// Stage 1 of a staged (JobSet) install: install kata artifacts/config on
+    /// Stage 2 of a staged (JobSet) install: install kata artifacts/config on
     /// the host and set up configured snapshotters. Does not touch CRI
     /// configuration.
     #[clap(name = "install-stage-artifacts")]
     InstallStageArtifacts,
-    /// Stage 2 of a staged (JobSet) install: write CRI drop-ins, restart the
+    /// Stage 3 of a staged (JobSet) install: write CRI drop-ins, restart the
     /// runtime, and wait for node readiness.
     #[clap(name = "install-stage-cri")]
     InstallStageCri,
@@ -105,10 +124,9 @@ const SUGGESTED_KUBELET_RUNTIME_REQUEST_TIMEOUT_SECS: u64 = 10 * 60;
 const MKFS_EROFS: &str = "mkfs.erofs";
 const MIN_EROFS_UTILS_VERSION: &str = "1.8.2";
 /// The `mkfs.erofs` options kata-deploy configures containerd's EROFS differ to
-/// use: `--mkfs-time` and `--sort=none`, both added in erofs-utils 1.8.2. The
-/// leading dashes are left out because that is how the option names appear
-/// inside the binary, which is where `validate_mkfs_erofs_options` looks.
-const REQUIRED_MKFS_EROFS_OPTIONS: &[&str] = &["mkfs-time", "sort"];
+/// use, both added in erofs-utils 1.8.2. Spelled as the binary's own usage text
+/// does, which is where `validate_mkfs_erofs_options` looks for them.
+const REQUIRED_MKFS_EROFS_OPTIONS: &[&str] = &["--mkfs-time", "--sort"];
 
 // Cap the tokio runtime to a small fixed number of worker threads. The default
 // multi-thread runtime allocates `num_cpus()` workers (each with a ~2 MiB
@@ -126,6 +144,47 @@ const REQUIRED_MKFS_EROFS_OPTIONS: &[&str] = &["mkfs-time", "sort"];
 // probe and the pod is restarted before install can finish.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    let result = run().await;
+    if let Err(error) = result.as_ref() {
+        write_termination_message(error);
+    }
+    result
+}
+
+/// The error chain on one line, as `kubectl` will show it.
+fn termination_message(error: &anyhow::Error) -> String {
+    // A failing host command brings its stderr along, newlines and all.
+    let mut message = format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if message.len() > TERMINATION_MESSAGE_MAX {
+        // The outermost context says which step failed, so the tail goes.
+        const ELLIPSIS: &str = "... (truncated)";
+        let keep = TERMINATION_MESSAGE_MAX - ELLIPSIS.len();
+        let keep = (0..=keep)
+            .rev()
+            .find(|index| message.is_char_boundary(*index))
+            .unwrap_or(0);
+        message.truncate(keep);
+        message.push_str(ELLIPSIS);
+    }
+    message
+}
+
+/// Best-effort: outside a pod there is no such file, and the reason is logged
+/// either way.
+fn write_termination_message(error: &anyhow::Error) {
+    if !std::path::Path::new(TERMINATION_LOG).exists() {
+        return;
+    }
+
+    if let Err(write_error) = std::fs::write(TERMINATION_LOG, termination_message(error)) {
+        log::warn!("failed to write {TERMINATION_LOG}: {write_error}");
+    }
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Set log level based on DEBUG environment variable
@@ -152,7 +211,9 @@ async fn main() -> Result<()> {
     let config = config::Config::from_env()?;
     if matches!(
         args.action,
-        Action::InstallStageHostCheck
+        Action::InstallStageSelinuxPolicy
+            | Action::InstallStageLoadKernelModules
+            | Action::InstallStageHostCheck
             | Action::InstallStageArtifacts
             | Action::InstallStageCri
             | Action::CleanupStageRevertCri
@@ -164,6 +225,8 @@ async fn main() -> Result<()> {
         Action::Install => "install",
         Action::Cleanup => "cleanup",
         Action::Reset => "reset",
+        Action::InstallStageSelinuxPolicy => "install-stage-selinux-policy",
+        Action::InstallStageLoadKernelModules => "install-stage-load-kernel-modules",
         Action::InstallStageHostCheck => "install-stage-host-check",
         Action::InstallStageArtifacts => "install-stage-artifacts",
         Action::InstallStageCri => "install-stage-cri",
@@ -171,7 +234,18 @@ async fn main() -> Result<()> {
         Action::CleanupStageRemoveArtifacts => "cleanup-stage-remove-artifacts",
         Action::InternalPostInstallWait => "internal-post-install-wait",
     };
-    config.print_info(action_str);
+    // Every stage of a staged run resolves the same pod env, so repeating the
+    // configuration in each one buries the few lines that differ. Only the stage
+    // that opens a run prints it; keep this in sync with the chart's stage order.
+    let opens_a_run = matches!(
+        args.action,
+        Action::Install
+            | Action::Cleanup
+            | Action::Reset
+            | Action::InstallStageLoadKernelModules
+            | Action::CleanupStageRevertCri
+    );
+    config.print_info(action_str, opens_a_run);
 
     // After re-exec we already know which runtime we committed to during
     // install — trust the env var and skip the apiserver round-trip. For
@@ -179,6 +253,9 @@ async fn main() -> Result<()> {
     let runtime = match args.action {
         Action::InternalPostInstallWait => std::env::var(DETECTED_RUNTIME_ENV)
             .with_context(|| format!("missing {DETECTED_RUNTIME_ENV} env var after re-exec"))?,
+        // Loading a policy module is the same work whatever the CRI is, and this
+        // runs before every stage that would need one detected.
+        Action::InstallStageSelinuxPolicy => String::new(),
         _ => {
             let r = runtime::get_container_runtime(&config).await?;
             info!("Detected container runtime: {r}");
@@ -311,6 +388,14 @@ async fn main() -> Result<()> {
         // pipeline as a short-lived Job/initContainer and exits. The DaemonSet
         // path does not use these directly; it goes through `install` above,
         // which composes the same stage functions.
+        Action::InstallStageSelinuxPolicy => {
+            install_stage_selinux_policy(&config)?;
+            info!("Install SELinux-policy stage completed, exiting");
+        }
+        Action::InstallStageLoadKernelModules => {
+            install_stage_load_kernel_modules(&config)?;
+            info!("Install kernel-module stage completed, exiting");
+        }
         Action::InstallStageHostCheck => {
             install_stage_host_check(&config, &runtime, true).await?;
             info!("Install host-check stage completed, exiting");
@@ -345,7 +430,7 @@ async fn main() -> Result<()> {
 /// dispatcher passed down. An older chart passes none, and then there is nothing to
 /// compare against.
 fn verify_node_machine_id() -> Result<()> {
-    const EXPECTED_ENV: &str = "KATA_DEPLOY_NODE_MACHINE_ID";
+    const EXPECTED_ENV: &str = "NODE_MACHINE_ID";
     const HOST_MACHINE_ID: &str = "/host-machine-id";
 
     let Ok(expected) = std::env::var(EXPECTED_ENV) else {
@@ -436,10 +521,848 @@ const SUPPORTED_RUNTIMES: &[&str] = &[
     "microk8s",
 ];
 
-/// Install stage 0 (host-check): validate that this node can support a Kata
-/// installation before any host mutation happens. This is read-only and safe
-/// to run repeatedly; it fails fast with actionable diagnostics so a staged
-/// JobSet can abort the per-node pipeline before the privileged stages run.
+const HOST_ROOT: &str = "/host";
+const HOST_MODULES_LOAD_DIR: &str = "/host-modules-load.d";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HostModule {
+    name: &'static str,
+    required: bool,
+}
+
+impl HostModule {
+    const fn required(name: &'static str) -> Self {
+        Self {
+            name,
+            required: true,
+        }
+    }
+
+    const fn optional(name: &'static str) -> Self {
+        Self {
+            name,
+            required: false,
+        }
+    }
+}
+
+/// The modules the stage can load itself, kept apart from the x86 backend
+/// requirement because no module can satisfy the latter on its own.
+#[derive(Debug, Default)]
+struct HostModulePlan {
+    modules: Vec<HostModule>,
+    needs_x86_virtualization: bool,
+}
+
+/// Not composed into [`install`], so the DaemonSet path stays unprivileged.
+fn install_stage_load_kernel_modules(config: &config::Config) -> Result<()> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .context("failed to read /proc/cpuinfo while selecting host kernel modules")?;
+    let custom_bases = config
+        .custom_runtimes
+        .iter()
+        .map(|runtime| runtime.base_config.as_str())
+        .collect::<Vec<_>>();
+    let erofs_enabled = config
+        .experimental_setup_snapshotter
+        .as_ref()
+        .is_some_and(|snapshotters| snapshotters.iter().any(|s| s == "erofs"));
+    let plan = host_modules_for_install(
+        std::env::consts::ARCH,
+        &cpuinfo,
+        &config
+            .shims_for_arch
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        &custom_bases,
+        erofs_enabled,
+        config.erofs_dmverity,
+    )?;
+
+    if plan.modules.is_empty() && !plan.needs_x86_virtualization {
+        info!("install (kernel-modules): no host modules are needed");
+        return Ok(());
+    }
+
+    let _node_lock = acquire_node_mutation_lock()?;
+    // Lazily, so modules that are already loaded need no modprobe.
+    let mut modprobe = None;
+    let mut loaded = Vec::new();
+    for module in &plan.modules {
+        if host_module_visible(module.name) {
+            info!(
+                "install (kernel-modules): host module {} is already loaded",
+                module.name
+            );
+            loaded.push(module.name);
+            continue;
+        }
+
+        info!(
+            "install (kernel-modules): loading host module {}",
+            module.name
+        );
+        let path = match &modprobe {
+            Some(path) => path,
+            None => match find_host_modprobe() {
+                Ok(path) => modprobe.insert(path),
+                Err(error) => {
+                    handle_module_load_failure(*module, error)?;
+                    continue;
+                }
+            },
+        };
+        match run_host_modprobe(path, module.name) {
+            Ok(()) => loaded.push(module.name),
+            Err(error) => handle_module_load_failure(*module, error)?,
+        }
+    }
+
+    if plan.needs_x86_virtualization {
+        ensure_x86_virtualization_backend()?;
+    }
+
+    // Persisting what loaded, rather than what was asked for, keeps a module
+    // that does not apply to this node from being retried at every boot.
+    persist_modules_load_config(config, &loaded)?;
+    Ok(())
+}
+
+/// Follows the per-architecture `kata-runtime check` maps.
+fn host_modules_for_install(
+    arch: &str,
+    cpuinfo: &str,
+    shims: &[&str],
+    custom_bases: &[&str],
+    erofs_enabled: bool,
+    erofs_dmverity: bool,
+) -> Result<HostModulePlan> {
+    let has_local_runtime = shims.iter().any(|shim| *shim != "remote")
+        || custom_bases.iter().any(|base| *base != "remote");
+    let mut plan = HostModulePlan::default();
+    let modules = &mut plan.modules;
+
+    if has_local_runtime {
+        let vhost_vsock = if wants_host_vsock_device(shims, custom_bases) {
+            HostModule::required("vhost_vsock")
+        } else {
+            HostModule::optional("vhost_vsock")
+        };
+
+        match arch {
+            "x86_64" => {
+                // Every x86 VMM we ship runs on either KVM or MSHV, picking at
+                // run time, so KVM is worth trying but never the requirement:
+                // a Hyper-V root partition cannot load it and does not need to.
+                plan.needs_x86_virtualization = true;
+                modules.push(HostModule::optional("kvm"));
+                if cpuinfo.contains("GenuineIntel") {
+                    modules.push(HostModule::optional("kvm_intel"));
+                } else if cpuinfo.contains("AuthenticAMD") {
+                    modules.push(HostModule::optional("kvm_amd"));
+                }
+                modules.extend([
+                    HostModule::required("vhost"),
+                    HostModule::required("vhost_net"),
+                    vhost_vsock,
+                ]);
+            }
+            "aarch64" | "riscv64" => modules.extend([
+                HostModule::required("kvm"),
+                HostModule::required("vhost"),
+                HostModule::required("vhost_net"),
+                vhost_vsock,
+            ]),
+            "powerpc64" | "powerpc64le" => modules.extend([
+                HostModule::required("kvm"),
+                HostModule::required("kvm_hv"),
+                vhost_vsock,
+            ]),
+            "s390x" => modules.extend([HostModule::required("kvm"), vhost_vsock]),
+            unsupported => anyhow::bail!(
+                "cannot select Kata host kernel modules for unsupported architecture {unsupported}"
+            ),
+        }
+    }
+
+    if erofs_enabled {
+        // fs-verity is deliberately absent: CONFIG_FS_VERITY is a bool, so it is
+        // either built in or unavailable, and the host check already says which.
+        modules.extend([HostModule::required("erofs"), HostModule::required("loop")]);
+        if erofs_dmverity {
+            modules.extend([
+                HostModule::required("dm_mod"),
+                HostModule::required("dm_verity"),
+            ]);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    modules.retain(|module| seen.insert(module.name));
+    Ok(plan)
+}
+
+/// QEMU is the only shim that talks to the guest through the host's
+/// /dev/vhost-vsock; the rest tunnel VSOCK over a UNIX socket and do not care
+/// whether the module is there.
+fn wants_host_vsock_device(shims: &[&str], custom_bases: &[&str]) -> bool {
+    shims
+        .iter()
+        .chain(custom_bases.iter())
+        .any(|runtime| runtime.starts_with("qemu"))
+}
+
+/// The device nodes are the honest test. `kvm` alone loads happily on a machine
+/// with virtualization switched off in firmware and creates no /dev/kvm, and
+/// MSHV cannot be loaded at all: mshv_root only binds when the kernel booted as
+/// the Hyper-V root partition.
+fn ensure_x86_virtualization_backend() -> Result<()> {
+    if host_device_exists("kvm") {
+        info!("install (kernel-modules): the host provides KVM");
+        return Ok(());
+    }
+
+    if host_device_exists("mshv") {
+        info!("install (kernel-modules): the host provides MSHV instead of KVM");
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "this node has no usable virtualization backend: neither /dev/kvm nor /dev/mshv is \
+         present. Check the warnings above for why the KVM modules would not load, and that \
+         virtualization is enabled in firmware or exposed to this VM."
+    )
+}
+
+fn host_device_exists(device: &str) -> bool {
+    std::path::Path::new(HOST_ROOT)
+        .join("dev")
+        .join(device)
+        .exists()
+        || std::path::Path::new("/dev").join(device).exists()
+}
+
+fn modules_load_config_path(
+    base: &std::path::Path,
+    multi_install_suffix: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let suffix = multi_install_suffix.unwrap_or("default");
+    anyhow::ensure!(
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "MULTI_INSTALL_SUFFIX {suffix:?} cannot be used in a modules-load.d filename"
+    );
+    Ok(base.join(format!("kata-containers-{suffix}.conf")))
+}
+
+fn persist_modules_load_config(config: &config::Config, modules: &[&str]) -> Result<()> {
+    let path = modules_load_config_path(
+        std::path::Path::new(HOST_MODULES_LOAD_DIR),
+        config.multi_install_suffix.as_deref(),
+    )?;
+    let content = modules_load_config_content(modules);
+    let temp_path = path.with_extension(format!("conf.{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut temp = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary modules-load.d file {}",
+                    temp_path.display()
+                )
+            })?;
+        temp.write_all(content.as_bytes())
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        std::fs::rename(&temp_path, &path).with_context(|| {
+            format!(
+                "failed to atomically install modules-load.d file {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
+
+    info!(
+        "install (kernel-modules): persisted the loaded modules in {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn modules_load_config_content(modules: &[&str]) -> String {
+    format!(
+        "# Managed by kata-deploy; removed when this installation is uninstalled.\n{}\n",
+        modules.join("\n")
+    )
+}
+
+fn remove_modules_load_config(config: &config::Config) -> Result<()> {
+    let path = modules_load_config_path(
+        std::path::Path::new(HOST_MODULES_LOAD_DIR),
+        config.multi_install_suffix.as_deref(),
+    )?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!(
+            "cleanup (remove-artifacts): removed modules-load.d file {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to remove modules-load.d file {}", path.display())
+            })
+        }
+    }
+    Ok(())
+}
+
+fn handle_module_load_failure(module: HostModule, error: anyhow::Error) -> Result<()> {
+    if module.required {
+        return Err(error);
+    }
+
+    log::warn!(
+        "install (kernel-modules): optional host module {} could not be loaded: {error}",
+        module.name
+    );
+    Ok(())
+}
+
+/// The path is returned as it looks after the chroot, not as mounted here.
+fn find_host_modprobe() -> Result<String> {
+    const CANDIDATES: &[&str] = &[
+        "/usr/sbin/modprobe",
+        "/sbin/modprobe",
+        "/usr/bin/modprobe",
+        "/bin/modprobe",
+    ];
+
+    CANDIDATES
+        .iter()
+        .find(|path| host_path_is_file(std::path::Path::new(HOST_ROOT), std::path::Path::new(path)))
+        .map(|path| (*path).to_string())
+        .with_context(|| {
+            format!(
+                "host modprobe was not found under {HOST_ROOT}; install kmod on the node before \
+                 deploying Kata"
+            )
+        })
+}
+
+/// An absolute symlink target belongs to the host, not to this image.
+fn host_path_is_file(root: &std::path::Path, path: &std::path::Path) -> bool {
+    // The kernel's MAXSYMLINKS: fewer would reject chains the chroot resolves.
+    const MAX_HOPS: usize = 40;
+
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let mounted = root.join(current.strip_prefix("/").unwrap_or(&current));
+        let Ok(metadata) = std::fs::symlink_metadata(&mounted) else {
+            return false;
+        };
+        if !metadata.is_symlink() {
+            return metadata.is_file();
+        }
+        let Ok(target) = std::fs::read_link(&mounted) else {
+            return false;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            // ".." is left for the kernel to resolve against the real dir.
+            current
+                .parent()
+                .unwrap_or(std::path::Path::new("/"))
+                .join(target)
+        };
+    }
+    false
+}
+
+fn run_host_modprobe(modprobe: &str, module: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let host_root = std::ffi::CString::new(HOST_ROOT).expect("HOST_ROOT contains no NUL");
+    let root_dir = std::ffi::CString::new("/").expect("root path contains no NUL");
+    let mut command = std::process::Command::new(modprobe);
+    command.arg(module);
+
+    // This image ships no kmod, and only the host's own modprobe matches the
+    // running kernel's modules and compression.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::chroot(host_root.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(root_dir.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute host {modprobe} for module {module}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "host modprobe failed for module {module} (status {}): stdout={stdout:?}, stderr={stderr:?}",
+        output.status
+    )
+}
+
+/// The policy module shipped in this image, and the domains the chart names in
+/// each stage's `seLinuxOptions`.
+const SELINUX_POLICY_PATH: &str = "/opt/kata-artifacts/selinux/kata-deploy.cil";
+const SELINUX_POLICY_MODULE: &str = "kata-deploy";
+const SELINUX_POLICY_DOMAINS: &[&str] = &[
+    "kata_deploy_check_t",
+    "kata_deploy_artifacts_t",
+    "kata_deploy_cri_t",
+    "kata_deploy_node_binaries_t",
+    "kata_deploy_t",
+];
+
+/// `; policy-revision: N` in the shipped CIL, added to this to give the priority
+/// the module is installed at.
+///
+/// The node keeps the highest-priority module of a name, so this is what stops
+/// an older image -- installing or uninstalling a release of its own on a node
+/// a newer one already set up -- from replacing the newer rules with its own.
+/// 400 is semodule's own default for administrator-installed modules.
+const SELINUX_POLICY_PRIORITY_BASE: u32 = 400;
+const SELINUX_POLICY_REVISION_TAG: &str = "; policy-revision:";
+
+/// Load the SELinux policy module the confined stages need.
+///
+/// Installed with the *host's* own `semodule`, for the same reason the kernel
+/// modules use the host's `modprobe`: the policy store belongs to the node and
+/// only the node's tooling matches its version.
+fn install_stage_selinux_policy(config: &config::Config) -> Result<()> {
+    let Some(selinuxfs) = host_selinuxfs() else {
+        // Not an error, so the chart's flag can be left on for a mixed cluster:
+        // runc ignores labels where SELinux is off.
+        info!("install (selinux-policy): SELinux is disabled on this node, nothing to load");
+        return Ok(());
+    };
+    info!(
+        "install (selinux-policy): SELinux is enabled (selinuxfs at {})",
+        selinuxfs.display()
+    );
+
+    // A node whose policy already carries the domains needs nothing from us, so
+    // one managing its own SELinux policy is not obliged to carry semodule too.
+    let semodule = match find_host_semodule() {
+        Some(semodule) => semodule,
+        None => return require_preloaded_selinux_policy(&selinuxfs),
+    };
+
+    // The node has one policy store, so two releases installing at once would
+    // drive it concurrently.
+    let _node_lock = acquire_node_mutation_lock()?;
+
+    let policy = std::fs::read_to_string(SELINUX_POLICY_PATH)
+        .with_context(|| format!("failed to read the SELinux policy {SELINUX_POLICY_PATH}"))?;
+    let priority = SELINUX_POLICY_PRIORITY_BASE + selinux_policy_revision(&policy)?;
+    let installed = installed_selinux_modules(&semodule)?;
+
+    let mut modules: Vec<(String, String)> = Vec::new();
+    match installed.get(SELINUX_POLICY_MODULE) {
+        // Reinstalled rather than skipped when the priorities match: a rebuilt
+        // image may carry new rules under the same revision, and installing is
+        // idempotent.
+        Some(&present) if present > priority => info!(
+            "install (selinux-policy): this node carries {SELINUX_POLICY_MODULE} at priority \
+             {present}, above this image's {priority}; leaving the newer module in place"
+        ),
+        _ => modules.push((format!("{SELINUX_POLICY_MODULE}.cil"), policy)),
+    }
+    modules.extend(selinux_path_modules(config, &installed));
+
+    if !modules.is_empty() {
+        let staged = stage_selinux_modules_on_host(&modules)?;
+        let result = run_host_semodule(&semodule, priority, &staged.chroot_paths);
+        staged.discard();
+        result?;
+    }
+
+    verify_selinux_domains(&selinuxfs)
+}
+
+/// Where the node's selinuxfs is, or `None` when SELinux is disabled.
+///
+/// One kernel-wide filesystem, so the container's own view of it is the node's;
+/// the host mount is tried first in case a runtime stops offering a writable one.
+fn host_selinuxfs() -> Option<std::path::PathBuf> {
+    ["/host/sys/fs/selinux", "/sys/fs/selinux"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|path| path.join("enforce").exists())
+}
+
+/// The path is returned as it looks after the chroot, not as mounted here.
+fn find_host_semodule() -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "/usr/sbin/semodule",
+        "/sbin/semodule",
+        "/usr/bin/semodule",
+        "/bin/semodule",
+    ];
+
+    CANDIDATES
+        .iter()
+        .find(|path| host_path_is_file(std::path::Path::new(HOST_ROOT), std::path::Path::new(path)))
+        .map(|path| (*path).to_string())
+}
+
+/// Nothing can be loaded here, so the node's policy has to already say what the
+/// stages need. It usually will not, hence the error naming both ways out.
+fn require_preloaded_selinux_policy(selinuxfs: &std::path::Path) -> Result<()> {
+    info!("install (selinux-policy): no semodule on this node, so nothing can be loaded here");
+    verify_selinux_domains(selinuxfs).with_context(|| {
+        format!(
+            "this node has SELinux enabled but no semodule under {HOST_ROOT}: install \
+             policycoreutils on the node, or load an equivalent of {SELINUX_POLICY_PATH} into \
+             its policy by other means"
+        )
+    })
+}
+
+/// The `; policy-revision: N` the shipped CIL carries.
+fn selinux_policy_revision(policy: &str) -> Result<u32> {
+    policy
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(SELINUX_POLICY_REVISION_TAG))
+        .with_context(|| {
+            format!("{SELINUX_POLICY_PATH} carries no `{SELINUX_POLICY_REVISION_TAG} N` line")
+        })?
+        .trim()
+        .parse()
+        .with_context(|| format!("{SELINUX_POLICY_PATH} has an unparsable policy revision"))
+}
+
+/// Every module in the node's store, by name, at the highest priority it is
+/// installed at.
+fn installed_selinux_modules(semodule: &str) -> Result<std::collections::HashMap<String, u32>> {
+    let output = host_semodule_command(semodule)
+        .arg("--list-modules=full")
+        .output()
+        .with_context(|| format!("failed to execute host {semodule} to list the policy store"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "host semodule could not list the node's policy store (status {}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+
+    // `<priority> <name> <lang>` per line.
+    let mut modules = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(Ok(priority)), Some(name)) = (fields.next().map(str::parse), fields.next())
+        else {
+            continue;
+        };
+        modules
+            .entry(name.to_string())
+            .and_modify(|highest| *highest = std::cmp::max(*highest, priority))
+            .or_insert(priority);
+    }
+    Ok(modules)
+}
+
+/// A directory the installer writes whose label the shipped module cannot know,
+/// because the chart can move the directory anywhere on the node.
+///
+/// The rules are written against an attribute, so covering a node's own label
+/// means adding its type to that attribute and nothing else. One module per
+/// type rather than one per release: two releases with different prefixes must
+/// not take each other's coverage away.
+struct SelinuxWriteTarget {
+    /// Distinguishes the modules, so the two targets never collide on a name.
+    kind: &'static str,
+    path: String,
+    attribute: &'static str,
+    /// What the shipped module's own `typeattributeset` already covers.
+    granted: &'static [&'static str],
+}
+
+fn selinux_write_targets(dest_dir: &str) -> Vec<SelinuxWriteTarget> {
+    vec![
+        SelinuxWriteTarget {
+            kind: "install",
+            path: dest_dir.to_string(),
+            attribute: "kata_deploy_install_target",
+            granted: &["usr_t"],
+        },
+        SelinuxWriteTarget {
+            kind: "cri-config",
+            // The chart mounts the host's CRI config dir here, wherever
+            // containerd.configDir put it.
+            path: "/etc/containerd".to_string(),
+            attribute: "kata_deploy_cri_config_target",
+            granted: &["container_var_lib_t", "container_config_t"],
+        },
+    ]
+}
+
+/// The supplementary modules this node needs on top of the shipped one, as
+/// `(file name, contents)`, skipping what the shipped one or the store covers.
+fn selinux_path_modules(
+    config: &config::Config,
+    installed: &std::collections::HashMap<String, u32>,
+) -> Vec<(String, String)> {
+    let mut modules = Vec::new();
+    for target in selinux_write_targets(&config.dest_dir) {
+        let path = std::path::Path::new(&target.path);
+        let Some(file_type) = selinux_file_type(path) else {
+            log::warn!(
+                "install (selinux-policy): cannot read the SELinux label of {}; if it is not \
+                 labelled {}, the confined stages will be denied writing it",
+                target.path,
+                target.granted.join(" or ")
+            );
+            continue;
+        };
+        if target.granted.contains(&file_type.as_str()) {
+            continue;
+        }
+
+        // Names the type, so the same one is shared rather than reinstalled per
+        // release, and an admin reading the store can see what it is for.
+        let module = format!("{SELINUX_POLICY_MODULE}-{}-{file_type}", target.kind);
+        if installed.contains_key(&module) {
+            continue;
+        }
+        info!(
+            "install (selinux-policy): {} is {file_type}, which the shipped policy does not cover; \
+             adding it to {} as {module}",
+            target.path, target.attribute
+        );
+        modules.push((
+            format!("{module}.cil"),
+            format!(
+                "; Generated by kata-deploy: {} is {file_type} on this node, which the\n\
+                 ; kata-deploy module does not cover.\n\
+                 (typeattributeset {} ({file_type}))\n",
+                target.path, target.attribute
+            ),
+        ));
+    }
+    modules
+}
+
+/// The type field of a path's SELinux label, read from the inode's xattr: a bind
+/// mount shares the inode with the host directory it came from, so this is the
+/// label the host has.
+fn selinux_file_type(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let read = |buf: *mut libc::c_void, len: usize| unsafe {
+        libc::lgetxattr(path.as_ptr(), c"security.selinux".as_ptr(), buf, len)
+    };
+
+    // Sized by a first pass: a fixed buffer comes back ERANGE on a long label,
+    // which here is indistinguishable from no label at all.
+    let size = read(std::ptr::null_mut(), 0);
+    if size <= 0 {
+        return None;
+    }
+    let mut label = vec![0u8; size as usize];
+    let size = read(label.as_mut_ptr() as *mut libc::c_void, label.len());
+    if size <= 0 {
+        return None;
+    }
+    label.truncate(size as usize);
+
+    // user:role:type:level, of which only the type is a target here.
+    String::from_utf8_lossy(&label)
+        .trim_end_matches('\0')
+        .split(':')
+        .nth(2)
+        .filter(|file_type| !file_type.is_empty())
+        .map(str::to_string)
+}
+
+/// Modules staged where the chroot can reach them, as the chroot will see them.
+struct StagedModules {
+    staged_paths: Vec<std::path::PathBuf>,
+    chroot_paths: Vec<String>,
+}
+
+impl StagedModules {
+    fn discard(self) {
+        for path in self.staged_paths {
+            if let Err(error) = std::fs::remove_file(&path) {
+                log::debug!(
+                    "install (selinux-policy): could not remove staged policy {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Write the modules somewhere the chroot can reach, since the host's `semodule`
+/// cannot see this image's filesystem.
+fn stage_selinux_modules_on_host(modules: &[(String, String)]) -> Result<StagedModules> {
+    const CHROOT_DIR: &str = "/run/kata-deploy";
+
+    let dir = std::path::Path::new(HOST_ROOT).join(CHROOT_DIR.trim_start_matches('/'));
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create the policy staging directory {}",
+            dir.display()
+        )
+    })?;
+
+    let mut staged = StagedModules {
+        staged_paths: Vec::new(),
+        chroot_paths: Vec::new(),
+    };
+    for (name, contents) in modules {
+        let staged_path = dir.join(name);
+        std::fs::write(&staged_path, contents).with_context(|| {
+            format!(
+                "failed to stage the SELinux policy {}",
+                staged_path.display()
+            )
+        })?;
+        staged.staged_paths.push(staged_path);
+        staged.chroot_paths.push(format!("{CHROOT_DIR}/{name}"));
+    }
+    Ok(staged)
+}
+
+/// A `semodule` that will run against the node's own policy store.
+fn host_semodule_command(semodule: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+
+    let host_root = std::ffi::CString::new(HOST_ROOT).expect("HOST_ROOT contains no NUL");
+    let root_dir = std::ffi::CString::new("/").expect("root path contains no NUL");
+    let mut command = std::process::Command::new(semodule);
+
+    unsafe {
+        command.pre_exec(move || {
+            if libc::chroot(host_root.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::chdir(root_dir.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+fn run_host_semodule(semodule: &str, priority: u32, policies: &[String]) -> Result<()> {
+    // One transaction for all of them: each is a full policy rebuild otherwise.
+    let mut command = host_semodule_command(semodule);
+    command.arg(format!("--priority={priority}"));
+    for policy in policies {
+        command.arg("--install").arg(policy);
+    }
+
+    info!(
+        "install (selinux-policy): loading {} at priority {priority} with the host's {semodule}",
+        policies.join(", ")
+    );
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute host {semodule}"))?;
+    if output.status.success() {
+        info!("install (selinux-policy): policy modules loaded");
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    anyhow::bail!(
+        "host semodule failed to install {} (status {}): stdout={stdout:?}, stderr={stderr:?}",
+        policies.join(", "),
+        output.status
+    )
+}
+
+/// Confirm every domain the chart asks for now resolves, so that a stage which
+/// would otherwise fail with an opaque runc error fails here by name instead.
+///
+/// Asked of the kernel through selinuxfs, which needs no `seinfo`: nodes are not
+/// obliged to carry setools, and RHEL 9 does not install it.
+fn verify_selinux_domains(selinuxfs: &std::path::Path) -> Result<()> {
+    let context_path = selinuxfs.join("context");
+    // An unwritable interface would read as "every domain missing", so check it
+    // before trusting its rejections.
+    if let Err(error) = std::fs::OpenOptions::new().write(true).open(&context_path) {
+        log::warn!(
+            "install (selinux-policy): cannot use {} to verify the policy's domains ({error}); \
+             a stage requesting a missing domain will fail with an opaque runc error instead of \
+             a clear one here",
+            context_path.display()
+        );
+        return Ok(());
+    }
+
+    let missing: Vec<&str> = SELINUX_POLICY_DOMAINS
+        .iter()
+        .copied()
+        .filter(|domain| !selinux_context_is_valid(&context_path, domain))
+        .collect();
+
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the node's SELinux policy does not define {}; the install stages ask for those domains, \
+         so they would fail to start. Check what the store carries, and at which priority, with \
+         `semodule --list-modules=full`",
+        missing.join(", ")
+    );
+
+    info!(
+        "install (selinux-policy): all {} domains resolve",
+        SELINUX_POLICY_DOMAINS.len()
+    );
+    Ok(())
+}
+
+fn selinux_context_is_valid(context_path: &std::path::Path, domain: &str) -> bool {
+    use std::io::Write;
+
+    // One open per call: selinuxfs allows a single write per open and fails the
+    // next with EBUSY, so a shared handle would fail every domain but the first.
+    let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(context_path) else {
+        return false;
+    };
+    // A whole context, as the kernel validates no single field of one. The role
+    // and level are those the chart pairs each domain with.
+    file.write_all(format!("system_u:system_r:{domain}:s0").as_bytes())
+        .is_ok()
+}
+
+/// Install stage 1 (host-check): validate that this node can support a Kata
+/// installation before artifacts or CRI configuration are changed. This is
+/// read-only and safe to run repeatedly; it fails fast with actionable
+/// diagnostics so a staged Job can abort before persistent host changes.
 ///
 /// `staged` marks the job-mode pipeline, whose containers hold no Kubernetes
 /// credentials: the one check that needs the apiserver (reading the kubelet's
@@ -656,15 +1579,16 @@ fn host_boot_config_has_builtin_feature(config_symbol: &str) -> bool {
 ///
 /// Running the host binary to ask it is not possible: it is linked against the
 /// host's loader and libraries, which the container does not have. So this
-/// searches the binary for the option names, which `getopt_long` keeps as
-/// plain strings. Their presence says exactly what the tool accepts, which is
-/// what we care about — the erofs-utils version only ever stood in for it.
+/// searches the binary for the options its usage text lists. What it documents
+/// is what it accepts, which is what we care about — the erofs-utils version
+/// only ever stood in for it.
 fn validate_mkfs_erofs_options() -> Result<()> {
     let mkfs_erofs = utils::find_host_program(MKFS_EROFS).with_context(|| {
         format!(
             "Required host command `{MKFS_EROFS}` is not available. Install \
              erofs-utils >= {MIN_EROFS_UTILS_VERSION} before enabling the \
-             EROFS snapshotter."
+             EROFS snapshotter, or add a nodeBinaries entry taking it from \
+             an image."
         )
     })?;
 
@@ -674,15 +1598,15 @@ fn validate_mkfs_erofs_options() -> Result<()> {
     let missing: Vec<&str> = REQUIRED_MKFS_EROFS_OPTIONS
         .iter()
         .copied()
-        .filter(|option| !contains_c_string(&binary, option))
+        .filter(|option| !documents_option(&binary, option))
         .collect();
 
     if !missing.is_empty() {
         anyhow::bail!(
-            "Host {} does not support the --{} option(s) that kata-deploy \
+            "Host {} does not support the {} option(s) that kata-deploy \
              configures the EROFS differ to use. Install erofs-utils >= {}.",
             mkfs_erofs.display(),
-            missing.join(", --"),
+            missing.join(", "),
             MIN_EROFS_UTILS_VERSION
         );
     }
@@ -695,19 +1619,27 @@ fn validate_mkfs_erofs_options() -> Result<()> {
     Ok(())
 }
 
-/// Whether `haystack` holds `needle` as a whole NUL-terminated string, the way
-/// a C string literal is stored in a binary. This is the `strings | grep -x` of
-/// the probe: matching a substring would accept `sort` inside `qsort`.
-fn contains_c_string(haystack: &[u8], needle: &str) -> bool {
-    let needle = needle.as_bytes();
+/// Whether `binary` documents `option`, dashes and all, as a word of its own.
+///
+/// Looking for the bare `getopt_long` name instead does not work: it is short
+/// enough for the linker to fold into the tail of an unrelated string, which
+/// nothing can tell from `sort` inside `qsort`. aarch64 builds of erofs-utils
+/// keep no `sort` but the one in glibc's `rfc3484_sort`.
+fn documents_option(binary: &[u8], option: &str) -> bool {
+    let option = option.as_bytes();
+    let bounds_word = |byte: &u8| !byte.is_ascii_alphanumeric() && !b"-_".contains(byte);
 
-    haystack
-        .windows(needle.len() + 1)
+    binary
+        .windows(option.len())
         .enumerate()
         .any(|(start, window)| {
-            window[..needle.len()] == *needle
-                && window[needle.len()] == 0
-                && (start == 0 || !haystack[start - 1].is_ascii_graphic())
+            window == option
+                // Both ends, so that `--sort` inside a longer word is no more
+                // accepted than `sort` inside `qsort` was.
+                && start
+                    .checked_sub(1)
+                    .is_none_or(|before| bounds_word(&binary[before]))
+                && binary.get(start + option.len()).is_none_or(bounds_word)
         })
 }
 
@@ -1073,20 +2005,33 @@ async fn install_stage_cri(config: &config::Config, runtime: &str, staged: bool)
     let handlers = config.shim_handlers();
 
     if staged {
-        if let Some(before) = config_before {
-            let unchanged =
-                runtime::cri_config_snapshot(config, runtime).await.as_ref() == Some(&before);
-            if unchanged
-                && runtime::lifecycle::cri_serving_config_from(runtime, before.written_at()).await
-            {
-                info!(
-                    "install (cri): CRI config for {runtime} is unchanged from a previous \
-                     attempt, and {runtime} has been up since it was written. Skipping the \
-                     (self-terminating) restart and checking the runtime is up instead."
-                );
-                runtime::lifecycle::wait_till_cri_unit_active(runtime, 300).await?;
-                info!("install (cri): runtime is up; CRI stage complete without restart");
-                return Ok(());
+        // Every path out of here that keeps the restart says why: a retry loop that
+        // restarts forever is otherwise indistinguishable from one that never tried.
+        match config_before {
+            None => info!(
+                "install (cri): no readable CRI config predates this attempt; a restart is needed"
+            ),
+            Some(before) => {
+                let unchanged = runtime::cri_config_snapshot(config, runtime)
+                    .await
+                    .is_some_and(|after| after.same_config_as(&before));
+                if !unchanged {
+                    info!(
+                        "install (cri): configuring {runtime} changed its CRI config; a restart is \
+                         needed"
+                    );
+                } else if runtime::lifecycle::cri_serving_config_from(runtime, before.written_at())
+                    .await
+                {
+                    info!(
+                        "install (cri): CRI config for {runtime} is unchanged from a previous \
+                         attempt, and {runtime} has been up since it was written. Skipping the \
+                         (self-terminating) restart and checking the runtime is up instead."
+                    );
+                    runtime::lifecycle::wait_till_cri_unit_active(runtime, 300).await?;
+                    info!("install (cri): runtime is up; CRI stage complete without restart");
+                    return Ok(());
+                }
             }
         }
     }
@@ -1449,6 +2394,8 @@ async fn cleanup_stage_revert_cri(
 async fn cleanup_stage_remove_artifacts(config: &config::Config) -> Result<()> {
     info!("cleanup (remove-artifacts): removing kata artifacts from host");
     let _node_lock = acquire_node_mutation_lock()?;
+    // A partial install may have loaded modules but extracted nothing.
+    remove_modules_load_config(config)?;
 
     // The install dir is bind mounted into this pod, so it always exists and
     // outlives the artifacts it holds: an empty one means there is nothing
@@ -1542,6 +2489,11 @@ mod tests {
     #[case("install", Action::Install)]
     #[case("cleanup", Action::Cleanup)]
     #[case("reset", Action::Reset)]
+    #[case("install-stage-selinux-policy", Action::InstallStageSelinuxPolicy)]
+    #[case(
+        "install-stage-load-kernel-modules",
+        Action::InstallStageLoadKernelModules
+    )]
     #[case("install-stage-host-check", Action::InstallStageHostCheck)]
     #[case("install-stage-artifacts", Action::InstallStageArtifacts)]
     #[case("install-stage-cri", Action::InstallStageCri)]
@@ -1668,29 +2620,31 @@ mod tests {
         );
     }
 
-    /// The option probe reads a binary, so it has to match whole strings the
-    /// way `strings | grep -x` does: a `getopt_long` name is NUL terminated and
-    /// never the tail of a longer word.
+    /// The usage text spellings are the ones erofs-utils 1.9.3 ships on both
+    /// amd64 and arm64; `rfc3484_sort` is what an arm64 build folds its own
+    /// `sort` into.
     #[rstest]
-    #[case(b"\0mkfs-time\0", "mkfs-time", true)]
-    #[case(b"sort\0", "sort", true)]
-    #[case(b"--sort\0", "sort", false)]
-    #[case(b"\0qsort\0", "sort", false)]
-    #[case(b"\0sorted\0", "sort", false)]
-    #[case(b"\0sort", "sort", false)]
-    #[case(b"\0mkfs-timestamp\0", "mkfs-time", false)]
-    fn test_contains_c_string(
-        #[case] haystack: &[u8],
-        #[case] needle: &str,
-        #[case] expected: bool,
-    ) {
-        assert_eq!(contains_c_string(haystack, needle), expected);
+    #[case(b"    --mkfs-time         the t", "--mkfs-time", true)]
+    #[case(b"ta\n --sort=<path,none>  ", "--sort", true)]
+    #[case(b"\0rfc3484_sort\0", "--sort", false)]
+    #[case(b"\0qsort\0", "--sort", false)]
+    #[case(b"\0--mkfs-timestamp\0", "--mkfs-time", false)]
+    #[case(b"\0--sort", "--sort", true)]
+    #[case(b"1.7.1\0", "--sort", false)]
+    // A word ending in the option is no more a mention of it than `qsort` is.
+    #[case(b"\0x--sort\0", "--sort", false)]
+    #[case(b"\0no_--mkfs-time\0", "--mkfs-time", false)]
+    // Nothing before it to look at.
+    #[case(b"--sort=<path,none>", "--sort", true)]
+    fn test_documents_option(#[case] binary: &[u8], #[case] option: &str, #[case] expected: bool) {
+        assert_eq!(documents_option(binary, option), expected);
     }
 
     /// All non-internal staged actions remain visible in `--help` so operators
     /// can discover and run individual stages.
     #[rstest]
     #[case(Action::InstallStageHostCheck)]
+    #[case(Action::InstallStageLoadKernelModules)]
     #[case(Action::InstallStageArtifacts)]
     #[case(Action::InstallStageCri)]
     #[case(Action::CleanupStageRevertCri)]
@@ -1704,5 +2658,316 @@ mod tests {
             "staged action {:?} should be visible in --help",
             value.get_name(),
         );
+    }
+
+    /// The pod's status has to read as a sentence, not as a Debug dump.
+    #[test]
+    fn the_termination_message_is_the_whole_chain_on_one_line() {
+        let error = anyhow::anyhow!("host modprobe failed for module vhost_vsock")
+            .context("failed to load the host kernel modules");
+
+        assert_eq!(
+            termination_message(&error),
+            "failed to load the host kernel modules: host modprobe failed for module vhost_vsock"
+        );
+    }
+
+    #[test]
+    fn a_commands_output_does_not_break_the_termination_message_apart() {
+        let error =
+            anyhow::anyhow!("modprobe: FATAL: module vhost_vsock not found\nin /lib/modules")
+                .context("failed to load the host kernel modules");
+
+        assert_eq!(
+            termination_message(&error),
+            "failed to load the host kernel modules: modprobe: FATAL: module vhost_vsock \
+             not found in /lib/modules"
+        );
+    }
+
+    #[test]
+    fn an_over_long_termination_message_is_marked_as_truncated() {
+        // Twelve bytes to nine characters, so the cut falls inside the "ü" -
+        // which `truncate` panics on rather than tolerates.
+        let error = anyhow::anyhow!("{}", "übergröße".repeat(500));
+        let message = termination_message(&error);
+
+        assert!(message.len() <= TERMINATION_MESSAGE_MAX);
+        assert!(message.ends_with("... (truncated)"));
+        assert!(message.starts_with("übergröße"));
+    }
+
+    fn module_names(modules: &[HostModule]) -> Vec<&str> {
+        modules.iter().map(|module| module.name).collect()
+    }
+
+    fn test_module_plan(
+        arch: &str,
+        cpuinfo: &str,
+        shims: &[&str],
+        custom_bases: &[&str],
+        erofs_enabled: bool,
+        erofs_dmverity: bool,
+    ) -> Result<HostModulePlan> {
+        host_modules_for_install(
+            arch,
+            cpuinfo,
+            shims,
+            custom_bases,
+            erofs_enabled,
+            erofs_dmverity,
+        )
+    }
+
+    fn test_host_modules(
+        arch: &str,
+        cpuinfo: &str,
+        shims: &[&str],
+        custom_bases: &[&str],
+        erofs_enabled: bool,
+        erofs_dmverity: bool,
+    ) -> Result<Vec<HostModule>> {
+        test_module_plan(
+            arch,
+            cpuinfo,
+            shims,
+            custom_bases,
+            erofs_enabled,
+            erofs_dmverity,
+        )
+        .map(|plan| plan.modules)
+    }
+
+    #[rstest]
+    #[case("GenuineIntel", "kvm_intel")]
+    #[case("AuthenticAMD", "kvm_amd")]
+    fn x86_module_selection_follows_cpu_vendor(#[case] vendor: &str, #[case] vendor_module: &str) {
+        let modules = test_host_modules("x86_64", vendor, &["qemu"], &[], false, false).unwrap();
+        assert_eq!(
+            module_names(&modules),
+            vec!["kvm", vendor_module, "vhost", "vhost_net", "vhost_vsock"]
+        );
+    }
+
+    #[test]
+    fn x86_asks_for_a_backend_and_treats_the_kvm_modules_as_optional() {
+        let plan =
+            test_module_plan("x86_64", "GenuineIntel", &["qemu"], &[], false, false).unwrap();
+        assert!(plan.needs_x86_virtualization);
+        for name in ["kvm", "kvm_intel"] {
+            let module = plan
+                .modules
+                .iter()
+                .find(|module| module.name == name)
+                .expect("the KVM modules are still attempted");
+            assert!(!module.required);
+        }
+    }
+
+    /// An unnameable vendor may just mean a Hyper-V root partition, where no KVM
+    /// module would have loaded anyway.
+    #[test]
+    fn unknown_x86_vendor_leaves_the_backend_check_to_decide() {
+        let plan =
+            test_module_plan("x86_64", "UnknownVendor", &["qemu"], &[], false, false).unwrap();
+        assert!(plan.needs_x86_virtualization);
+        assert_eq!(
+            module_names(&plan.modules),
+            vec!["kvm", "vhost", "vhost_net", "vhost_vsock"]
+        );
+    }
+
+    #[rstest]
+    #[case(
+        "aarch64",
+        vec!["kvm", "vhost", "vhost_net", "vhost_vsock"]
+    )]
+    #[case("riscv64", vec!["kvm", "vhost", "vhost_net", "vhost_vsock"])]
+    #[case("powerpc64", vec!["kvm", "kvm_hv", "vhost_vsock"])]
+    #[case("s390x", vec!["kvm", "vhost_vsock"])]
+    fn non_x86_module_selection_matches_kata_check(
+        #[case] arch: &str,
+        #[case] expected: Vec<&str>,
+    ) {
+        let modules = test_host_modules(arch, "", &["qemu"], &[], false, false).unwrap();
+        assert_eq!(module_names(&modules), expected);
+    }
+
+    #[test]
+    fn remote_only_install_needs_no_virtualization_at_all() {
+        for plan in [
+            test_module_plan("x86_64", "", &["remote"], &[], false, false).unwrap(),
+            test_module_plan("x86_64", "", &[], &["remote"], false, false).unwrap(),
+        ] {
+            assert!(plan.modules.is_empty());
+            assert!(!plan.needs_x86_virtualization);
+        }
+    }
+
+    #[test]
+    fn local_custom_runtime_requests_virtualization_modules() {
+        let modules = test_host_modules(
+            "x86_64",
+            "GenuineIntel",
+            &["remote"],
+            &["qemu"],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(module_names(&modules).contains(&"kvm_intel"));
+    }
+
+    #[rstest]
+    #[case(&["qemu-runtime-rs"], true)]
+    #[case(&["clh-azure-runtime-rs"], false)]
+    #[case(&["clh", "qemu"], true)]
+    fn vhost_vsock_is_only_required_where_the_host_device_is_used(
+        #[case] shims: &[&str],
+        #[case] expected_required: bool,
+    ) {
+        let modules =
+            test_host_modules("x86_64", "GenuineIntel", shims, &[], false, false).unwrap();
+        let vsock = modules
+            .iter()
+            .find(|module| module.name == "vhost_vsock")
+            .expect("vhost_vsock is always considered");
+        assert_eq!(vsock.required, expected_required);
+    }
+
+    #[test]
+    fn erofs_features_are_selected_and_deduplicated() {
+        let modules = test_host_modules("aarch64", "", &["qemu"], &[], true, true).unwrap();
+        let names = module_names(&modules);
+        assert!(names.ends_with(&["erofs", "loop", "dm_mod", "dm_verity"]));
+        assert_eq!(
+            names.iter().copied().collect::<HashSet<_>>().len(),
+            names.len()
+        );
+        assert!(modules.iter().all(|module| module.required));
+    }
+
+    #[test]
+    fn modules_load_config_is_per_install() {
+        let base = std::path::Path::new("/etc/modules-load.d");
+        assert_eq!(
+            modules_load_config_path(base, None).unwrap(),
+            base.join("kata-containers-default.conf")
+        );
+        assert_eq!(
+            modules_load_config_path(base, Some("dev")).unwrap(),
+            base.join("kata-containers-dev.conf")
+        );
+        assert!(modules_load_config_path(base, Some("../escape")).is_err());
+
+        let content = modules_load_config_content(&["kvm", "vhost_vsock"]);
+        assert!(content.starts_with("# Managed by kata-deploy"));
+        assert!(content.contains("\nkvm\nvhost_vsock\n"));
+    }
+
+    #[test]
+    fn required_module_failures_abort_but_optional_failures_do_not() {
+        assert!(handle_module_load_failure(
+            HostModule::required("vhost_vsock"),
+            anyhow::anyhow!("no vhost_vsock")
+        )
+        .is_err());
+        assert!(handle_module_load_failure(
+            HostModule::optional("fsverity"),
+            anyhow::anyhow!("no fsverity")
+        )
+        .is_ok());
+    }
+
+    /// /bin/sh exists here but not on the fake host, so only a resolution that
+    /// escapes the root answers true for it.
+    #[rstest]
+    #[case::absolute_symlink("/bin/kmod", true)]
+    #[case::relative_symlink("../bin/kmod", true)]
+    #[case::escapes_the_host_root("/bin/sh", false)]
+    #[case::dangling("/bin/nowhere", false)]
+    fn host_symlinks_resolve_inside_the_host_root(#[case] target: &str, #[case] expected: bool) {
+        let host = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(host.path().join("usr/sbin")).expect("usr/sbin");
+        std::fs::create_dir_all(host.path().join("usr/bin")).expect("usr/bin");
+        std::fs::write(host.path().join("usr/bin/kmod"), b"#!/bin/sh\n").expect("kmod");
+        // usrmerge, so /bin/kmod lands on usr/bin/kmod.
+        std::os::unix::fs::symlink("usr/bin", host.path().join("bin")).expect("bin symlink");
+        std::os::unix::fs::symlink(target, host.path().join("usr/sbin/modprobe"))
+            .expect("modprobe symlink");
+
+        assert_eq!(
+            host_path_is_file(host.path(), std::path::Path::new("/usr/sbin/modprobe")),
+            expected,
+            "modprobe -> {target}"
+        );
+    }
+
+    #[test]
+    fn a_missing_host_path_is_not_a_file() {
+        let host = tempfile::tempdir().expect("tempdir");
+        assert!(!host_path_is_file(
+            host.path(),
+            std::path::Path::new("/usr/sbin/modprobe")
+        ));
+    }
+
+    #[test]
+    fn a_symlink_loop_under_the_host_root_terminates() {
+        let host = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(host.path().join("usr/sbin")).expect("usr/sbin");
+        std::os::unix::fs::symlink("/usr/sbin/b", host.path().join("usr/sbin/a")).expect("a");
+        std::os::unix::fs::symlink("/usr/sbin/a", host.path().join("usr/sbin/b")).expect("b");
+
+        assert!(!host_path_is_file(
+            host.path(),
+            std::path::Path::new("/usr/sbin/a")
+        ));
+    }
+
+    /// The revision is what keeps an older image from replacing a newer
+    /// release's module, so an unreadable one has to fail the stage.
+    #[rstest]
+    #[case("; policy-revision: 7\n(type kata_deploy_t)\n", Some(7))]
+    #[case("(type kata_deploy_t)\n; policy-revision:12", Some(12))]
+    #[case("(type kata_deploy_t)\n", None)]
+    #[case("; policy-revision: v3\n", None)]
+    fn the_policy_revision_comes_from_the_policy(#[case] cil: &str, #[case] expected: Option<u32>) {
+        assert_eq!(selinux_policy_revision(cil).ok(), expected);
+    }
+
+    /// A bump the CIL carries and this does not would install the new rules at
+    /// the old priority, which is the downgrade the revision exists to stop.
+    #[test]
+    fn the_shipped_policy_carries_a_revision() {
+        assert!(selinux_policy_revision(shipped_policy()).is_ok());
+    }
+
+    /// The shipped policy is the source of truth for what a supplement would
+    /// duplicate: drift here means either a redundant module per node, or none
+    /// where one is needed.
+    #[test]
+    fn the_shipped_policy_grants_what_the_supplements_assume() {
+        let policy = shipped_policy();
+
+        for target in selinux_write_targets("/opt/kata") {
+            let granted = policy
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix(&format!("(typeattributeset {} (", target.attribute))
+                })
+                .unwrap_or_else(|| panic!("{} is not set by the policy", target.attribute))
+                .trim_end_matches("))")
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(granted, target.granted, "{}", target.attribute);
+        }
+    }
+
+    /// Embedded rather than read at run time, so a build context missing the
+    /// policy fails to compile instead of failing these two tests with ENOENT.
+    fn shipped_policy() -> &'static str {
+        include_str!("../../selinux/kata-deploy.cil")
     }
 }

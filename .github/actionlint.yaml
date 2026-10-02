@@ -16,6 +16,7 @@ self-hosted-runner:
     - garm-ubuntu-2304
     - garm-ubuntu-2304-smaller
     - garm-ubuntu-2204-smaller
+    - kata-deploy-selinux
     - ppc64le
     - ppc64le-k8s
     - ppc64le-small
@@ -27,6 +28,9 @@ self-hosted-runner:
     - s390x-large
     - tdx
     - ubuntu-24.04-arm
+    # GitHub hosted, but missing from the hard coded list of the actionlint
+    # release we pin. Drop once rhysd/actionlint#683 reaches a release.
+    - ubuntu-26.04
 
 paths:
   .github/workflows/**/*.{yml,yaml}:
