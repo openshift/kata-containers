@@ -164,6 +164,28 @@ function kubectl_retry() {
 	echo "'kubectl $*' failed after ${max_tries} tries" 1>&2 && return 1
 }
 
+# A wrapper around `apt-get update` with retry logic.
+#
+# The GitHub runner images come with third-party apt repositories configured
+# (packages.microsoft.com, dl.google.com, ...) that we don't use but that apt
+# still refreshes, and a single one of them answering 403 or timing out is
+# enough to make the whole update fail.  Retrying keeps a hiccup on a
+# repository we don't even need from taking the job down.
+function apt_get_update() {
+	local -r max_tries=5
+	local -r interval=15
+	local i
+
+	for ((i = 1; i <= max_tries; i++)); do
+		sudo apt-get update && return 0
+		[[ "${i}" -eq "${max_tries}" ]] && break
+		warn "'apt-get update' failed, retrying in ${interval} seconds"
+		sleep "${interval}"
+	done
+
+	die "'apt-get update' failed after ${max_tries} tries"
+}
+
 function waitForProcess() {
 	wait_time="$1"
 	sleep_time="$2"
@@ -907,7 +929,7 @@ function install_erofs_utils() {
 		Pin: release n=questing
 		Pin-Priority: 100
 		APTPIN
-		sudo apt-get update
+		apt_get_update
 		sudo apt-get -y install --no-install-recommends -t questing erofs-utils
 		sudo rm -f /etc/apt/preferences.d/questing-pin
 		sudo add-apt-repository -y --remove 'deb https://archive.ubuntu.com/ubuntu/ questing universe'
@@ -924,6 +946,29 @@ function load_dm_verity_modules() {
 
 	[[ -d /sys/module/dm_verity ]] || \
 		die "the dm_verity kernel module is not available after modprobe"
+}
+
+# Gives the node what only kata-deploy's per-node Jobs would have brought it.
+#
+# The job pipeline stages erofs-utils onto the node (nodeBinaries) and has a
+# privileged stage that loads the modules EROFS needs. The DaemonSet does
+# neither - it is one container with no such ordering - so a node it installs
+# has to arrive with both, and the install's host check fails it if it does not.
+#
+# Which mode this applies to is the caller's to decide. Nothing is prepared for
+# job mode, deliberately: doing so would hide its own stages failing to.
+function prepare_host_for_erofs() {
+	[[ "${SNAPSHOTTER:-}" == "erofs" ]] || return 0
+
+	# Also loads the erofs module.
+	install_erofs_utils
+
+	# EROFS mounts its layer blobs through loop devices.
+	sudo modprobe loop
+
+	if [[ "${EROFS_DMVERITY:-}" == "dmverity" ]]; then
+		load_dm_verity_modules
+	fi
 }
 
 # Points containerd at the erofs differ and snapshotter, as a conf.d drop-in.
@@ -1378,12 +1423,22 @@ function install_crio() {
 	sudo mkdir -p /etc/apt/keyrings
 	sudo mkdir -p /etc/apt/sources.list.d
 
-	curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/Release.key" | \
+	local major minor repo_url
+	major=$(echo "${version}" | cut -d. -f1)
+	minor=$(echo "${version}" | cut -d. -f2)
+
+	if [[ "${major}" -gt 1 || "${minor}" -ge 33 ]]; then
+		repo_url="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${version}/deb"
+	else
+		repo_url="https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb"
+	fi
+
+	curl -fsSL "${repo_url}/Release.key" | \
 		sudo gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-	echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/ /" | \
+	echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] ${repo_url}/ /" | \
 		sudo tee /etc/apt/sources.list.d/cri-o.list
 
-	sudo apt update
+	apt_get_update
 	sudo apt install -y cri-o
 
 	# We need to set the default capabilities to ensure our tests will pass
@@ -1414,7 +1469,7 @@ EOF
 
 function install_docker() {
 	# Add Docker's official GPG key
-	sudo apt-get update
+	apt_get_update
 	sudo apt-get -y install ca-certificates curl gnupg
 	sudo install -m 0755 -d /etc/apt/keyrings
 	curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -1425,7 +1480,7 @@ function install_docker() {
 		"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
 		$(. /etc/os-release && echo "${VERSION_CODENAME}") stable" | \
 		sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-	sudo apt-get update
+	apt_get_update
 
 	sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 }

@@ -1,8 +1,8 @@
 # Deployment model for installing/cleaning up Kata on nodes.
 #   daemonset: (default) the long-running kata-deploy DaemonSet installs Kata on
 #              every matching node and reverts it on pod termination (uninstall).
-#   job:       no always-on component. A tiny dispatcher Job (the dispatcher,
-#              kata-deploy-job-dispatcher) runs as a post-install/upgrade hook, enumerates
+#   job:       no always-on component. A tiny k8s-job-dispatcher Job runs as a
+#              post-install/upgrade hook, enumerates
 #              the selected nodes LIVE, and creates one node-pinned install Job
 #              per node - paced to job.parallelism and guaranteeing one install
 #              per node. Each per-node Job runs the staged pipeline as ordered
@@ -22,17 +22,43 @@
 #   and installs the new nodes (the staged actions are idempotent, so already-
 #   installed nodes are skipped). This is intentional: it avoids an always-on
 #   privileged component on every node.
+#
+#   On a fleet that grows on its own, `job.reconcile` does that re-run on a
+#   schedule instead.
+#
+# NOTE on host kernel modules in "job" mode:
+#   Each per-node install Job starts with one short-lived privileged, tokenless
+#   init container that loads the modules the enabled runtimes and snapshotters
+#   need. It mounts the host root read-only because only the host's own modprobe
+#   matches the running kernel, and it fails the node before anything on it is
+#   changed if a required module cannot be loaded, or if x86 ends up with
+#   neither /dev/kvm nor /dev/mshv.
+#
+#   Those modules are also recorded under the host's /etc/modules-load.d so they
+#   come back after a reboot. Uninstall drops that file but never unloads a
+#   module, because module state is host-global and may be in use by something
+#   else.
+#
+# NOTE on finding out what went wrong in "job" mode:
+#   A failed rollout names the nodes that failed and what stopped each of them,
+#   in the `helm install` output, as an Event on each node, and afterwards under
+#   `kubectl get nodes -l kata-deploy-job-dispatcher/result=failed`. None of it
+#   is configured here; it is what a rollout does.
+#
+#   Each stage writes why it is giving up to /dev/termination-log, so the reason
+#   is in the pod's status rather than only in a log that
+#   job.ttlSecondsAfterFinished deletes along with the pod.
 deploymentMode: daemonset  # daemonset | job
 
 # Settings specific to deploymentMode: job
 job:
   # Dispatcher image: the dispatcher that fans out per-node Jobs. It only talks to
   # the Kubernetes API (lists nodes, creates/watches Jobs); it never touches the
-  # host. Supports reference:tag or reference@sha256:digest; tag defaults to the
-  # chart appVersion.
+  # host. Supports reference:tag or reference@sha256:digest. This component is
+  # released independently of Kata Containers, so its version is pinned here.
   dispatcherImage:
-    reference: quay.io/kata-containers/kata-deploy-job-dispatcher
-    tag: ""
+    reference: ghcr.io/kata-containers/k8s-job-dispatcher
+    tag: "0.3.0"
   # Where the dispatcher pods themselves may run (install and uninstall). Nothing
   # to do with which nodes get Kata - that is the top-level `nodeSelector` /
   # `affinity` / `tolerations`.
@@ -112,6 +138,27 @@ job:
   # NotReady for a moment. Waiting keeps the first Kata workload away until the
   # runtime is back. A node that never becomes Ready stays unlabeled.
   waitNodeReadySeconds: 300
+  # Scheduled reconcile: covers the nodes that join after the release was applied.
+  #
+  # The dispatcher runs as a release hook, so a node joining later is never
+  # dispatched to and stays without Kata until the next `helm upgrade`. Enable
+  # this and a CronJob does that upgrade's work on a schedule instead, running the
+  # same dispatcher against the same selectors and per-node templates.
+  #
+  # A tick stands aside while a release rollout is in flight, and leaves out the
+  # nodes that already show a finished install, so a tick over a settled fleet is
+  # a couple of API calls and no pods.
+  #
+  # Off by default, for two reasons. A recurring privileged rollout is something
+  # to ask for explicitly, and this only ever ADDS nodes: one that fell out of the
+  # selection is usually a label gone wrong somewhere, so it is left for the next
+  # upgrade rather than dismantled on a timer with nobody watching.
+  #
+  # Requires job.dispatcherImage 0.2.0 or newer.
+  reconcile:
+    enabled: false
+    # Cron expression, interpreted in the cluster's own timezone.
+    schedule: "*/15 * * * *"
   # Node selection for the UNINSTALL (pre-delete hook) dispatcher.
   #
   # Deliberately independent of the install selection: uninstall has to reach
@@ -167,6 +214,21 @@ job:
   # failed. One node failing never aborts the others.
   backoffLimit: 3
 
+# SELinux confinement for the installer's own containers. On an enforcing node
+# the unprivileged install stages are otherwise denied the host work they exist
+# to do; this loads a Kata-owned policy module and gives each stage a
+# least-privilege domain instead, so they can stay unprivileged.
+#
+# Needs policycoreutils (for semodule) on the SELinux-enabled nodes, unless their
+# policy already defines the domains. Nodes with SELinux off are unaffected, so it
+# is safe to set across a mixed cluster.
+#
+# Off by default because it mutates the node's policy store, and the modules are
+# left loaded on uninstall: list them with `semodule --list-modules=full | grep
+# kata-deploy` and remove each with `semodule -X <priority> -r <name>`.
+selinux:
+  enabled: false
+
 imagePullPolicy: Always
 
 imagePullSecrets: []
@@ -216,14 +278,18 @@ monitor:
       memory: 300Mi
 
 # Which Kubernetes flavour this cluster runs. It picks the host directory that
-# holds containerd's configuration, which is mounted into the install.
+# holds containerd's configuration, which is mounted into the install, and where
+# the kubelet keeps its root directory: k0s and microk8s both move it, and only
+# the right one leads to a Kata workload's ConfigMap/Secret updates and to the
+# Pod Resources API socket that GPU cold plug asks for its devices.
 #
 # Getting it wrong used to pass unnoticed: the install detects the runtime on the
 # node itself, so it would write a correct configuration into whichever directory
 # was mounted - and if that is not the one this node's containerd reads, Kata is
 # configured where nothing looks for it. The install now refuses to continue when
 # the two disagree, naming the value to set. Setting containerd.configDir takes
-# that check out of the way, being an explicit override of this derivation.
+# that check out of the way, being an explicit override of this derivation; it
+# says nothing about the kubelet, so this value still applies there.
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Containerd configuration overrides
@@ -524,6 +590,43 @@ snapshotter:
   # Enable dm-verity integrity verification for EROFS lower layers.
   # Independent of erofsSnapshotterMode — works with both disk and memory.
   erofsDmverity: false
+  # Nodes packaging an erofs-utils older than the 1.8.2 these settings need, or
+  # none at all, can be given one through nodeBinaries below.
+
+# Binaries to put on each node's PATH, taken from container images, for what a
+# node's own distribution packages too old a version of or not at all. Empty
+# (the default) installs nothing.
+#
+# Each key names an entry and becomes the name of the container staging it, so
+# it has to be a valid container name. Each entry needs an image and the list of
+# binaries to take out of it:
+#
+#   nodeBinaries:
+#     erofs-utils:
+#       image: quay.io/kata-containers/erofs-utils:1.9.3
+#       binaries: [mkfs.erofs, dump.erofs, fsck.erofs]
+#       pullPolicy: IfNotPresent  # optional, defaults to imagePullPolicy
+#
+# The image needs a POSIX shell, cp, and each listed binary statically built in
+# one of /usr/local/bin, /usr/local/sbin, /usr/bin, /usr/sbin, /bin, /sbin or
+# its root. Only the listed binaries are taken, so an image built on a
+# distribution does not put the rest of its userland on the node, and each one
+# names a single binary rather than a path or a pattern.
+#
+# They are copied into /usr/local/bin, ahead of /usr/bin in containerd's PATH,
+# and removed again on uninstall. Changing an entry replaces what it installed.
+# A file already there that kata-deploy did not install fails the install rather
+# than being replaced, and two entries offering the same name fail it too;
+# either way nothing on the node is touched, so it keeps the set it had. Marker
+# files are named after env.multiInstallSuffix, so side-by-side installs own
+# separate sets.
+#
+# Requires deploymentMode: job, the install being staged so the binaries are in
+# place before the host check looks for them. Private images use the chart's
+# imagePullSecrets. An image with no manifest for a node's architecture stalls
+# that node's install on the pull, so cover every architecture being deployed
+# to; the erofs-utils image above is amd64 and arm64 only.
+nodeBinaries: {}
 
 # Shim configuration
 # By default (disableAll: false), all shims with enabled: ~ (null) are enabled.
@@ -654,6 +757,11 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
+    # Settings for NVRC, the init process of the NVIDIA guest images. Each key
+    # becomes an nvrc.* guest kernel parameter; see docs/helm-configuration.md.
+    nvrc:
+      # Run nv-hostengine and dcgm-exporter in the guest (nvrc.dcgm=on).
+      enableDCGM: false
     runtimeClass:
       # This label is automatically added by gpu-operator. Override it
       # if you want to use a different label.
@@ -668,6 +776,8 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # This label is automatically added by gpu-operator. Override it
       # if you want to use a different label.
@@ -687,6 +797,8 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
@@ -709,6 +821,8 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
@@ -727,6 +841,8 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
@@ -749,6 +865,8 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
