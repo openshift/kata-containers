@@ -29,6 +29,6 @@ appVersion: "4.2.0"
 # remote archive name breaks Helm 4 resolution; the local tarball is enough.
 dependencies:
   - name: node-feature-discovery
-    version: "0.19.0"
+    version: "0.20.0"
     repository: https://kubernetes-sigs.github.io/node-feature-discovery/charts
     condition: node-feature-discovery.enabled
