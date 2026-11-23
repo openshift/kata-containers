@@ -231,7 +231,7 @@ impl Sandbox {
             None => Err(anyhow!("Sandbox storage with path {} not found", path)),
             Some(state) => {
                 if state.dec_and_test_ref_count().await {
-                    if state.is_shared() {
+                    if state.is_shared() && state.path().is_some_and(|p| !p.is_empty()) {
                         state.count.store(1, Ordering::Release);
                         return Ok(false);
                     }
